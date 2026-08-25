@@ -25,4 +25,4 @@ Limit findings to five unless a user explicitly asks for a full audit. Do not im
 
 ## Artifact Board Update
 
-For each accepted finding, update `docs/product-ops/board.yaml` first with a `discovery` card containing the scenario ID, evidence, severity, smallest useful improvement, and acceptance condition. Then update the existing `AI Product Operations Board` Artifact from those cards when Artifact editing is available. Do not create a new board. In a terminal-only client, update the YAML and return the equivalent `ARTIFACT_UPDATE` block after the audit.
+For each accepted finding, update `docs/product-ops/board.yaml` first with a `discovery` card containing the scenario ID, evidence, severity, smallest useful improvement, and acceptance condition. Then update the existing `Overlord Board` Artifact from those cards when Artifact editing is available. Do not create a new board. In a terminal-only client, update the YAML and return the equivalent `ARTIFACT_UPDATE` block after the audit.

@@ -1,6 +1,6 @@
-# AI Product Operations Skills
+# Overlord
 
-複数プロジェクトの要件整理、UX監査、実装準備、独立レビューをAIで並列化するためのスキルセットです。
+複数プロジェクトの要件整理、UX監査、実装準備、独立レビューをAIで並列化するためのプロダクト運用スキルセットです。
 
 人間は優先順位、方針、受け入れ確認を判断します。AIは改善カード化、既存コード調査、実装ブリーフ、レビュー、ボード更新を担当します。
 
@@ -21,7 +21,7 @@
                  |                                                    |
                  +---------- docs/product-ops/board.yaml ------------+
                                       |
-                                      +-> AI Product Operations Board Artifact
+                                      +-> Overlord Board Artifact
 ```
 
 - `docs/product-ops/board.yaml` はAIが読む正本です。
@@ -37,14 +37,14 @@
 
 ```bash
 git clone <YOUR_REPOSITORY_URL>
-cd ai-product-ops-skills
+cd overlord
 ./scripts/install.sh claude
 ```
 
 プロジェクト単位で入れる場合は、対象リポジトリで実行します。
 
 ```bash
-/path/to/ai-product-ops-skills/scripts/install.sh project
+/path/to/overlord/scripts/install.sh project
 ```
 
 Claude Codeは `.claude/skills/<skill-name>/SKILL.md` をプロジェクトスキルとして読み込みます。起動後、`/product-ops` のように実行できます。
@@ -53,7 +53,7 @@ Claude Codeは `.claude/skills/<skill-name>/SKILL.md` をプロジェクトス�
 
 ```bash
 git clone <YOUR_REPOSITORY_URL>
-cd ai-product-ops-skills
+cd overlord
 ./scripts/install.sh codex
 ```
 
@@ -71,7 +71,7 @@ docs/product-ops/board.yaml を作成してください。
 最初に私が判断すべき案件は最大3件にしてください。
 ```
 
-Artifactを作成できるクライアントでは、同時に `AI Product Operations Board` を作成・更新します。通常のターミナルではArtifact画面を直接操作できないため、YAMLの更新と `ARTIFACT_UPDATE` の出力までを実行します。
+Artifactを作成できるクライアントでは、同時に `Overlord Board` を作成・更新します。通常のターミナルではArtifact画面を直接操作できないため、YAMLの更新と `ARTIFACT_UPDATE` の出力までを実行します。
 
 ## 日常の使い方
 

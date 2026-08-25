@@ -1,10 +1,10 @@
 # Artifact Update Format
 
-Use this only when the current client cannot create or update a Claude Artifact. It allows a main Claude App chat to update the existing `AI Product Operations Board` without reinterpreting a long report.
+Use this only when the current client cannot create or update a Claude Artifact. It allows a main Claude App chat to update the existing `Overlord Board` without reinterpreting a long report.
 
 ```json
 {
-  "artifact": "AI Product Operations Board",
+  "artifact": "Overlord Board",
   "project": "<project>",
   "changes": [
     {

@@ -29,4 +29,4 @@ The brief is ready for implementation only when every acceptance condition has a
 
 ## Artifact Board Update
 
-Update the matching card in `docs/product-ops/board.yaml` first: add the chosen approach, worktree boundary, verification plan, and risk; set the state to `specified` only when the brief is ready. If the work must be split, create the dependent cards and keep the original card in `discovery`. Then update the existing `AI Product Operations Board` Artifact from the YAML state when Artifact editing is available. In a terminal-only client, update the YAML and return the equivalent `ARTIFACT_UPDATE` block after the brief.
+Update the matching card in `docs/product-ops/board.yaml` first: add the chosen approach, worktree boundary, verification plan, and risk; set the state to `specified` only when the brief is ready. If the work must be split, create the dependent cards and keep the original card in `discovery`. Then update the existing `Overlord Board` Artifact from the YAML state when Artifact editing is available. In a terminal-only client, update the YAML and return the equivalent `ARTIFACT_UPDATE` block after the brief.

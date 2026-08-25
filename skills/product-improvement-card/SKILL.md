@@ -31,4 +31,4 @@ An item is `specified` only if the problem, chosen solution, acceptance conditio
 
 ## Artifact Board Update
 
-After creating the card, update `docs/product-ops/board.yaml` first. Add or update one card with the observed problem, evidence, recommended option, acceptance conditions, estimated size, and `discovery` or `specified` state. Then update the current project's `AI Product Operations Board` Artifact from that same card when Artifact editing is available. Do not create a new board. In a terminal-only client, update the YAML and return the equivalent `ARTIFACT_UPDATE` block after the card.
+After creating the card, update `docs/product-ops/board.yaml` first. Add or update one card with the observed problem, evidence, recommended option, acceptance conditions, estimated size, and `discovery` or `specified` state. Then update the current project's `Overlord Board` Artifact from that same card when Artifact editing is available. Do not create a new board. In a terminal-only client, update the YAML and return the equivalent `ARTIFACT_UPDATE` block after the card.

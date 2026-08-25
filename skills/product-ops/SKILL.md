@@ -18,7 +18,7 @@ Operate as the human's product-development control plane. The goal is to minimiz
 
 ## Artifact Board
 
-When the current client supports Claude Artifacts, maintain one Artifact named `AI Product Operations Board` for the current project or portfolio.
+When the current client supports Claude Artifacts, maintain one Artifact named `Overlord Board` for the current project or portfolio.
 
 - On the first product-operations request, create this Artifact as an interactive Kanban board.
 - On later requests, update the existing Artifact. Do not create a duplicate board for each task or report.
