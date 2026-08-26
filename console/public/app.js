@@ -369,22 +369,54 @@ function renderDetail() {
   root.append(updated);
 }
 
-/** Card actions are phrased as instructions to the commander, never sent directly. */
+/**
+ * Card actions send directly to the commander. A second press of the same
+ * button within three seconds confirms; at most one button is armed at a
+ * time. Arming state lives in this closure, so a renderDetail() rebuild
+ * simply resets every button to the unarmed state.
+ */
 function commandField(item) {
   const field = fieldNode("司令塔への指示");
   const row = document.createElement("div");
   row.className = "templates";
+  let armedButton = null;
+  let armTimer = null;
+  const disarm = () => {
+    clearTimeout(armTimer);
+    if (armedButton) {
+      armedButton.classList.remove("armed");
+      armedButton.textContent = armedButton.dataset.label;
+      armedButton = null;
+    }
+  };
   for (const template of cardInstructions(item)) {
     const button = document.createElement("button");
     button.className = "btn";
     button.textContent = template.label;
-    button.addEventListener("click", () => fillCompose(template.text));
+    button.dataset.label = template.label;
+    button.addEventListener("click", () => {
+      if (armedButton === button) {
+        disarm();
+        void sendTemplate(template.text);
+        return;
+      }
+      // Switching buttons never sends; it only moves the armed state.
+      disarm();
+      if (!commanderLink()) {
+        toast("先に司令塔を設定してください", true);
+        return;
+      }
+      armedButton = button;
+      button.classList.add("armed");
+      button.textContent = "もう一度で送信";
+      armTimer = setTimeout(disarm, 3000);
+    });
     row.append(button);
   }
   field.append(row);
   const hint = document.createElement("div");
   hint.className = "hint";
-  hint.textContent = "指示文は司令塔の入力欄に入ります。送信はあなたが押したときだけです。";
+  hint.textContent = "ボタンは司令塔へ直接送信します。同じボタンをもう一度押すと送信されます。";
   field.append(hint);
   return field;
 }
@@ -976,26 +1008,36 @@ function fillCompose(text) {
  * #compose-input or view.draft, so an unsent draft always survives.
  * Returns true when the text was sent.
  */
+// True while a sendTemplate() call is in flight; blocks duplicate sends
+// from every caller (dock templates, note form, card buttons).
+let sendTemplateInFlight = false;
+
 async function sendTemplate(text) {
-  const link = commanderLink();
-  if (!link) {
-    toast("先に司令塔を設定してください", true);
-    return false;
-  }
+  if (sendTemplateInFlight) return false;
+  sendTemplateInFlight = true;
   try {
-    await api("/api/cmux/send", {
-      method: "POST",
-      body: JSON.stringify({ surface: link.surface.id, text, submit: true }),
-    });
-    toast("送信しました");
-    // Transient peek so the reply is visible; the persisted choice is untouched.
-    view.screenPeek = true;
-    renderDock();
-    setTimeout(() => refreshScreen(link.surface.id), 400);
-    return true;
-  } catch (error) {
-    toast(`送信できません: ${error.message}`, true);
-    return false;
+    const link = commanderLink();
+    if (!link) {
+      toast("先に司令塔を設定してください", true);
+      return false;
+    }
+    try {
+      await api("/api/cmux/send", {
+        method: "POST",
+        body: JSON.stringify({ surface: link.surface.id, text, submit: true }),
+      });
+      toast("送信しました");
+      // Transient peek so the reply is visible; the persisted choice is untouched.
+      view.screenPeek = true;
+      renderDock();
+      setTimeout(() => refreshScreen(link.surface.id), 400);
+      return true;
+    } catch (error) {
+      toast(`送信できません: ${error.message}`, true);
+      return false;
+    }
+  } finally {
+    sendTemplateInFlight = false;
   }
 }
 
