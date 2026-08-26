@@ -283,6 +283,12 @@ body {
   padding: 10px 12px;
   border-top: 1px solid var(--line);
 }
+/* Collapsed commander screen: head and compose stack at the top instead of
+   the compose box falling into the freed 1fr middle row and stretching. */
+.dock.collapsed {
+  grid-template-rows: auto auto;
+  align-content: start;
+}
 
 .field { margin-bottom: 12px; }
 .field > label {

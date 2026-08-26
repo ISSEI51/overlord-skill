@@ -12,6 +12,7 @@ const STATES = [
 const ACTIVE_STATES = ["discovery", "specified", "implementing", "reviewing", "acceptance"];
 const SCREEN_INTERVAL_MS = 1500;
 const DOCK_WIDTH_KEY = "overlord.dockWidth";
+const SCREEN_OPEN_KEY = "overlord.screenOpen";
 
 const view = {
   data: null,
@@ -24,7 +25,17 @@ const view = {
   composeBuilt: false,
   /** Unsent commander draft; survives any dock rebuild. */
   draft: "",
+  /** Persisted choice: keep the commander screen expanded. */
+  screenOpen: false,
+  /** Transient expansion (never persisted); reserved for OV-CON-011. */
+  screenPeek: false,
 };
+
+try {
+  view.screenOpen = localStorage.getItem(SCREEN_OPEN_KEY) === "1";
+} catch {
+  /* missing or blocked storage keeps the collapsed default */
+}
 
 const $ = (selector) => document.querySelector(selector);
 
@@ -534,6 +545,12 @@ function commanderLink() {
   return terminalSurfaces().find((entry) => entry.surface.id === id) ?? null;
 }
 
+/** Single authority for whether the commander screen is shown. */
+function screenVisible() {
+  const ready = Boolean(commanderLink()) && !view.setupOpen;
+  return ready && (view.screenOpen || view.screenPeek);
+}
+
 function renderDock() {
   const link = commanderLink();
   const configured = Boolean(view.data.board.commander?.surface_id);
@@ -549,6 +566,18 @@ function renderDock() {
   const controls = $("#dock-controls");
   controls.replaceChildren();
   if (ready) {
+    controls.append(
+      dockButton(view.screenOpen ? "画面を隠す" : "画面を表示", () => {
+        view.screenOpen = !view.screenOpen;
+        view.screenPeek = false;
+        try {
+          localStorage.setItem(SCREEN_OPEN_KEY, view.screenOpen ? "1" : "0");
+        } catch {
+          /* private windows and blocked storage are fine */
+        }
+        renderDock();
+      }),
+    );
     controls.append(
       dockButton("cmux で開く", async () => {
         await api("/api/cmux/focus", {
@@ -574,8 +603,12 @@ function renderDock() {
   }
 
   const screen = $("#commander-screen");
-  screen.hidden = !ready;
-  if (ready) {
+  const visible = screenVisible();
+  screen.hidden = !visible;
+  // Collapsed applies only when ready: in setup mode the hidden screen
+  // already lets the compose area take the middle row (current behavior).
+  $("#dock").classList.toggle("collapsed", ready && !visible);
+  if (visible) {
     // Content is owned by refreshScreen so a board re-render never scrolls it.
     startScreenPolling(link.surface.id);
   } else {
