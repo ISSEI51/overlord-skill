@@ -157,10 +157,22 @@ function findIdInText(text) {
   return match ? match[0] : null;
 }
 
+function decisionIds() {
+  const raw = view.data.board.decisions_required ?? [];
+  const ids = new Set();
+  for (const entry of raw) {
+    const text = typeof entry === "string" ? entry : (entry.question ?? entry.title ?? "");
+    const id = typeof entry === "object" ? (entry.id ?? null) : findIdInText(text);
+    if (id) ids.add(id);
+  }
+  return ids;
+}
+
 function renderBoard() {
   const board = $("#board");
   board.replaceChildren();
   const items = view.data.board.items ?? [];
+  const needsUserIds = decisionIds();
   for (const state of STATES) {
     const columnItems = items.filter((item) => item.state === state.key);
     const column = document.createElement("section");
@@ -176,7 +188,7 @@ function renderBoard() {
 
     const body = document.createElement("div");
     body.className = "column-body";
-    for (const item of columnItems) body.append(cardNode(item));
+    for (const item of columnItems) body.append(cardNode(item, needsUserIds));
 
     column.append(head, body);
     column.addEventListener("dragover", (event) => {
@@ -202,10 +214,13 @@ function renderBoard() {
   }
 }
 
-function cardNode(item) {
+function cardNode(item, needsUserIds) {
   const node = document.createElement("article");
   node.className = "card";
   node.draggable = true;
+  if (item.state === "acceptance" || item.owner === "user" || needsUserIds.has(item.id)) {
+    node.classList.add("needs-user");
+  }
   if (item.id === view.selectedId) node.classList.add("selected");
 
   const score = scoreOf(item);

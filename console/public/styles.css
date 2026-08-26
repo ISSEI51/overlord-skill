@@ -12,6 +12,7 @@
   --warn: #e3b341;
   --danger: #f77067;
   --ok: #56d364;
+  --needs-user: #4dd0e1;
   --radius: 8px;
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
 }
@@ -30,6 +31,7 @@
     --warn: #9a6700;
     --danger: #c0392b;
     --ok: #1a7f37;
+    --needs-user: #0e7490;
   }
 }
 
@@ -182,7 +184,10 @@ body {
   cursor: pointer;
 }
 .card:hover { border-color: var(--line-strong); }
+/* 順序依存: .needs-user は :hover より後・.selected より前に置く（同特異度の後勝ちで selected を優先） */
+.card.needs-user { border-color: var(--needs-user); }
 .card.selected { border-color: var(--accent); }
+.card.selected.needs-user { box-shadow: 0 0 0 2px color-mix(in srgb, var(--needs-user) 55%, transparent); }
 .card.dragging { opacity: 0.4; }
 .card-top { display: flex; justify-content: space-between; gap: 6px; align-items: baseline; }
 .card-id { font: 10px/1.4 var(--mono); color: var(--text-faint); }
