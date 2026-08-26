@@ -228,16 +228,20 @@ export async function readScreen(
   return withTerminal(surface, () => runOrThrow(args));
 }
 
-const PASTE_START = "\u001b[200~";
-const PASTE_END = "\u001b[201~";
-
 /**
- * Send text to a terminal surface as a bracketed paste.
+ * Send text to a terminal surface.
  *
- * `cmux send` turns \n into Enter and `cmux paste-buffer` rejects an explicit
- * --surface, so text goes through the raw `surface.send_text` method wrapped in
- * bracketed-paste markers. An agent TUI then receives multi-line input as one
- * paste instead of submitting every line, and `submit` presses Enter once.
+ * cmux injects `surface.send_text` / `terminal.input` text as per-character
+ * key events, so hand-built bracketed-paste markers (ESC[200~ ... ESC[201~)
+ * are not recognized by the Claude Code TUI: each ESC arrives as a standalone
+ * Escape keypress and "[200~" is inserted literally (OV-014). Instead:
+ *
+ * - submit: one `terminal.paste` call. cmux pastes the whole (multi-line)
+ *   text as a single block and submits it itself; the response reports
+ *   `submitted`. If cmux could not submit, Enter is sent as a fallback.
+ * - no submit: `terminal.input` per line. `terminal.input` turns "\n" into
+ *   Enter (which would submit every line), so newlines are inserted with a
+ *   shift+enter key event between lines instead.
  *
  * Requires the surface UUID, not a ref.
  */
@@ -246,18 +250,40 @@ export async function sendText(
   text: string,
   submit: boolean,
 ): Promise<void> {
-  const payload = PASTE_START + sanitize(text) + PASTE_END;
-  await withTerminal(surfaceId, () =>
-    runOrThrow([
-      "rpc",
-      "surface.send_text",
-      JSON.stringify({ surface_id: surfaceId, text: payload }),
-    ]),
-  );
+  const clean = sanitize(text);
   if (submit) {
-    await Bun.sleep(150);
-    await sendKey(surfaceId, "enter");
+    const stdout = await withTerminal(surfaceId, () =>
+      runOrThrow([
+        "rpc",
+        "terminal.paste",
+        JSON.stringify({ surface_id: surfaceId, text: clean }),
+      ]),
+    );
+    let submitted = false;
+    try {
+      submitted = (JSON.parse(stdout) as { submitted?: boolean }).submitted === true;
+    } catch {
+      submitted = false;
+    }
+    if (!submitted) await sendKey(surfaceId, "enter");
+    return;
   }
+  const lines = clean.split("\n");
+  await withTerminal(surfaceId, async () => {
+    for (let i = 0; i < lines.length; i++) {
+      if (i > 0) {
+        await runOrThrow(["send-key", "--surface", surfaceId, "--", "shift+enter"]);
+      }
+      const line = lines[i];
+      if (line && line.length > 0) {
+        await runOrThrow([
+          "rpc",
+          "terminal.input",
+          JSON.stringify({ surface_id: surfaceId, text: line }),
+        ]);
+      }
+    }
+  });
 }
 
 /** Drop control characters that would end the paste or drive the TUI. */
