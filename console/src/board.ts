@@ -1,0 +1,291 @@
+/**
+ * board.yaml access.
+ *
+ * `docs/product-ops/board.yaml` stays the single machine-readable source of
+ * truth. The console reads it, writes it back in block YAML, and detects
+ * concurrent writes by an agent through a revision token.
+ */
+
+import { mkdir, rename, stat, writeFile } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
+
+export const STATES = [
+  "inbox",
+  "discovery",
+  "specified",
+  "implementing",
+  "reviewing",
+  "acceptance",
+  "done",
+  "blocked",
+] as const;
+
+export type State = (typeof STATES)[number];
+
+export type Json =
+  | string
+  | number
+  | boolean
+  | null
+  | Json[]
+  | { [key: string]: Json };
+
+export type Item = {
+  id: string;
+  project?: string | null;
+  title: string;
+  state: State;
+  priority?: {
+    impact?: number | null;
+    urgency?: number | null;
+    confidence?: number | null;
+    ease?: number | null;
+    override?: string | null;
+  } | null;
+  evidence?: string | null;
+  acceptance_conditions?: string[] | null;
+  out_of_scope?: string | null;
+  owner?: string | null;
+  next_action?: string | null;
+  blocker?: string | null;
+  updated_at?: string | null;
+  agent?: SessionLink | null;
+  [key: string]: Json | undefined;
+};
+
+/** Pointer to a running cmux session. */
+export type SessionLink = {
+  workspace_id?: string | null;
+  surface_id?: string | null;
+  cwd?: string | null;
+};
+
+export type Board = {
+  version: number;
+  updated_at?: string | null;
+  /** The single commander session the user talks to in Overlord Console. */
+  commander?: SessionLink | null;
+  decisions_required?: Json[] | null;
+  items: Item[];
+  [key: string]: Json | undefined;
+};
+
+const ITEM_KEY_ORDER = [
+  "id",
+  "project",
+  "title",
+  "state",
+  "priority",
+  "evidence",
+  "acceptance_conditions",
+  "out_of_scope",
+  "owner",
+  "next_action",
+  "blocker",
+  "agent",
+  "updated_at",
+];
+
+const BOARD_KEY_ORDER = [
+  "version",
+  "updated_at",
+  "commander",
+  "decisions_required",
+  "items",
+];
+
+export const EMPTY_BOARD: Board = { version: 1, updated_at: null, items: [] };
+
+export function nowIso(): string {
+  return new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+
+export function boardPathFor(target: string): string {
+  const absolute = resolve(target);
+  return absolute.endsWith(".yaml") || absolute.endsWith(".yml")
+    ? absolute
+    : resolve(absolute, "docs/product-ops/board.yaml");
+}
+
+/** Revision token used for optimistic concurrency against agent writes. */
+export async function revisionOf(path: string): Promise<string> {
+  try {
+    const info = await stat(path);
+    return `${Math.round(info.mtimeMs)}:${info.size}`;
+  } catch {
+    return "absent";
+  }
+}
+
+export type LoadedBoard = { board: Board; rev: string; exists: boolean };
+
+export async function loadBoard(path: string): Promise<LoadedBoard> {
+  const file = Bun.file(path);
+  if (!(await file.exists())) {
+    return { board: structuredClone(EMPTY_BOARD), rev: "absent", exists: false };
+  }
+  const rev = await revisionOf(path);
+  const text = await file.text();
+  const parsed = (Bun.YAML.parse(text) ?? {}) as Partial<Board>;
+  const board: Board = {
+    version: typeof parsed.version === "number" ? parsed.version : 1,
+    updated_at: (parsed.updated_at as string | null) ?? null,
+    items: Array.isArray(parsed.items) ? (parsed.items as Item[]) : [],
+  };
+  if (parsed.commander) board.commander = parsed.commander as SessionLink;
+  if (parsed.decisions_required) {
+    board.decisions_required = parsed.decisions_required as Json[];
+  }
+  return { board, rev, exists: true };
+}
+
+export async function saveBoard(path: string, board: Board): Promise<string> {
+  board.updated_at = nowIso();
+  const text = toBlockYaml(orderKeys(board as Json, BOARD_KEY_ORDER));
+  await mkdir(dirname(path), { recursive: true });
+  const temp = `${path}.overlord-tmp`;
+  await writeFile(temp, text, "utf8");
+  await rename(temp, path);
+  return revisionOf(path);
+}
+
+export function canonicalItem(item: Item): Item {
+  return orderKeys(item as Json, ITEM_KEY_ORDER) as Item;
+}
+
+function orderKeys(value: Json, order: string[]): Json {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return value;
+  }
+  const source = value as { [key: string]: Json };
+  const result: { [key: string]: Json } = {};
+  for (const key of order) {
+    if (key in source) result[key] = source[key]!;
+  }
+  for (const key of Object.keys(source)) {
+    if (!(key in result)) result[key] = source[key]!;
+  }
+  if (Array.isArray(result.items)) {
+    result.items = (result.items as Json[]).map((entry) =>
+      orderKeys(entry, ITEM_KEY_ORDER),
+    );
+  }
+  return result;
+}
+
+/**
+ * Minimal block-style YAML emitter.
+ *
+ * Bun.YAML.stringify emits flow style on one line, which is unreadable in a
+ * git diff and in an editor, so board.yaml is serialized here instead.
+ */
+export function toBlockYaml(value: Json): string {
+  const lines: string[] = [];
+  emitMapping(value, 0, lines);
+  return lines.join("\n") + "\n";
+}
+
+function emitMapping(value: Json, indent: number, lines: string[]): void {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    lines.push(`${" ".repeat(indent)}${scalar(value)}`);
+    return;
+  }
+  const entries = Object.entries(value as { [key: string]: Json });
+  if (entries.length === 0) {
+    lines.push(`${" ".repeat(indent)}{}`);
+    return;
+  }
+  for (const [key, entry] of entries) {
+    emitEntry(key, entry, indent, lines);
+  }
+}
+
+function emitEntry(
+  key: string,
+  value: Json,
+  indent: number,
+  lines: string[],
+): void {
+  const pad = " ".repeat(indent);
+  const name = plainKey(key) ? key : quote(key);
+  if (Array.isArray(value)) {
+    if (value.length === 0) {
+      lines.push(`${pad}${name}: []`);
+      return;
+    }
+    lines.push(`${pad}${name}:`);
+    emitSequence(value, indent + 2, lines);
+    return;
+  }
+  if (value !== null && typeof value === "object") {
+    const entries = Object.entries(value as { [key: string]: Json });
+    if (entries.length === 0) {
+      lines.push(`${pad}${name}: {}`);
+      return;
+    }
+    lines.push(`${pad}${name}:`);
+    emitMapping(value, indent + 2, lines);
+    return;
+  }
+  if (typeof value === "string" && value.includes("\n")) {
+    lines.push(`${pad}${name}: |-`);
+    for (const line of value.replace(/\n+$/, "").split("\n")) {
+      lines.push(line.length === 0 ? "" : `${pad}  ${line}`);
+    }
+    return;
+  }
+  lines.push(`${pad}${name}: ${scalar(value)}`);
+}
+
+function emitSequence(values: Json[], indent: number, lines: string[]): void {
+  const pad = " ".repeat(indent);
+  for (const value of values) {
+    if (Array.isArray(value)) {
+      lines.push(`${pad}-`);
+      emitSequence(value, indent + 2, lines);
+      continue;
+    }
+    if (value !== null && typeof value === "object") {
+      const nested: string[] = [];
+      emitMapping(value, indent + 2, nested);
+      if (nested.length === 0) {
+        lines.push(`${pad}- {}`);
+        continue;
+      }
+      lines.push(`${pad}- ${nested[0]!.trimStart()}`);
+      lines.push(...nested.slice(1));
+      continue;
+    }
+    if (typeof value === "string" && value.includes("\n")) {
+      lines.push(`${pad}- |-`);
+      for (const line of value.replace(/\n+$/, "").split("\n")) {
+        lines.push(line.length === 0 ? "" : `${pad}  ${line}`);
+      }
+      continue;
+    }
+    lines.push(`${pad}- ${scalar(value)}`);
+  }
+}
+
+function plainKey(key: string): boolean {
+  return /^[A-Za-z_][A-Za-z0-9_-]*$/.test(key);
+}
+
+function scalar(value: Json): string {
+  if (value === null) return "null";
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? String(value) : "null";
+  }
+  if (typeof value === "boolean") return value ? "true" : "false";
+  return quote(String(value));
+}
+
+function quote(value: string): string {
+  const escaped = value
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"')
+    .replace(/\n/g, "\\n")
+    .replace(/\r/g, "\\r")
+    .replace(/\t/g, "\\t");
+  return `"${escaped}"`;
+}

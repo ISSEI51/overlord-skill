@@ -29,6 +29,6 @@ Next state: discovery / specified / blocked
 
 An item is `specified` only if the problem, chosen solution, acceptance conditions, and out-of-scope boundary are all clear. Otherwise it remains `discovery`.
 
-## Artifact Board Update
+## Board Update
 
-After creating the card, update `docs/product-ops/board.yaml` first. Add or update one card with the observed problem, evidence, recommended option, acceptance conditions, estimated size, and `discovery` or `specified` state. Then update the current project's `Overlord Board` Artifact from that same card when Artifact editing is available. Do not create a new board. In a terminal-only client, update the YAML and return the equivalent `ARTIFACT_UPDATE` block after the card.
+After creating the card, update `docs/product-ops/board.yaml`. Add or update one card with the observed problem, evidence, recommended option, acceptance conditions, estimated size, and `discovery` or `specified` state. Overlord Console renders the file, so no separate board update is needed. If the file cannot be written, return a `BOARD_UPDATE_REQUIRED` block and do not claim that the board is current.
