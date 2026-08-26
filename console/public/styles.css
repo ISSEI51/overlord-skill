@@ -234,6 +234,10 @@ body {
 .dock {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr) auto;
+  /* Constrain the implicit column: an auto column would grow to the
+     max-content width of a long session title and push the header
+     buttons outside the dock. */
+  grid-template-columns: minmax(0, 1fr);
   min-width: 0;
   min-height: 0;
   background: var(--bg-raised);
@@ -247,14 +251,24 @@ body {
   padding: 9px 12px;
   border-bottom: 1px solid var(--line);
 }
-.dock-title { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
-.dock-label { font-size: 12px; font-weight: 650; }
+.dock-title {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+.dock-label { font-size: 12px; font-weight: 650; white-space: nowrap; }
 .dock-session {
   font: 11px/1.4 var(--mono);
   color: var(--text-faint);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  /* A flex item's implicit min-width:auto would keep the full title width
+     and push the header buttons out of view. */
+  min-width: 0;
+  flex: 1 1 auto;
 }
 .dock-controls { display: flex; gap: 6px; flex-shrink: 0; }
 .dock .screen {
@@ -325,6 +339,29 @@ ul.conditions { margin: 0; padding-left: 18px; font-size: 12.5px; }
   font-size: 12px;
 }
 .notice.bad { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 40%, transparent); }
+
+/* in-page dialog (replaces window.prompt) */
+dialog.panel {
+  width: min(460px, 90vw);
+  padding: 0;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: var(--bg-raised);
+  color: var(--text);
+}
+dialog.panel::backdrop { background: rgba(0, 0, 0, 0.45); }
+dialog.panel form { padding: 14px; }
+dialog.panel h2 { margin: 0 0 12px; font-size: 13px; }
+
+.inline-form {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  margin-top: 8px;
+}
+.inline-form input { flex: 1; }
+
+.btn.armed { border-color: var(--danger); color: var(--danger); }
 
 .toast {
   position: fixed;

@@ -58,6 +58,28 @@
       </aside>
     </div>
 
+    <dialog id="card-dialog" class="panel">
+      <form method="dialog" novalidate>
+        <h2>気づきを追加</h2>
+        <div class="field">
+          <label for="card-title">1行の見出し</label>
+          <input id="card-title" type="text" autocomplete="off" />
+        </div>
+        <div class="field">
+          <label for="card-project">プロジェクト（任意）</label>
+          <input id="card-project" type="text" autocomplete="off" />
+        </div>
+        <div class="field">
+          <label for="card-evidence">根拠・再現手順（任意・複数行可）</label>
+          <textarea id="card-evidence" rows="4"></textarea>
+        </div>
+        <div class="row">
+          <button type="submit" class="btn primary" value="add">追加</button>
+          <button type="button" class="btn" id="card-cancel">キャンセル</button>
+        </div>
+      </form>
+    </dialog>
+
     <div id="toast" class="toast" hidden></div>
     <script type="module" src="/app.js"></script>
   </body>

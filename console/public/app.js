@@ -22,6 +22,8 @@ const view = {
   setupOpen: false,
   setupBuilt: false,
   composeBuilt: false,
+  /** Unsent commander draft; survives any dock rebuild. */
+  draft: "",
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -503,6 +505,13 @@ function editableField(item, key, label) {
   input.addEventListener("blur", commit);
   input.addEventListener("keydown", (event) => {
     if (event.key === "Enter") input.blur();
+    if (event.key === "Escape") {
+      // Cancel, don't save: restore the original value so the blur commit
+      // sees no change, and keep the panel open.
+      event.stopPropagation();
+      input.value = item[key] ?? "";
+      input.blur();
+    }
   });
   field.append(input);
   return field;
@@ -660,7 +669,6 @@ function renderSetup() {
   const create = document.createElement("button");
   create.className = "btn";
   create.textContent = "司令塔を新しく起動";
-  create.addEventListener("click", startCommanderWorkspace);
   row.append(create);
 
   const refresh = document.createElement("button");
@@ -674,6 +682,38 @@ function renderSetup() {
 
   field.append(row);
 
+  // Inline directory field for a new commander workspace (no window.prompt).
+  const createForm = document.createElement("div");
+  createForm.className = "inline-form";
+  createForm.hidden = true;
+  const cwdInput = document.createElement("input");
+  cwdInput.type = "text";
+  cwdInput.value = view.data.projectRoot;
+  cwdInput.placeholder = "司令塔を動かすディレクトリ";
+  const launch = document.createElement("button");
+  launch.className = "btn primary";
+  launch.textContent = "起動";
+  launch.addEventListener("click", () => {
+    const cwd = cwdInput.value.trim();
+    if (cwd === "") {
+      toast("ディレクトリを入力してください", true);
+      return;
+    }
+    void startCommanderWorkspace(cwd);
+  });
+  const cancel = document.createElement("button");
+  cancel.className = "btn";
+  cancel.textContent = "キャンセル";
+  cancel.addEventListener("click", () => {
+    createForm.hidden = true;
+  });
+  createForm.append(cwdInput, launch, cancel);
+  field.append(createForm);
+  create.addEventListener("click", () => {
+    createForm.hidden = false;
+    cwdInput.focus();
+  });
+
   const hint = document.createElement("div");
   hint.className = "hint";
   hint.style.marginTop = "8px";
@@ -684,9 +724,7 @@ function renderSetup() {
   root.append(field);
 }
 
-async function startCommanderWorkspace() {
-  const cwd = prompt("司令塔を動かすディレクトリ", view.data.projectRoot);
-  if (!cwd) return;
+async function startCommanderWorkspace(cwd) {
   try {
     const result = await api("/api/cmux/workspace", {
       method: "POST",
@@ -739,6 +777,10 @@ function renderCompose() {
   const input = document.createElement("textarea");
   input.id = "compose-input";
   input.placeholder = "司令塔への指示（⌘Enter または Ctrl+Enter で送信）";
+  input.value = view.draft;
+  input.addEventListener("input", () => {
+    view.draft = input.value;
+  });
   input.addEventListener("keydown", (event) => {
     if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
       event.preventDefault();
@@ -777,11 +819,25 @@ function renderCompose() {
     actions.append(button);
   }
 
+  // Two presses within three seconds interrupt; no native dialog.
   const interrupt = document.createElement("button");
   interrupt.className = "btn danger";
   interrupt.textContent = "中断";
+  let armTimer = null;
+  const disarm = () => {
+    clearTimeout(armTimer);
+    interrupt.classList.remove("armed");
+    interrupt.textContent = "中断";
+  };
   interrupt.addEventListener("click", () => {
-    if (confirm("司令塔の実行中の処理を中断します。よろしいですか？")) sendKey("ctrl+c");
+    if (interrupt.classList.contains("armed")) {
+      disarm();
+      void sendKey("ctrl+c");
+      return;
+    }
+    interrupt.classList.add("armed");
+    interrupt.textContent = "もう一度で中断";
+    armTimer = setTimeout(disarm, 3000);
   });
   actions.append(interrupt);
 
@@ -821,9 +877,14 @@ function fillCompose(text) {
     toast("先に司令塔を設定してください", true);
     return;
   }
-  input.value = text;
+  // Never overwrite an unsent draft; append below it instead.
+  const draft = input.value;
+  const next = draft.trim() === "" ? text : `${draft.replace(/\n+$/, "")}\n${text}`;
+  input.value = next;
+  view.draft = next;
   input.focus();
-  input.setSelectionRange(text.length, text.length);
+  input.setSelectionRange(next.length, next.length);
+  if (draft.trim() !== "") toast("下書きの末尾に追記しました");
 }
 
 async function send(submit) {
@@ -838,6 +899,7 @@ async function send(submit) {
       body: JSON.stringify({ surface: link.surface.id, text, submit }),
     });
     input.value = "";
+    view.draft = "";
     toast(submit ? "送信しました" : "貼り付けました");
     setTimeout(() => refreshScreen(link.surface.id), 400);
   } catch (error) {
@@ -925,17 +987,39 @@ $("#resizer").addEventListener("mousedown", (event) => {
 
 $("#detail-close").addEventListener("click", closeDetail);
 
-$("#new-card").addEventListener("click", async () => {
-  const title = prompt("気づきを1行で書いてください");
-  if (!title) return;
+/* Card creation dialog: cancel and Escape keep what was typed. */
+const cardDialog = $("#card-dialog");
+$("#new-card").addEventListener("click", () => {
+  cardDialog.showModal();
+  $("#card-title").focus();
+});
+$("#card-cancel").addEventListener("click", () => cardDialog.close());
+cardDialog.addEventListener("keydown", (event) => {
+  // The dialog handles its own Escape; don't also close the card detail.
+  if (event.key === "Escape") event.stopPropagation();
+});
+cardDialog.querySelector("form").addEventListener("submit", async (event) => {
+  const title = $("#card-title").value.trim();
+  if (title === "") {
+    event.preventDefault();
+    toast("見出しを入力してください", true);
+    return;
+  }
   try {
     const result = await api("/api/items", {
       method: "POST",
-      body: JSON.stringify({ title }),
+      body: JSON.stringify({
+        title,
+        project: $("#card-project").value.trim() || undefined,
+        evidence: $("#card-evidence").value.trim() || undefined,
+      }),
     });
+    $("#card-title").value = "";
+    $("#card-evidence").value = "";
     await load();
     select(result.item.id);
   } catch (error) {
+    event.preventDefault();
     toast(`追加できません: ${error.message}`, true);
   }
 });

@@ -1,12 +1,12 @@
 version: 1
-updated_at: "2026-08-26T07:40:00Z"
+updated_at: "2026-08-26T08:20:00Z"
 commander:
   workspace_id: "C06728B8-B8BA-4D83-A69D-9ADE254532CB"
   surface_id: "93EF686E-FAF3-4474-850A-0DEAC3C5BD8D"
   cwd: "/Users/kunimasa/dev/overlord"
 decisions_required:
   - id: "OV-CON-001"
-    question: "Overlord Console の変更をコミットしてよいか。独立レビューの前か後か。"
+    question: "Overlord Console 導入とUX監査修正の PR を確認し、マージ可否を判断する"
 items:
   - id: "OV-CON-001"
     project: "Overlord"
@@ -32,7 +32,7 @@ items:
       - "変更がコミットされている"
     out_of_scope: "cmux 側の機能追加、board.yaml スキーマの再設計"
     owner: "user"
-    next_action: "別セッションで /product-change-review OV-CON-001 を実行する"
+    next_action: "PR を確認し、必要なら PR 上で /product-change-review を実行する"
     blocker: "コミット可否のユーザー判断"
     updated_at: "2026-08-26T07:05:44Z"
   - id: "OV-CON-002"
@@ -102,7 +102,7 @@ items:
   - id: "OV-CON-006"
     project: "Overlord"
     title: "司令塔のタイトルが長いと「変更」「cmux で開く」が画面外に押し出される"
-    state: "discovery"
+    state: "reviewing"
     priority:
       impact: 4
       urgency: 3
@@ -114,18 +114,19 @@ items:
       コマンドライン全文になり、ドックのヘッダーで省略されずに折り返す。
       「変更」「cmux で開く」が不可視になり、司令塔の付け替え操作に到達できない。
       原因の予想（コード確認済み）: .dock-session に min-width:0 がなく flex 縮小されない。
+      修正済み: .dock の列を minmax(0,1fr) で拘束し、セッション名に min-width:0 を追加。長いタイトルでもボタン表示をブラウザで確認。
     acceptance_conditions:
       - "任意の長さのセッションタイトルでも、ヘッダーの2つのボタンが常に表示される"
       - "長いタイトルは省略記号で切り詰められる"
     out_of_scope: "ドック全体のレイアウト変更"
-    owner: null
-    next_action: "実装ブリーフを作成する"
+    owner: "claude"
+    next_action: "PR の変更内容を確認する"
     blocker: null
     updated_at: "2026-08-26T07:40:00Z"
   - id: "OV-CON-007"
     project: "Overlord"
     title: "カードの指示ボタンが司令塔の未送信下書きを警告なく上書きする"
-    state: "discovery"
+    state: "reviewing"
     priority:
       impact: 4
       urgency: 3
@@ -136,18 +137,19 @@ items:
       UX監査 S3。入力欄に下書きを書いた状態でカードの「状況を聞く」を押すと、
       下書きが確認なしでテンプレート文に置き換わることを実操作で確認。
       fillCompose() が input.value を無条件に代入している。
+      修正済み: fillCompose が未送信下書きの末尾に追記する方式に変更。下書きは view 状態に保持し、ドック再構築でも消えない。実操作で確認。
     acceptance_conditions:
       - "入力欄に未送信の文字があるとき、上書き前に確認するか、末尾に追記する"
       - "空の入力欄では従来どおり1クリックでテンプレートが入る"
     out_of_scope: "下書きの永続化"
-    owner: null
-    next_action: "実装ブリーフを作成する"
+    owner: "claude"
+    next_action: "PR の変更内容を確認する"
     blocker: null
     updated_at: "2026-08-26T07:40:00Z"
   - id: "OV-CON-008"
     project: "Overlord"
     title: "カード追加とディレクトリ指定がネイティブダイアログで1行しか書けない"
-    state: "discovery"
+    state: "reviewing"
     priority:
       impact: 3
       urgency: 2
@@ -159,14 +161,35 @@ items:
       「中断」が window.confirm を使用（app.js に3箇所）。
       1行しか入力できず、複数行の根拠を貼れない。Escape で入力内容が消える。
       ネイティブダイアログはブラウザ自動化も停止させる。
+      修正済み: カード追加をページ内 dialog（複数行の根拠欄付き）に、司令塔の起動先をインライン入力に、中断を2度押し方式に置き換え。prompt/confirm は0箇所。
     acceptance_conditions:
       - "気づきの追加がページ内フォームで行え、複数行の根拠を書ける"
       - "Escape やキャンセルで直前の入力が失われない"
     out_of_scope: "カード編集フォームの全面化"
-    owner: null
-    next_action: "実装ブリーフを作成する"
+    owner: "claude"
+    next_action: "PR の変更内容を確認する"
     blocker: null
     updated_at: "2026-08-26T07:40:00Z"
+  - id: "OV-CON-009"
+    project: "Overlord"
+    title: "フィールド編集中の Escape が取消ではなく保存になる"
+    state: "reviewing"
+    priority:
+      impact: 3
+      urgency: 2
+      confidence: 5
+      ease: 5
+      override: null
+    evidence: |-
+      UX監査 F5。編集中に Escape でパネルが閉じ、blur 経由で編集値が board.yaml に保存された。
+      修正済み: Escape は値を元に戻して blur し、パネルは開いたまま。ファイルへ書き込まれないことを確認。
+    acceptance_conditions:
+      - "フィールド編集中の Escape で値が元に戻り、ファイルに書き込まれない"
+    out_of_scope: "テキストエリアの編集履歴"
+    owner: "claude"
+    next_action: "PR の変更内容を確認する"
+    blocker: null
+    updated_at: "2026-08-26T08:20:00Z"
   - id: "OV-CON-005"
     project: "Overlord"
     title: "board.yaml が複数リポジトリに分かれている場合の扱い"
