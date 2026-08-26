@@ -567,10 +567,12 @@ function renderDock() {
   controls.replaceChildren();
   if (ready) {
     controls.append(
-      dockButton(view.screenOpen ? "画面を隠す" : "画面を表示", () => {
-        view.screenOpen = !view.screenOpen;
+      dockButton(screenVisible() ? "画面を隠す" : "画面を表示", () => {
+        // Hide wins whenever the screen is showing, even via a transient peek.
+        view.screenOpen = !screenVisible();
         view.screenPeek = false;
         try {
+          // Only the explicit choice is persisted; a peek never is.
           localStorage.setItem(SCREEN_OPEN_KEY, view.screenOpen ? "1" : "0");
         } catch {
           /* private windows and blocked storage are fine */
@@ -798,18 +800,66 @@ function renderCompose() {
 
   const templates = document.createElement("div");
   templates.className = "templates";
+
+  // Inline note form for "気づきをカードに": the skill command stays out of
+  // the DOM; only the user's own note is typed here.
+  const noteForm = document.createElement("div");
+  noteForm.className = "inline-form";
+  noteForm.hidden = true;
+  const noteInput = document.createElement("input");
+  noteInput.type = "text";
+  noteInput.placeholder = "気づき・観測した問題を1〜2文で";
+  const noteSend = document.createElement("button");
+  noteSend.className = "btn primary";
+  noteSend.textContent = "送信";
+  noteSend.disabled = true;
+  noteInput.addEventListener("input", () => {
+    noteSend.disabled = noteInput.value.trim() === "";
+  });
+  let notePrefix = "";
+  const submitNote = async () => {
+    const note = noteInput.value.trim();
+    if (note === "") return;
+    const sent = await sendTemplate(notePrefix + note);
+    if (!sent) return;
+    noteInput.value = "";
+    noteSend.disabled = true;
+    noteForm.hidden = true;
+  };
+  noteSend.addEventListener("click", () => void submitNote());
+  noteInput.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      void submitNote();
+    }
+    if (event.key === "Escape") {
+      // Close only the form; keep the card detail panel open.
+      event.stopPropagation();
+      noteForm.hidden = true;
+    }
+  });
+  noteForm.append(noteInput, noteSend);
+
   for (const template of dockTemplates()) {
     const button = document.createElement("button");
     button.className = "btn";
     button.textContent = template.label;
-    button.addEventListener("click", () => fillCompose(template.text));
+    if (template.inline) {
+      button.addEventListener("click", () => {
+        notePrefix = template.prefix;
+        noteForm.hidden = !noteForm.hidden;
+        if (!noteForm.hidden) noteInput.focus();
+      });
+    } else {
+      button.addEventListener("click", () => void sendTemplate(template.text));
+    }
     templates.append(button);
   }
-  root.append(templates);
+  root.append(templates, noteForm);
 
   const input = document.createElement("textarea");
   input.id = "compose-input";
-  input.placeholder = "司令塔への指示（⌘Enter または Ctrl+Enter で送信）";
+  input.placeholder = "詳細・自由入力（⌘Enter または Ctrl+Enter で送信）";
   input.value = view.draft;
   input.addEventListener("input", () => {
     view.draft = input.value;
@@ -895,7 +945,8 @@ function dockTemplates() {
     },
     {
       label: "気づきをカードに",
-      text: "/product-improvement-card ",
+      prefix: "/product-improvement-card ",
+      inline: true,
     },
     {
       label: "ボード更新",
@@ -918,6 +969,34 @@ function fillCompose(text) {
   input.focus();
   input.setSelectionRange(next.length, next.length);
   if (draft.trim() !== "") toast("下書きの末尾に追記しました");
+}
+
+/**
+ * Send a fixed template directly to the commander. Never touches
+ * #compose-input or view.draft, so an unsent draft always survives.
+ * Returns true when the text was sent.
+ */
+async function sendTemplate(text) {
+  const link = commanderLink();
+  if (!link) {
+    toast("先に司令塔を設定してください", true);
+    return false;
+  }
+  try {
+    await api("/api/cmux/send", {
+      method: "POST",
+      body: JSON.stringify({ surface: link.surface.id, text, submit: true }),
+    });
+    toast("送信しました");
+    // Transient peek so the reply is visible; the persisted choice is untouched.
+    view.screenPeek = true;
+    renderDock();
+    setTimeout(() => refreshScreen(link.surface.id), 400);
+    return true;
+  } catch (error) {
+    toast(`送信できません: ${error.message}`, true);
+    return false;
+  }
 }
 
 async function send(submit) {
