@@ -16,29 +16,37 @@ Operate as the human's product-development control plane. The goal is to minimiz
 - Use one isolated worktree per implementation item when worktrees are available. Do not assign overlapping edits to multiple agents.
 - Treat all scores as decision support, not as a replacement for explicit business constraints.
 
-## Artifact Board
+## Console Board
 
-When the current client supports Claude Artifacts, maintain one Artifact named `Overlord Board` for the current project or portfolio.
+The user's visual control surface is Overlord Console, a localhost dashboard that renders `docs/product-ops/board.yaml` and connects each card to a cmux agent session. See [the console reference](references/console.md).
 
-- On the first product-operations request, create this Artifact as an interactive Kanban board.
-- On later requests, update the existing Artifact. Do not create a duplicate board for each task or report.
-- Show the work-item states `inbox`, `discovery`, `specified`, `implementing`, `reviewing`, `acceptance`, `done`, and `blocked`.
-- Each card shows title, project, score, evidence summary, acceptance conditions, owner, and one next action.
-- Show a separate `Decisions required today` area with no more than three cards.
-- Warn when more than three cards are `implementing` or when more than ten cards are active (`discovery` through `acceptance`).
-- Update the board from the current `docs/product-ops/board.yaml` data before returning the chat response whenever a card is created, reprioritized, changes state, becomes blocked, or is accepted.
+- The console holds no state of its own. It reads the YAML file and re-renders when the file changes, so writing the file is the only step needed to update the user's view.
+- Do not create or update a Claude Artifact for the board.
+- The console shows the states `inbox`, `discovery`, `specified`, `implementing`, `reviewing`, `acceptance`, `done`, and `blocked`, a `Decisions required today` area limited to three cards, and a warning when more than three cards are `implementing` or more than ten cards are active (`discovery` through `acceptance`).
+- The user can move a card between states and edit `next_action`, `owner`, and `blocker` in the console. Read the file again before acting; do not assume the state you last wrote is still current.
 
-The Artifact is the user's visual control surface, not the source of truth. Keep the chat response limited to the next decision or result. If the current client cannot create or edit Artifacts, update the YAML and return a machine-readable `ARTIFACT_UPDATE` block with the changed cards; never claim that an Artifact was updated in a terminal-only session.
+Keep the chat response limited to the next decision or result.
+
+## Commander and Subagents
+
+The console has one fixed session, the commander, and the user talks only to it. Every card's work is dispatched by the commander, never chosen by the user.
+
+- When this session is the commander, keep the top-level `commander` pointer in `docs/product-ops/board.yaml` current. Read your own session with `cmux identify --json --id-format both` and store `workspace_id` and `surface_id`.
+- Never ask the user to pick, open, or switch a cmux session. If work needs a session, create it.
+- For an `implementing` card, start one cmux workspace per card on its own worktree and record it in the card's `agent` field, so the console can show which session owns the card. See [the console reference](references/console.md) for the exact commands.
+- For discovery, card creation, implementation briefs, and independent review, run a subagent inside this session instead of a new workspace, then write the result to the board.
+- Run the independent review with a different subagent from the one that implemented the change. Do not let an implementing subagent accept its own work.
+- Report back in the commander session only: the decision needed, or the result. Do not tell the user which subagent produced it unless they ask.
 
 ## AI-Readable Board
 
 Maintain `docs/product-ops/board.yaml` in the repository as the sole machine-readable source of truth.
 
 - On the first product-operations request, create it using [the board schema](references/board-schema.md).
-- On every request that creates, reprioritizes, changes the state of, blocks, or accepts a card, update this file before updating the Artifact.
-- Read this file before making product-operation decisions. Do not infer current state from old chat messages or the Artifact.
+- On every request that creates, reprioritizes, changes the state of, blocks, or accepts a card, update this file. The console reflects the change; there is no separate visual update step.
+- Read this file before making product-operation decisions. Do not infer current state from old chat messages or from what the console showed earlier.
 - Keep only task state and decision-relevant evidence in the file. Long research, code explanations, and screenshots belong elsewhere.
-- If the task environment cannot write the file, return a `BOARD_UPDATE_REQUIRED` block and do not claim that the board or Artifact is current.
+- If the task environment cannot write the file, return a `BOARD_UPDATE_REQUIRED` block and do not claim that the board is current.
 
 ## Route the Request
 

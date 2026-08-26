@@ -23,6 +23,6 @@ Acceptance condition:
 
 Limit findings to five unless a user explicitly asks for a full audit. Do not implement fixes during the audit. Turn accepted findings into improvement cards with `product-improvement-card`.
 
-## Artifact Board Update
+## Board Update
 
-For each accepted finding, update `docs/product-ops/board.yaml` first with a `discovery` card containing the scenario ID, evidence, severity, smallest useful improvement, and acceptance condition. Then update the existing `Overlord Board` Artifact from those cards when Artifact editing is available. Do not create a new board. In a terminal-only client, update the YAML and return the equivalent `ARTIFACT_UPDATE` block after the audit.
+For each accepted finding, update `docs/product-ops/board.yaml` with a `discovery` card containing the scenario ID, evidence, severity, smallest useful improvement, and acceptance condition. Overlord Console renders the file, so no separate board update is needed. If the file cannot be written, return a `BOARD_UPDATE_REQUIRED` block and do not claim that the board is current.

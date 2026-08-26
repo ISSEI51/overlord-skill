@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Overlord Console</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="top">
+      <div class="brand">
+        <span class="mark">◧</span>
+        <span class="name">Overlord</span>
+      </div>
+      <div class="meta">
+        <span id="board-path" class="path" title=""></span>
+        <span id="wip" class="wip"></span>
+      </div>
+      <div class="actions">
+        <button id="new-card" class="btn">気づきを追加</button>
+        <span id="conn" class="pill">接続中</span>
+      </div>
+    </header>
+
+    <div class="stage">
+      <div class="workarea">
+        <section id="decisions" class="decisions" hidden>
+          <h2>今日の判断</h2>
+          <div id="decision-list" class="decision-list"></div>
+        </section>
+
+        <main id="board" class="board"></main>
+
+        <aside id="detail" class="detail" hidden>
+          <div class="detail-head">
+            <div>
+              <div id="detail-id" class="detail-id"></div>
+              <h2 id="detail-title" class="detail-title"></h2>
+            </div>
+            <button id="detail-close" class="btn ghost" title="閉じる">×</button>
+          </div>
+          <div id="detail-body" class="detail-body"></div>
+        </aside>
+      </div>
+
+      <div id="resizer" class="resizer" title="幅を変える"></div>
+
+      <aside id="dock" class="dock">
+        <div class="dock-head">
+          <div class="dock-title">
+            <span class="dock-label">司令塔</span>
+            <span id="commander-name" class="dock-session"></span>
+          </div>
+          <div id="dock-controls" class="dock-controls"></div>
+        </div>
+        <pre id="commander-screen" class="screen"></pre>
+        <div id="dock-compose" class="compose"></div>
+      </aside>
+    </div>
+
+    <div id="toast" class="toast" hidden></div>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
