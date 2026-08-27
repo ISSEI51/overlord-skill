@@ -44,8 +44,6 @@ export default function App() {
 
   /* Persisted dock choices; localStorage keys are shared with the old UI. */
   const [dockOpen, setDockOpen] = useState(() => readStorage(DOCK_OPEN_KEY) !== "0");
-  /** Transient peek (memory only): a successful send re-shows dock + mirror. */
-  const [peek, setPeek] = useState(false);
   const [setupOpen, setSetupOpen] = useState(false);
   const [dockWidth, setDockWidth] = useState(readDockWidth);
   const [dockResizing, setDockResizing] = useState(false);
@@ -234,8 +232,6 @@ export default function App() {
             body: JSON.stringify({ surface: link.surface.id, text, submit: true }),
           });
           toast.success("送信しました");
-          // Transient peek so the reply is visible; persisted choices are untouched.
-          setPeek(true);
           refreshScreenSoon(400);
           return true;
         } catch (error) {
@@ -363,9 +359,9 @@ export default function App() {
   const configured = Boolean(data.board.commander?.surface_id);
   const ready = Boolean(link) && !setupOpen;
   /** Single authority for whether the whole commander dock is shown. */
-  const dockVisible = dockOpen || peek;
-  /** The mirror always shows while the dock is visible and a commander is ready. */
-  const screenVisible = ready && dockVisible;
+  const dockVisible = dockOpen;
+  /** The mirror always shows while the dock is open and a commander is ready. */
+  const screenVisible = ready && dockOpen;
 
   const controller: ConsoleController = {
     data,
@@ -409,14 +405,11 @@ export default function App() {
 
   return (
     <SidebarProvider
-      // The dock is the shadcn Sidebar; its open state is dockOpen || peek,
+      // The dock is the shadcn Sidebar; its open state is dockOpen,
       // persisted to the legacy localStorage key instead of the cookie.
       open={dockVisible}
       onOpenChange={(next) => {
-        // Hide wins whenever the dock is showing, even via a transient peek;
-        // only the explicit choice is persisted, a peek never is.
         setDockOpen(next);
-        setPeek(false);
         writeStorage(DOCK_OPEN_KEY, next ? "1" : "0");
       }}
       className="h-svh min-h-svh"
