@@ -12,13 +12,14 @@ import { basename, dirname, join, resolve } from "node:path";
 import * as cmux from "./cmux.ts";
 import * as cmuxSocket from "./cmux-socket.ts";
 import {
+  BoardConflictError,
   boardPathFor,
   canonicalItem,
   loadBoard,
+  mutateBoard,
   nowIso,
   projectRootFor,
   revisionOf,
-  saveBoard,
   STATES,
   type Board,
   type Item,
@@ -183,6 +184,36 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/**
+ * Rejection raised from inside a `mutateBoard` callback. Throwing aborts the
+ * write, so a request that turns out to be invalid only after the board was
+ * read (unknown item, non-editable field) leaves the file untouched.
+ */
+class RequestError extends Error {
+  readonly status: number;
+
+  constructor(message: string, status = 400) {
+    super(message);
+    this.name = "RequestError";
+    this.status = status;
+  }
+}
+
+/** Record the revision this server just wrote and tell the clients. */
+function announce(rev: string): void {
+  lastRev = rev;
+  broadcast({ type: "board", rev });
+}
+
+/** Turn a failed board write into the response the frontend expects. */
+function boardFailure(error: unknown): Response {
+  if (error instanceof BoardConflictError) {
+    return json({ error: error.message, rev: error.rev }, 409);
+  }
+  if (error instanceof RequestError) return fail(error.message, error.status);
+  throw error;
+}
+
 /* ------------------------------------------------------------- board API */
 
 const PATCHABLE = new Set([
@@ -205,69 +236,97 @@ async function patchItem(request: Request, id: string): Promise<Response> {
     request,
   );
   const patch = payload.patch ?? {};
-  const { board, rev } = await loadBoard(options.boardPath);
-  if (payload.rev && payload.rev !== rev) {
-    return json({ error: "board changed on disk", rev }, 409);
+  try {
+    const { rev, result } = await mutateBoard(
+      options.boardPath,
+      payload.rev,
+      (board) => {
+        const item = board.items.find((entry) => entry.id === id);
+        if (!item) throw new RequestError(`unknown item: ${id}`, 404);
+        for (const [key, value] of Object.entries(patch)) {
+          if (!PATCHABLE.has(key)) {
+            throw new RequestError(`field not editable: ${key}`);
+          }
+          if (key === "state" && !STATES.includes(value as State)) {
+            throw new RequestError(`unknown state: ${String(value)}`);
+          }
+          (item as Record<string, unknown>)[key] = value;
+        }
+        item.updated_at = nowIso();
+        const index = board.items.indexOf(item);
+        board.items[index] = canonicalItem(item);
+        return board.items[index]!;
+      },
+    );
+    announce(rev);
+    return json({ item: result, rev });
+  } catch (error) {
+    return boardFailure(error);
   }
-  const item = board.items.find((entry) => entry.id === id);
-  if (!item) return fail(`unknown item: ${id}`, 404);
-  for (const [key, value] of Object.entries(patch)) {
-    if (!PATCHABLE.has(key)) return fail(`field not editable: ${key}`);
-    if (key === "state" && !STATES.includes(value as State)) {
-      return fail(`unknown state: ${String(value)}`);
-    }
-    (item as Record<string, unknown>)[key] = value;
-  }
-  item.updated_at = nowIso();
-  const index = board.items.indexOf(item);
-  board.items[index] = canonicalItem(item);
-  const nextRev = await saveBoard(options.boardPath, board);
-  lastRev = nextRev;
-  broadcast({ type: "board", rev: nextRev });
-  return json({ item: board.items[index], rev: nextRev });
 }
 
 async function deleteItem(request: Request, id: string): Promise<Response> {
   const payload = await body<{ rev?: string }>(request);
-  const { board, rev } = await loadBoard(options.boardPath);
-  if (payload.rev && payload.rev !== rev) {
-    return json({ error: "board changed on disk", rev }, 409);
+  try {
+    const { rev } = await mutateBoard(options.boardPath, payload.rev, (board) => {
+      const index = board.items.findIndex((entry) => entry.id === id);
+      if (index === -1) throw new RequestError(`unknown item: ${id}`, 404);
+      if (board.items[index]!.state !== "done") {
+        throw new RequestError("only done items can be deleted");
+      }
+      board.items.splice(index, 1);
+    });
+    announce(rev);
+    return json({ ok: true, rev });
+  } catch (error) {
+    return boardFailure(error);
   }
-  const index = board.items.findIndex((entry) => entry.id === id);
-  if (index === -1) return fail(`unknown item: ${id}`, 404);
-  if (board.items[index]!.state !== "done") {
-    return fail("only done items can be deleted");
-  }
-  board.items.splice(index, 1);
-  const nextRev = await saveBoard(options.boardPath, board);
-  lastRev = nextRev;
-  broadcast({ type: "board", rev: nextRev });
-  return json({ ok: true, rev: nextRev });
 }
 
+/**
+ * Create a card. `rev` is optional here and only here: the frontend's create
+ * dialog does not hold a revision, and a create never overwrites an existing
+ * card, so an omitted `rev` writes without an optimistic check exactly as it
+ * did before. A caller that does send `rev` gets the same 409 as the other
+ * write endpoints. Either way the write runs through the serialized board
+ * write path, so a concurrent edit is no longer overwritten wholesale.
+ */
 async function createItem(request: Request): Promise<Response> {
-  const payload = await body<{ title?: string; project?: string; state?: State; evidence?: string }>(
-    request,
-  );
+  const payload = await body<{
+    rev?: string;
+    title?: string;
+    project?: string;
+    state?: State;
+    evidence?: string;
+  }>(request);
   const title = (payload.title ?? "").trim();
   if (!title) return fail("title is required");
-  const { board } = await loadBoard(options.boardPath);
-  const item = canonicalItem({
-    id: nextId(board, payload.project),
-    project: payload.project ?? null,
-    title,
-    state: payload.state && STATES.includes(payload.state) ? payload.state : "inbox",
-    evidence: payload.evidence ?? null,
-    owner: null,
-    next_action: null,
-    blocker: null,
-    updated_at: nowIso(),
-  } as Item);
-  board.items.unshift(item);
-  const rev = await saveBoard(options.boardPath, board);
-  lastRev = rev;
-  broadcast({ type: "board", rev });
-  return json({ item, rev });
+  try {
+    const { rev, result } = await mutateBoard(
+      options.boardPath,
+      payload.rev,
+      (board) => {
+        const item = canonicalItem({
+          id: nextId(board, payload.project),
+          project: payload.project ?? null,
+          title,
+          state:
+            payload.state && STATES.includes(payload.state) ? payload.state : "inbox",
+          evidence: payload.evidence ?? null,
+          owner: null,
+          next_action: null,
+          blocker: null,
+          updated_at: nowIso(),
+        } as Item);
+        board.items.unshift(item);
+        return item;
+      },
+    );
+    announce(rev);
+    return json({ item: result, rev });
+  } catch (error) {
+    return boardFailure(error);
+  }
 }
 
 function nextId(board: Board, project?: string): string {
@@ -289,15 +348,20 @@ async function setCommander(request: Request): Promise<Response> {
   const payload = await body<{ rev?: string; commander?: SessionLink | null }>(
     request,
   );
-  const { board, rev } = await loadBoard(options.boardPath);
-  if (payload.rev && payload.rev !== rev) {
-    return json({ error: "board changed on disk", rev }, 409);
+  try {
+    const { rev, result } = await mutateBoard(
+      options.boardPath,
+      payload.rev,
+      (board) => {
+        board.commander = payload.commander ?? null;
+        return board.commander;
+      },
+    );
+    announce(rev);
+    return json({ commander: result, rev });
+  } catch (error) {
+    return boardFailure(error);
   }
-  board.commander = payload.commander ?? null;
-  const nextRev = await saveBoard(options.boardPath, board);
-  lastRev = nextRev;
-  broadcast({ type: "board", rev: nextRev });
-  return json({ commander: board.commander, rev: nextRev });
 }
 
 /* -------------------------------------------------------------- cmux API */
