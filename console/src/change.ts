@@ -12,6 +12,7 @@
  * Implemented subcommands:
  *   change start <change-id> [--board <path>] [--base <branch>]
  *   change pr    <change-id> [--board <path>] [--base <branch>] [--number <n>]
+ *   change sync  [<card-id>] [--all] [--board <path>]
  */
 
 import { dirname, resolve } from "node:path";
@@ -100,6 +101,57 @@ export async function updateChange(
 }
 
 /**
+ * Read the board, mutate several changes, write the board back once.
+ *
+ * `sync` reads many pull requests in one run, and every board write makes the
+ * console re-render, so the whole run must land as a single write. The
+ * concurrency safety is the same as `updateChange`: the revision is re-read
+ * immediately before saving and, if the file moved, the board is re-read once
+ * and every mutation is re-applied to its own change, so a concurrent console
+ * edit elsewhere on the board survives. The mutation therefore has to be
+ * idempotent, exactly as it is for `updateChange`.
+ *
+ * An empty id list writes nothing at all, so a run that found no update leaves
+ * the file, and the console, untouched.
+ */
+export async function updateChanges(
+  boardPath: string,
+  changeIds: string[],
+  mutate: (change: Change) => void,
+): Promise<void> {
+  if (changeIds.length === 0) return;
+
+  /** Apply every mutation to one loaded board; report the cards touched. */
+  const applyAll = (board: Board): Item[] => {
+    const touched: Item[] = [];
+    for (const changeId of changeIds) {
+      const found = findChange(board, changeId);
+      if (!found) throw new ChangeNotFoundError(changeId);
+      mutate(found.change);
+      if (!touched.includes(found.item)) touched.push(found.item);
+    }
+    return touched;
+  };
+
+  const loaded = await loadBoard(boardPath);
+  let board = loaded.board;
+  let touched = applyAll(board);
+
+  const current = await revisionOf(boardPath);
+  if (current !== loaded.rev) {
+    const reloaded = await loadBoard(boardPath);
+    board = reloaded.board;
+    touched = applyAll(board);
+  }
+
+  for (const item of touched) {
+    const index = board.items.indexOf(item);
+    if (index >= 0) board.items[index] = canonicalItem(item);
+  }
+  await saveBoard(boardPath, board);
+}
+
+/**
  * Board file to operate on: `--board <path>`, else `$OVERLORD_BOARD`, else the
  * current directory. Directory targets get the standard board suffix appended
  * by `boardPathFor`.
@@ -131,6 +183,11 @@ export class CommandError extends Error {
 async function run(command: string[], cwd?: string): Promise<RunResult> {
   const proc = Bun.spawn(command, {
     cwd,
+    // A copy of the current environment rather than the default: Bun resolves
+    // the executable against the PATH of the environment it is handed, and the
+    // default is the environment the process was started with, so a PATH set
+    // after startup would otherwise be ignored.
+    env: { ...process.env },
     stdout: "pipe",
     stderr: "pipe",
     stdin: "ignore",
@@ -223,8 +280,15 @@ export type ParsedArgs = {
   options: Record<string, string>;
 };
 
-/** Split `--key value` options out of an argument list. */
-export function parseArgs(argv: string[]): ParsedArgs {
+/**
+ * Split `--key value` options out of an argument list.
+ *
+ * Names listed in `booleans` are flags: they take no value, never swallow the
+ * next argument, and are recorded as `"true"` so the option map stays a plain
+ * string map.
+ */
+export function parseArgs(argv: string[], booleans: string[] = []): ParsedArgs {
+  const flags = new Set(booleans);
   const positional: string[] = [];
   const options: Record<string, string> = {};
   for (let index = 0; index < argv.length; index += 1) {
@@ -238,11 +302,16 @@ export function parseArgs(argv: string[]): ParsedArgs {
       options[arg.slice(2, equals)] = arg.slice(equals + 1);
       continue;
     }
+    const name = arg.slice(2);
+    if (flags.has(name)) {
+      options[name] = "true";
+      continue;
+    }
     const value = argv[index + 1];
     if (value === undefined || value.startsWith("--")) {
       throw new Error(`option ${arg} needs a value`);
     }
-    options[arg.slice(2)] = value;
+    options[name] = value;
     index += 1;
   }
   return { positional, options };
@@ -629,6 +698,202 @@ export async function pr(argv: string[]): Promise<number> {
 }
 
 // ---------------------------------------------------------------------------
+// sync
+// ---------------------------------------------------------------------------
+
+/**
+ * Changes `sync` can read: those that already carry a pull request number.
+ *
+ * A change whose `pr` is still null has never been pushed, so there is nothing
+ * to ask GitHub about and it is skipped rather than reported as a failure.
+ */
+export function syncTargets(items: Item[]): FoundChange[] {
+  const targets: FoundChange[] = [];
+  for (const item of items) {
+    const changes = item.changes;
+    if (!Array.isArray(changes)) continue;
+    changes.forEach((change, index) => {
+      if (!change) return;
+      if (typeof change.pr?.number !== "number") return;
+      targets.push({ item, change, index });
+    });
+  }
+  return targets;
+}
+
+/** What one `gh pr view` result did to one change. */
+export type SyncOutcome = {
+  /** Whether anything on the change actually moved. */
+  changed: boolean;
+  /** Pull request state on the board before this run. */
+  previousState: string | null;
+  /** Pull request state after this run. */
+  state: string | null;
+  /** Whether this run moved the change itself to `done`. */
+  changeDone: boolean;
+};
+
+/**
+ * Write one `gh pr view` result onto one change and report what moved.
+ *
+ * `merged` is the only pull request state that decides the change is finished.
+ * A `closed` pull request leaves `change.state` alone on purpose: closing can
+ * mean abandoned, superseded or reopened next, and that call belongs to the
+ * commander, not to a status poll.
+ *
+ * `reviewed_sha` belongs to the review commands and is carried over unchanged,
+ * the same way `pr` treats it. The function only touches the change it is
+ * given and reads nothing else, so it is safe to re-apply after a reload.
+ */
+export function applyPullRequestView(
+  change: Change,
+  view: PullRequestView,
+): SyncOutcome {
+  const previous = change.pr ?? {};
+  const previousState = previous.state ?? null;
+  const state = normalizePrState(view.state);
+  const url = view.url ?? previous.url ?? null;
+  const headSha = view.headRefOid ?? previous.head_sha ?? null;
+
+  const prMoved =
+    state !== previousState ||
+    url !== (previous.url ?? null) ||
+    headSha !== (previous.head_sha ?? null);
+  const changeDone = state === "merged" && change.state !== "done";
+
+  change.pr = {
+    number: view.number,
+    url,
+    state,
+    head_sha: headSha,
+    reviewed_sha: previous.reviewed_sha ?? null,
+  };
+  if (changeDone) change.state = "done";
+
+  return { changed: prMoved || changeDone, previousState, state, changeDone };
+}
+
+/** One reported line: `OV-103-C2  open -> merged  (change done)`. */
+export function syncLine(changeId: string, outcome: SyncOutcome): string {
+  const from = outcome.previousState ?? "unknown";
+  const to = outcome.state ?? "unknown";
+  const done = outcome.changeDone ? "  (change done)" : "";
+  return `${changeId}  ${from} -> ${to}${done}`;
+}
+
+/**
+ * Read the pull request state of every recorded change and write it back.
+ *
+ * One run reads many pull requests but writes `board.yaml` exactly once, so
+ * the console re-renders once per run instead of once per change. Only the
+ * changes that actually moved are written, so a run that found nothing new
+ * leaves the file untouched.
+ *
+ * A `gh` failure on one change is reported and skipped; the remaining changes
+ * are still synchronized and still written, and the command then exits
+ * non-zero so the caller knows the picture is incomplete.
+ */
+export async function sync(argv: string[]): Promise<number> {
+  const { positional, options } = parseArgs(argv, ["all"]);
+  const cardId = positional[0] ?? null;
+  const all = options.all === "true";
+  if (!cardId && !all) {
+    process.stderr.write("usage: change sync [<card-id>] [--all]\n");
+    return 2;
+  }
+  if (cardId && all) {
+    process.stderr.write(
+      `sync takes a card id or --all, not both: ${cardId} --all\n`,
+    );
+    return 2;
+  }
+
+  const boardPath = resolveBoardPath(options.board);
+  const { board, exists } = await loadBoard(boardPath);
+  if (!exists) {
+    process.stderr.write(`board not found: ${boardPath}\n`);
+    return 1;
+  }
+
+  let items = board.items;
+  if (cardId) {
+    const item = board.items.find((candidate) => candidate.id === cardId);
+    if (!item) {
+      process.stderr.write(
+        `unknown card id: ${cardId} (board: ${boardPath})\n`,
+      );
+      return 1;
+    }
+    items = [item];
+  }
+
+  const targets = syncTargets(items);
+  if (targets.length === 0) {
+    process.stdout.write("no change has a pull request to read\n");
+    return 0;
+  }
+
+  const root = await mainRepoRoot();
+  const views = new Map<string, PullRequestView>();
+  let failures = 0;
+
+  for (const target of targets) {
+    const number = target.change.pr!.number!;
+    const viewed = await gh(
+      ["pr", "view", String(number), "--json", PR_VIEW_FIELDS],
+      root,
+    );
+    if (viewed.code !== 0) {
+      process.stderr.write(
+        `${target.change.id}: gh pr view ${number} failed\n`,
+      );
+      reportFailure(viewed);
+      failures += 1;
+      continue;
+    }
+    const view = parseJson<PullRequestView>(viewed.stdout);
+    if (!view || typeof view.number !== "number") {
+      process.stderr.write(
+        `${target.change.id}: could not read: gh pr view ${number}\n`,
+      );
+      failures += 1;
+      continue;
+    }
+    views.set(target.change.id, view);
+  }
+
+  // Applied to the copy loaded above only to find out what moved and to build
+  // the report. The file on disk is written once, below, and only for the
+  // changes that moved.
+  const lines: string[] = [];
+  const moved: string[] = [];
+  for (const target of targets) {
+    const view = views.get(target.change.id);
+    if (!view) continue;
+    const outcome = applyPullRequestView(target.change, view);
+    if (!outcome.changed) continue;
+    moved.push(target.change.id);
+    lines.push(syncLine(target.change.id, outcome));
+  }
+
+  if (moved.length === 0) {
+    process.stdout.write(
+      "no pull request moved; the board is already current\n",
+    );
+    return failures > 0 ? 1 : 0;
+  }
+
+  await updateChanges(boardPath, moved, (change) => {
+    const view = views.get(change.id);
+    if (view) applyPullRequestView(change, view);
+  });
+
+  for (const line of lines) process.stdout.write(`${line}\n`);
+  process.stdout.write(`board updated:    ${boardPath}\n`);
+  return failures > 0 ? 1 : 0;
+}
+
+// ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
 
@@ -639,6 +904,9 @@ commands:
                       them on the board
   pr <change-id>      push the change branch, open its pull request and record
                       it on the board
+  sync [<card-id>]    read the pull request state of every recorded change of
+                      one card, or of the whole board with --all, and write it
+                      back in a single board write
 
 options:
   --board <path>      board.yaml, or a project directory containing one
@@ -647,12 +915,14 @@ options:
                       (default: the current branch of the main checkout)
   --number <n>        pr only: record the pull request with this number instead
                       of creating one, for a pull request opened by hand
+  --all               sync only: every card on the board instead of one card
 `;
 
 export async function main(argv: string[]): Promise<number> {
   const command = argv[0];
   if (command === "start") return start(argv.slice(1));
   if (command === "pr") return pr(argv.slice(1));
+  if (command === "sync") return sync(argv.slice(1));
   if (command === undefined || command === "--help" || command === "-h") {
     process.stdout.write(USAGE);
     return command === undefined ? 2 : 0;
