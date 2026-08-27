@@ -7,7 +7,7 @@
  */
 
 import { mkdir, rename, stat, writeFile } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import { dirname, resolve, sep } from "node:path";
 
 export const STATES = [
   "inbox",
@@ -105,6 +105,22 @@ export function boardPathFor(target: string): string {
   return absolute.endsWith(".yaml") || absolute.endsWith(".yml")
     ? absolute
     : resolve(absolute, "docs/product-ops/board.yaml");
+}
+
+/**
+ * Project root for a resolved board path.
+ *
+ * Inverse of the `docs/product-ops/board.yaml` suffix that boardPathFor
+ * appends to a directory target: when the board file sits in a
+ * `<root>/docs/product-ops` directory, the root is two levels above it.
+ * For a board file anywhere else, the board's own directory is the project
+ * root; it is never assumed to be two levels up (which made projectRoot "/"
+ * for boards near the filesystem root).
+ */
+export function projectRootFor(boardPath: string): string {
+  const directory = dirname(boardPath);
+  const suffix = `${sep}docs${sep}product-ops`;
+  return directory.endsWith(suffix) ? resolve(directory, "../..") : directory;
 }
 
 /** Revision token used for optimistic concurrency against agent writes. */

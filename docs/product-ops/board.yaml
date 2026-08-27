@@ -1,66 +1,17 @@
 version: 1
-updated_at: "2026-08-26T08:20:00Z"
+updated_at: "2026-08-27T03:53:39Z"
 commander:
   workspace_id: "C06728B8-B8BA-4D83-A69D-9ADE254532CB"
   surface_id: "93EF686E-FAF3-4474-850A-0DEAC3C5BD8D"
   cwd: "/Users/kunimasa/dev/overlord"
 decisions_required:
-  - id: "OV-CON-001"
-    question: "Overlord Console 導入とUX監査修正の PR を確認し、マージ可否を判断する"
-items:
-  - id: "OV-CON-001"
-    project: "Overlord"
-    title: "Overlord Console の導入（Artifact からの置き換え）"
-    state: "reviewing"
-    priority:
-      impact: 5
-      urgency: 4
-      confidence: 5
-      ease: 4
-      override: null
-    evidence: |-
-      Artifact は claude.ai の CSP により 127.0.0.1 へ接続できず、cmux と連携できない。
-      console/ に Bun 製のローカルサーバーと board.yaml ダッシュボードを追加し、
-      5つのスキルと README から Artifact 手順を削除した。
-      対話は司令塔1セッションに固定し、カードごとのセッション選択は廃止した。
-      カードのボタンは司令塔への指示文を入力欄に入れるだけで、送信はユーザー操作に限る。
-      実装者自身による動作確認は完了。独立レビューは未実施。作業ツリーは未コミット。
-    acceptance_conditions:
-      - "別セッションの AI による /product-change-review で止めるべき問題が残らない"
-      - "実利用の1件で、カード移動と司令塔への送信が成功する"
-      - "司令塔がサブエージェントを起動し、担当セッションがカードに記録される"
-      - "変更がコミットされている"
-    out_of_scope: "cmux 側の機能追加、board.yaml スキーマの再設計"
-    owner: "user"
-    next_action: "PR を確認し、必要なら PR 上で /product-change-review を実行する"
-    blocker: "コミット可否のユーザー判断"
-    updated_at: "2026-08-26T07:05:44Z"
   - id: "OV-CON-002"
-    project: "Overlord"
-    title: "エージェント画面のスクロールバックを UI から読めるようにする"
-    state: "specified"
-    priority:
-      impact: 3
-      urgency: 2
-      confidence: 5
-      ease: 5
-      override: null
-    evidence: |-
-      サーバーは /api/cmux/screen で scrollback=1 を受け付けるが、
-      console/public/app.js は lines=80 のみを渡しており、UI から呼べない。
-      直前の出力しか見えないため、長い応答は cmux 側に切り替えて読む必要がある。
-    acceptance_conditions:
-      - "エージェントタブから、表示行数の拡大またはスクロールバック取得を選べる"
-      - "取得中もカードの操作と送信が阻害されない"
-    out_of_scope: "端末エスケープシーケンスの色再現"
-    owner: null
-    next_action: "実装ブリーフを作成する"
-    blocker: null
-    updated_at: "2026-08-26T06:30:00Z"
+    question: "サーバー再起動+リロード後、スクロールバック(002)とミラー即時反映(003)を確認して2件を受け入れるか"
+items:
   - id: "OV-CON-003"
     project: "Overlord"
-    title: "画面取得をポーリングからイベント購読へ置き換えられるか調べる"
-    state: "discovery"
+    title: "端末ミラー取得をソケット直結+イベントトリガー化する"
+    state: "acceptance"
     priority:
       impact: 3
       urgency: 1
@@ -68,140 +19,17 @@ items:
       ease: 2
       override: null
     evidence: |-
-      現在はカードを開いている間、1.5秒ごとに cmux read-screen をプロセス起動で実行している。
-      cmux capabilities には terminal.bytes.v1、terminal.render_grid.v1、events.v1 があり、
-      購読方式に置き換えられる可能性があるが、CLI からの購読手段は未確認。
+      discovery 完了（サブエージェント実測）: 端末出力そのものを購読する手段は cmux に存在しない（events ストリームに端末出力イベントは流れない、terminal.* にストリーム系メソッドなし、render_revision も出力で不変 — すべて実測）。ただし events.stream は購読可能で、対象 surface の活動を示す間接イベント（agent.hook.*、surface.key_sent 等）は取れる。
+      修正後の採用案: (1) read-screen のプロセス起動（40回/分）を UNIX ソケット直結の surface.read_text に置換、(2) events.stream の常駐購読をトリガーに即時再取得（300ms デバウンス）、(3) フォールバックポーリングを 1.5秒→10秒に緩和。純イベント購読のみは実現不可のため主従逆転の構成とする。
     acceptance_conditions:
-      - "cmux CLI またはソケットから端末更新を購読できるかどうかを、実行結果付きで判定できる"
-    out_of_scope: "実装そのもの"
-    owner: null
-    next_action: "cmux events と rpc の端末系メソッドで購読可否を確認する"
+      - "端末ミラー取得で cmux CLI の子プロセス起動が定常的に発生しない（ソケット直結）"
+      - "司令塔で活動があった際、1秒以内にミラーへ反映される"
+      - "イベントに乗らない出力変化も最大10秒で反映される（フォールバック）"
+      - "cmux 再起動・ソケット切断後に自動で再接続し、ミラーが復旧する"
+    out_of_scope: "端末出力の完全な購読（cmux 側に機構がなく不可能）、フロントの表示仕様変更"
+    owner: "user"
+    next_action: "サーバー再起動後、ミラーの即時反映を体感して受け入れる"
     blocker: null
-    updated_at: "2026-08-26T06:30:00Z"
-  - id: "OV-CON-004"
-    project: "Overlord"
-    title: "--board に任意パスを渡すと projectRoot が / になる"
-    state: "specified"
-    priority:
-      impact: 2
-      urgency: 2
-      confidence: 4
-      ease: 5
-      override: null
-    evidence: |-
-      console/src/server.ts は projectRoot を resolve(dirname(boardPath), "../..") で決めている。
-      docs/product-ops 配下でない board を指定すると、
-      「新しいワークスペースで開始」の既定ディレクトリが意図しない場所になる。
-    acceptance_conditions:
-      - "docs/product-ops 配下でない board を指定しても、既定の作業ディレクトリが board の所在から妥当に決まる"
-    out_of_scope: "複数 board の同時表示"
-    owner: null
-    next_action: "実装ブリーフを作成する"
-    blocker: null
-    updated_at: "2026-08-26T06:30:00Z"
-  - id: "OV-CON-006"
-    project: "Overlord"
-    title: "司令塔のタイトルが長いと「変更」「cmux で開く」が画面外に押し出される"
-    state: "reviewing"
-    priority:
-      impact: 4
-      urgency: 3
-      confidence: 5
-      ease: 5
-      override: null
-    evidence: |-
-      UX監査 S4。scripts/console.sh 経由で起動したセッションはタイトルが
-      コマンドライン全文になり、ドックのヘッダーで省略されずに折り返す。
-      「変更」「cmux で開く」が不可視になり、司令塔の付け替え操作に到達できない。
-      原因の予想（コード確認済み）: .dock-session に min-width:0 がなく flex 縮小されない。
-      修正済み: .dock の列を minmax(0,1fr) で拘束し、セッション名に min-width:0 を追加。長いタイトルでもボタン表示をブラウザで確認。
-    acceptance_conditions:
-      - "任意の長さのセッションタイトルでも、ヘッダーの2つのボタンが常に表示される"
-      - "長いタイトルは省略記号で切り詰められる"
-    out_of_scope: "ドック全体のレイアウト変更"
-    owner: "claude"
-    next_action: "PR の変更内容を確認する"
-    blocker: null
-    updated_at: "2026-08-26T07:40:00Z"
-  - id: "OV-CON-007"
-    project: "Overlord"
-    title: "カードの指示ボタンが司令塔の未送信下書きを警告なく上書きする"
-    state: "reviewing"
-    priority:
-      impact: 4
-      urgency: 3
-      confidence: 5
-      ease: 4
-      override: null
-    evidence: |-
-      UX監査 S3。入力欄に下書きを書いた状態でカードの「状況を聞く」を押すと、
-      下書きが確認なしでテンプレート文に置き換わることを実操作で確認。
-      fillCompose() が input.value を無条件に代入している。
-      修正済み: fillCompose が未送信下書きの末尾に追記する方式に変更。下書きは view 状態に保持し、ドック再構築でも消えない。実操作で確認。
-    acceptance_conditions:
-      - "入力欄に未送信の文字があるとき、上書き前に確認するか、末尾に追記する"
-      - "空の入力欄では従来どおり1クリックでテンプレートが入る"
-    out_of_scope: "下書きの永続化"
-    owner: "claude"
-    next_action: "PR の変更内容を確認する"
-    blocker: null
-    updated_at: "2026-08-26T07:40:00Z"
-  - id: "OV-CON-008"
-    project: "Overlord"
-    title: "カード追加とディレクトリ指定がネイティブダイアログで1行しか書けない"
-    state: "reviewing"
-    priority:
-      impact: 3
-      urgency: 2
-      confidence: 5
-      ease: 4
-      override: null
-    evidence: |-
-      UX監査 S2。「気づきを追加」「司令塔を新しく起動」が window.prompt、
-      「中断」が window.confirm を使用（app.js に3箇所）。
-      1行しか入力できず、複数行の根拠を貼れない。Escape で入力内容が消える。
-      ネイティブダイアログはブラウザ自動化も停止させる。
-      修正済み: カード追加をページ内 dialog（複数行の根拠欄付き）に、司令塔の起動先をインライン入力に、中断を2度押し方式に置き換え。prompt/confirm は0箇所。
-    acceptance_conditions:
-      - "気づきの追加がページ内フォームで行え、複数行の根拠を書ける"
-      - "Escape やキャンセルで直前の入力が失われない"
-    out_of_scope: "カード編集フォームの全面化"
-    owner: "claude"
-    next_action: "PR の変更内容を確認する"
-    blocker: null
-    updated_at: "2026-08-26T07:40:00Z"
-  - id: "OV-CON-009"
-    project: "Overlord"
-    title: "フィールド編集中の Escape が取消ではなく保存になる"
-    state: "reviewing"
-    priority:
-      impact: 3
-      urgency: 2
-      confidence: 5
-      ease: 5
-      override: null
-    evidence: |-
-      UX監査 F5。編集中に Escape でパネルが閉じ、blur 経由で編集値が board.yaml に保存された。
-      修正済み: Escape は値を元に戻して blur し、パネルは開いたまま。ファイルへ書き込まれないことを確認。
-    acceptance_conditions:
-      - "フィールド編集中の Escape で値が元に戻り、ファイルに書き込まれない"
-    out_of_scope: "テキストエリアの編集履歴"
-    owner: "claude"
-    next_action: "PR の変更内容を確認する"
-    blocker: null
-    updated_at: "2026-08-26T08:20:00Z"
-  - id: "OV-CON-005"
-    project: "Overlord"
-    title: "board.yaml が複数リポジトリに分かれている場合の扱い"
-    state: "inbox"
-    priority: null
-    evidence: |-
-      コンソールは1インスタンスにつき1つの board.yaml を読む。
-      1ファイル内に project 別のカードを置く運用は可能だが、
-      リポジトリごとに board.yaml が分かれている場合は同時に見られない。
-    acceptance_conditions: []
-    out_of_scope: null
-    owner: null
-    next_action: "運用方針（1ファイル集約か複数表示か）を決める"
-    blocker: null
-    updated_at: "2026-08-26T06:30:00Z"
+    updated_at: "2026-08-27T15:40:00Z"
+    brief: "方針: 新規 cmux-socket.ts（Bun.connect の UNIX ソケット NDJSON クライアント、コマンド用+購読用の2接続、指数バックオフ再接続、boot_id/gap 検知、応答エンベロープ ok/result/error は実測で確定）。readScreen を surface.read_text の RPC に置換 — 実測で lines=N がスクロールバック末尾 N 行を返し CLI と4通りバイト単位一致（OV-CON-002 の HTTP 契約はそのまま維持、CLI フォールバックはソケット不通時と起動時セルフチェック不合格時の保険）。サーバーは events.stream を購読し 300ms デバウンスで SSE の activity 通知（本文送らずフロント即時 pull）。フォールバックポーリング 1.5s→10s。変更5ファイル・新規依存なし。サイズ M。実装順 003→002 確定。ロールバックは revert のみ。"
+    review: "実装エージェントの実測: ソケット接続2本、socket/CLI のバイト単位一致（scrollback 契約維持）、40リクエスト中 CLI 起動0、デバウンス動作。司令塔の追加検証: サーバー経由30リクエストで CLI 起動0（ps 50ms サンプリング）、activity フレームの end-to-end 配信（実セッションのフックイベント→SSE、surface_id 付き）を確認。実測差異: 素の端末出力はイベント非発生（エージェント活動のみ即時、素の出力は10秒ポーリングが安全網）。未確認: cmux 再起動時の再接続（コードレビューのみ、通常運用で自然に検証される）。コミット 7c64534 マージ済み。反映にはサーバー再起動が必要。"

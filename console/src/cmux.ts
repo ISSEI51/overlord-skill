@@ -5,6 +5,8 @@
  * cmux app over its local Unix socket. No other transport is used.
  */
 
+import * as cmuxSocket from "./cmux-socket.ts";
+
 const FALLBACK_BIN = "/Applications/cmux.app/Contents/Resources/bin/cmux";
 const DEFAULT_TIMEOUT_MS = 10_000;
 
@@ -218,26 +220,122 @@ async function withTerminal<T>(
   }
 }
 
+const UUID_PATTERN =
+  /^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$/;
+
+function readScreenArgs(surface: string, lines: number, scrollback: boolean): string[] {
+  const args = ["read-screen", "--surface", surface, "--lines", String(lines)];
+  if (scrollback) args.push("--scrollback");
+  return args;
+}
+
+function readScreenViaCli(
+  surface: string,
+  lines: number,
+  scrollback: boolean,
+): Promise<string> {
+  return withTerminal(surface, () => runOrThrow(readScreenArgs(surface, lines, scrollback)));
+}
+
+/**
+ * surface.read_text over the cmux socket. The CLI prints the same text plus
+ * a trailing newline (measured byte-for-byte), so the newline is appended
+ * here to keep /api/cmux/screen byte-identical with the CLI transport.
+ * RPC failures (ok:false) become CmuxError so withTerminal's one-shot
+ * terminal start still applies; transport failures stay
+ * CmuxSocketUnavailable so callers can fall back to the CLI.
+ */
+async function readTextViaSocket(
+  surfaceId: string,
+  lines: number,
+  scrollback: boolean,
+): Promise<string> {
+  try {
+    const result = await cmuxSocket.request<{ text: string }>("surface.read_text", {
+      surface_id: surfaceId,
+      lines,
+      scrollback,
+    });
+    return `${result.text}\n`;
+  } catch (error) {
+    if (error instanceof cmuxSocket.CmuxRpcError) {
+      const detail = `${error.code}: ${error.message}`;
+      throw new CmuxError(`cmux surface.read_text failed: ${detail}`, {
+        code: 1,
+        stdout: "",
+        stderr: detail,
+        timedOut: false,
+      });
+    }
+    throw error;
+  }
+}
+
+/**
+ * Scrollback reads run one socket/CLI equivalence self-check per process:
+ * the first scrollback request fetches through both transports and compares
+ * bytes. On a match every later read stays on the socket; on a mismatch all
+ * later scrollback reads use the CLI. If the socket is unreachable the
+ * check is deferred to the next scrollback request.
+ */
+let scrollbackTransport: "unchecked" | "socket" | "cli" = "unchecked";
+
+async function scrollbackSelfCheck(surface: string, lines: number): Promise<string> {
+  let viaSocket: string;
+  try {
+    viaSocket = await withTerminal(surface, () => readTextViaSocket(surface, lines, true));
+  } catch (error) {
+    if (error instanceof cmuxSocket.CmuxSocketUnavailable) {
+      return readScreenViaCli(surface, lines, true);
+    }
+    throw error;
+  }
+  const viaCli = await runOrThrow(readScreenArgs(surface, lines, true));
+  scrollbackTransport = viaSocket === viaCli ? "socket" : "cli";
+  return scrollbackTransport === "socket" ? viaSocket : viaCli;
+}
+
+/**
+ * Read a terminal surface's screen (or scrollback) text.
+ *
+ * The socket transport (surface.read_text) is used whenever possible; the
+ * CLI remains the fallback for (a) non-UUID surface identifiers, (b) an
+ * unreachable socket, and (c) scrollback reads after a failed self-check.
+ */
 export async function readScreen(
   surface: string,
   lines: number,
   scrollback: boolean,
 ): Promise<string> {
-  const args = ["read-screen", "--surface", surface, "--lines", String(lines)];
-  if (scrollback) args.push("--scrollback");
-  return withTerminal(surface, () => runOrThrow(args));
+  if (!UUID_PATTERN.test(surface)) return readScreenViaCli(surface, lines, scrollback);
+  if (scrollback) {
+    if (scrollbackTransport === "cli") return readScreenViaCli(surface, lines, true);
+    if (scrollbackTransport === "unchecked") return scrollbackSelfCheck(surface, lines);
+  }
+  try {
+    return await withTerminal(surface, () => readTextViaSocket(surface, lines, scrollback));
+  } catch (error) {
+    if (error instanceof cmuxSocket.CmuxSocketUnavailable) {
+      return readScreenViaCli(surface, lines, scrollback);
+    }
+    throw error;
+  }
 }
 
-const PASTE_START = "\u001b[200~";
-const PASTE_END = "\u001b[201~";
-
 /**
- * Send text to a terminal surface as a bracketed paste.
+ * Send text to a terminal surface.
  *
- * `cmux send` turns \n into Enter and `cmux paste-buffer` rejects an explicit
- * --surface, so text goes through the raw `surface.send_text` method wrapped in
- * bracketed-paste markers. An agent TUI then receives multi-line input as one
- * paste instead of submitting every line, and `submit` presses Enter once.
+ * cmux injects `surface.send_text` / `terminal.input` text as per-character
+ * key events, so hand-built bracketed-paste markers (ESC[200~ ... ESC[201~)
+ * are not recognized by the Claude Code TUI: each ESC arrives as a standalone
+ * Escape keypress and "[200~" is inserted literally (OV-014). Instead:
+ *
+ * - submit: one `terminal.paste` call. cmux pastes the whole (multi-line)
+ *   text as a single block and submits it itself; the response reports
+ *   `submitted`. If cmux could not submit, Enter is sent as a fallback.
+ * - no submit: `terminal.input` per line. `terminal.input` turns "\n" into
+ *   Enter (which would submit every line), so newlines are inserted with a
+ *   shift+enter key event between lines instead.
  *
  * Requires the surface UUID, not a ref.
  */
@@ -246,18 +344,40 @@ export async function sendText(
   text: string,
   submit: boolean,
 ): Promise<void> {
-  const payload = PASTE_START + sanitize(text) + PASTE_END;
-  await withTerminal(surfaceId, () =>
-    runOrThrow([
-      "rpc",
-      "surface.send_text",
-      JSON.stringify({ surface_id: surfaceId, text: payload }),
-    ]),
-  );
+  const clean = sanitize(text);
   if (submit) {
-    await Bun.sleep(150);
-    await sendKey(surfaceId, "enter");
+    const stdout = await withTerminal(surfaceId, () =>
+      runOrThrow([
+        "rpc",
+        "terminal.paste",
+        JSON.stringify({ surface_id: surfaceId, text: clean }),
+      ]),
+    );
+    let submitted = false;
+    try {
+      submitted = (JSON.parse(stdout) as { submitted?: boolean }).submitted === true;
+    } catch {
+      submitted = false;
+    }
+    if (!submitted) await sendKey(surfaceId, "enter");
+    return;
   }
+  const lines = clean.split("\n");
+  await withTerminal(surfaceId, async () => {
+    for (let i = 0; i < lines.length; i++) {
+      if (i > 0) {
+        await runOrThrow(["send-key", "--surface", surfaceId, "--", "shift+enter"]);
+      }
+      const line = lines[i];
+      if (line && line.length > 0) {
+        await runOrThrow([
+          "rpc",
+          "terminal.input",
+          JSON.stringify({ surface_id: surfaceId, text: line }),
+        ]);
+      }
+    }
+  });
 }
 
 /** Drop control characters that would end the paste or drive the TUI. */

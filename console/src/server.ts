@@ -10,11 +10,13 @@
 import { watch, type FSWatcher } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import * as cmux from "./cmux.ts";
+import * as cmuxSocket from "./cmux-socket.ts";
 import {
   boardPathFor,
   canonicalItem,
   loadBoard,
   nowIso,
+  projectRootFor,
   revisionOf,
   saveBoard,
   STATES,
@@ -87,6 +89,54 @@ function watchBoard(): void {
     });
   } catch (error) {
     console.warn(`board watch unavailable: ${String(error)}`);
+  }
+}
+
+/* --------------------------------------------------------- cmux activity */
+
+/**
+ * cmux events that carry a surface_id or workspace_id become lightweight
+ * {type:"activity"} SSE frames (no content — the frontend re-reads the
+ * screen itself). A 300 ms trailing debounce per key (surface_id, falling
+ * back to workspace_id) coalesces event bursts into one frame. Losing
+ * stream continuity (cmux restart or dropped events) broadcasts an
+ * activity frame with both ids null: "refresh everything".
+ */
+const ACTIVITY_DEBOUNCE_MS = 300;
+const activityTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+function scheduleActivity(surfaceId: string | null, workspaceId: string | null): void {
+  const key = surfaceId ?? workspaceId ?? "*";
+  const existing = activityTimers.get(key);
+  if (existing) clearTimeout(existing);
+  activityTimers.set(
+    key,
+    setTimeout(() => {
+      activityTimers.delete(key);
+      broadcast({ type: "activity", surface_id: surfaceId, workspace_id: workspaceId });
+    }, ACTIVITY_DEBOUNCE_MS),
+  );
+}
+
+/**
+ * Start the event subscription. subscribeEvents never throws (connection
+ * failures are retried internally with backoff), so a broken subscription
+ * can never take the server down.
+ */
+function watchCmuxActivity(): () => void {
+  try {
+    return cmuxSocket.subscribeEvents({
+      onEvent(event) {
+        if (event.surfaceId === null && event.workspaceId === null) return;
+        scheduleActivity(event.surfaceId, event.workspaceId);
+      },
+      onResync() {
+        broadcast({ type: "activity", surface_id: null, workspace_id: null });
+      },
+    });
+  } catch (error) {
+    console.warn(`cmux event subscription unavailable: ${String(error)}`);
+    return () => undefined;
   }
 }
 
@@ -174,6 +224,24 @@ async function patchItem(request: Request, id: string): Promise<Response> {
   lastRev = nextRev;
   broadcast({ type: "board", rev: nextRev });
   return json({ item: board.items[index], rev: nextRev });
+}
+
+async function deleteItem(request: Request, id: string): Promise<Response> {
+  const payload = await body<{ rev?: string }>(request);
+  const { board, rev } = await loadBoard(options.boardPath);
+  if (payload.rev && payload.rev !== rev) {
+    return json({ error: "board changed on disk", rev }, 409);
+  }
+  const index = board.items.findIndex((entry) => entry.id === id);
+  if (index === -1) return fail(`unknown item: ${id}`, 404);
+  if (board.items[index]!.state !== "done") {
+    return fail("only done items can be deleted");
+  }
+  board.items.splice(index, 1);
+  const nextRev = await saveBoard(options.boardPath, board);
+  lastRev = nextRev;
+  broadcast({ type: "board", rev: nextRev });
+  return json({ ok: true, rev: nextRev });
 }
 
 async function createItem(request: Request): Promise<Response> {
@@ -313,7 +381,7 @@ async function handle(request: Request): Promise<Response> {
       rev,
       exists,
       boardPath: options.boardPath,
-      projectRoot: resolve(dirname(options.boardPath), "../.."),
+      projectRoot: projectRootFor(options.boardPath),
       cmux: { available: cmuxUp, error: cmuxError, workspaces },
     });
   }
@@ -323,6 +391,9 @@ async function handle(request: Request): Promise<Response> {
   const itemMatch = path.match(/^\/api\/items\/([^/]+)$/);
   if (itemMatch && request.method === "PATCH") {
     return patchItem(request, decodeURIComponent(itemMatch[1]!));
+  }
+  if (itemMatch && request.method === "DELETE") {
+    return deleteItem(request, decodeURIComponent(itemMatch[1]!));
   }
 
   if (path === "/api/commander" && request.method === "PUT") {
@@ -367,6 +438,7 @@ async function handle(request: Request): Promise<Response> {
 /* ----------------------------------------------------------------- start */
 
 watchBoard();
+const stopCmuxActivity = watchCmuxActivity();
 
 // Keep proxies and browsers from dropping idle event streams.
 setInterval(() => {
@@ -410,6 +482,7 @@ if (options.open) {
 }
 
 process.on("SIGINT", () => {
+  stopCmuxActivity();
   watcher?.close();
   server.stop(true);
   process.exit(0);
