@@ -115,6 +115,27 @@ export default function App() {
     [patchItem, load],
   );
 
+  const deleteItem = useCallback(
+    async (id: string) => {
+      try {
+        const current = dataRef.current;
+        if (!current) throw new Error("board not loaded");
+        await api<{ ok: boolean; rev: string }>(`/api/items/${encodeURIComponent(id)}`, {
+          method: "DELETE",
+          body: JSON.stringify({ rev: current.rev }),
+        });
+        setSelectedId((previous) => (previous === id ? null : previous));
+        toast.success(`${id} を削除しました`);
+      } catch (error) {
+        toast.error(`削除できません: ${errorMessage(error)}`);
+      }
+      // Reload either way: on success to drop the card, on 409/400/404 to
+      // resync the board with what is on disk.
+      await load();
+    },
+    [load],
+  );
+
   const createItem = useCallback(
     async (payload: { title: string; project?: string; evidence?: string }) => {
       const result = await api<{ item: Item; rev: string }>("/api/items", {
@@ -375,6 +396,7 @@ export default function App() {
     patchItem,
     patchField,
     moveItem,
+    deleteItem,
     createItem,
     setCommander,
     startCommanderWorkspace,

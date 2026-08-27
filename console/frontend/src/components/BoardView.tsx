@@ -1,12 +1,20 @@
 import { useMemo, useState, type ReactNode } from "react";
 
+import { Trash2Icon } from "lucide-react";
+
+import {
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuTrigger,
+} from "@/components/ui/context-menu";
 import { useConsole } from "@/console-context";
 import { decisionId, decisionIds, decisionText, scoreOf } from "@/lib/board";
 import { STATES, type Item, type StateKey } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 export function BoardView() {
-  const { data, selectedId, select, moveItem } = useConsole();
+  const { data, selectedId, select, moveItem, deleteItem } = useConsole();
   const items = data.board.items ?? [];
   const needsUserIds = useMemo(() => decisionIds(data.board), [data.board]);
   const decisions = (data.board.decisions_required ?? []).slice(0, 3);
@@ -102,6 +110,11 @@ export function BoardView() {
                       running={running}
                       selected={item.id === selectedId}
                       onSelect={() => select(item.id)}
+                      // Only done cards get a context menu; the server also
+                      // rejects deleting anything else with a 400.
+                      onDelete={
+                        item.state === "done" ? () => void deleteItem(item.id) : undefined
+                      }
                     />
                   );
                 })}
@@ -120,16 +133,19 @@ function BoardCard({
   running,
   selected,
   onSelect,
+  onDelete,
 }: {
   item: Item;
   needsUser: boolean;
   running: boolean;
   selected: boolean;
   onSelect: () => void;
+  /** Present only on done cards; enables the right-click delete menu. */
+  onDelete?: () => void;
 }) {
   const [dragging, setDragging] = useState(false);
   const score = scoreOf(item);
-  return (
+  const card = (
     <article
       draggable
       onClick={onSelect}
@@ -169,6 +185,20 @@ function BoardCard({
         </div>
       )}
     </article>
+  );
+  if (!onDelete) return card;
+  // The trigger only adds an onContextMenu handler to the article, so
+  // click-to-open and drag-and-drop behave exactly as without the menu.
+  return (
+    <ContextMenu>
+      <ContextMenuTrigger asChild>{card}</ContextMenuTrigger>
+      <ContextMenuContent>
+        <ContextMenuItem variant="destructive" onSelect={onDelete}>
+          <Trash2Icon />
+          削除
+        </ContextMenuItem>
+      </ContextMenuContent>
+    </ContextMenu>
   );
 }
 

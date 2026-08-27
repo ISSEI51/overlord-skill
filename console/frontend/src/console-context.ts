@@ -14,6 +14,8 @@ export type ConsoleController = {
   /** patchItem + error toast + reload; used by detail-panel editors. */
   patchField: (id: string, patch: Record<string, unknown>) => Promise<void>;
   moveItem: (id: string, state: StateKey, label: string) => Promise<void>;
+  /** DELETE a done card; toasts the outcome and reloads the board. */
+  deleteItem: (id: string) => Promise<void>;
   createItem: (payload: {
     title: string;
     project?: string;

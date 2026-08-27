@@ -176,6 +176,24 @@ async function patchItem(request: Request, id: string): Promise<Response> {
   return json({ item: board.items[index], rev: nextRev });
 }
 
+async function deleteItem(request: Request, id: string): Promise<Response> {
+  const payload = await body<{ rev?: string }>(request);
+  const { board, rev } = await loadBoard(options.boardPath);
+  if (payload.rev && payload.rev !== rev) {
+    return json({ error: "board changed on disk", rev }, 409);
+  }
+  const index = board.items.findIndex((entry) => entry.id === id);
+  if (index === -1) return fail(`unknown item: ${id}`, 404);
+  if (board.items[index]!.state !== "done") {
+    return fail("only done items can be deleted");
+  }
+  board.items.splice(index, 1);
+  const nextRev = await saveBoard(options.boardPath, board);
+  lastRev = nextRev;
+  broadcast({ type: "board", rev: nextRev });
+  return json({ ok: true, rev: nextRev });
+}
+
 async function createItem(request: Request): Promise<Response> {
   const payload = await body<{ title?: string; project?: string; state?: State; evidence?: string }>(
     request,
@@ -323,6 +341,9 @@ async function handle(request: Request): Promise<Response> {
   const itemMatch = path.match(/^\/api\/items\/([^/]+)$/);
   if (itemMatch && request.method === "PATCH") {
     return patchItem(request, decodeURIComponent(itemMatch[1]!));
+  }
+  if (itemMatch && request.method === "DELETE") {
+    return deleteItem(request, decodeURIComponent(itemMatch[1]!));
   }
 
   if (path === "/api/commander" && request.method === "PUT") {
