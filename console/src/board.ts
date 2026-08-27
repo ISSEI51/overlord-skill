@@ -163,11 +163,24 @@ export function projectRootFor(boardPath: string): string {
   return directory.endsWith(suffix) ? resolve(directory, "../..") : directory;
 }
 
-/** Revision token used for optimistic concurrency against agent writes. */
+/**
+ * Revision token used for optimistic concurrency against agent writes.
+ *
+ * The token is `<mtime in nanoseconds>:<size in bytes>`. Millisecond
+ * resolution was too coarse: two writes of the same byte length inside one
+ * millisecond produced the same token, so a conflicting write was neither
+ * rejected with 409 nor announced over SSE. `stat(path, { bigint: true })`
+ * reports `mtimeNs`, which separates writes that land microseconds apart.
+ *
+ * The token is opaque to every consumer: the frontend types it as a string
+ * and only compares it for equality and echoes it back, `change.ts` only
+ * compares it for equality, and it is stored neither in board.yaml nor in
+ * browser storage. The format can therefore change without a migration.
+ */
 export async function revisionOf(path: string): Promise<string> {
   try {
-    const info = await stat(path);
-    return `${Math.round(info.mtimeMs)}:${info.size}`;
+    const info = await stat(path, { bigint: true });
+    return `${info.mtimeNs}:${info.size}`;
   } catch {
     return "absent";
   }
@@ -204,6 +217,93 @@ export async function saveBoard(path: string, board: Board): Promise<string> {
   await rename(temp, path);
   return revisionOf(path);
 }
+
+/**
+ * Raised by `mutateBoard` when the board on disk no longer carries the
+ * revision the caller expected. `rev` is the revision actually found, so the
+ * caller can hand it back to the client (the console server answers 409 with
+ * it) without reading the file again.
+ */
+export class BoardConflictError extends Error {
+  readonly rev: string;
+
+  constructor(rev: string) {
+    super("board changed on disk");
+    this.name = "BoardConflictError";
+    this.rev = rev;
+  }
+}
+
+/**
+ * In-process write queue, keyed by resolved board path.
+ *
+ * Bun.serve runs request handlers concurrently, so two overlapping writes
+ * used to interleave as load/load/save/save and the first save was lost
+ * without any conflict being reported. Every mutation for one board path is
+ * chained onto the previous one here, so `loadBoard` -> mutate -> `saveBoard`
+ * runs as one critical section and a second writer always observes the first
+ * writer's revision.
+ *
+ * This only serializes writers inside this process; writers in another
+ * process (the `change.ts` CLI) are still caught by the `expectedRev` check,
+ * which now runs inside the same critical section as the save.
+ */
+const writeQueues = new Map<string, Promise<unknown>>();
+
+export type BoardMutation<T> = {
+  /** The board as it was written. */
+  board: Board;
+  /** Revision of the file after the save. */
+  rev: string;
+  /** Whatever the mutate callback returned. */
+  result: T;
+};
+
+/**
+ * The single write path for board.yaml.
+ *
+ * Serializes against every other `mutateBoard` call for the same path, loads
+ * the board inside that critical section, rejects the call with
+ * `BoardConflictError` when `expectedRev` is given and does not match what is
+ * on disk, applies `mutate`, and writes the result back.
+ *
+ * `expectedRev` may be omitted (or null/undefined/empty) to write without an
+ * optimistic check. Throwing from `mutate` aborts the write: nothing is
+ * saved and the error reaches the caller, which is how a handler rejects a
+ * request after it has already seen the board.
+ */
+export async function mutateBoard<T>(
+  path: string,
+  expectedRev: string | null | undefined,
+  mutate: (board: Board) => T | Promise<T>,
+): Promise<BoardMutation<T>> {
+  const previous = writeQueues.get(path);
+  const run = (previous ? previous.then(noop, noop) : Promise.resolve()).then(
+    () => applyMutation(path, expectedRev, mutate),
+  );
+  const tail = run.then(noop, noop);
+  writeQueues.set(path, tail);
+  void tail.then(() => {
+    if (writeQueues.get(path) === tail) writeQueues.delete(path);
+  });
+  return run;
+}
+
+async function applyMutation<T>(
+  path: string,
+  expectedRev: string | null | undefined,
+  mutate: (board: Board) => T | Promise<T>,
+): Promise<BoardMutation<T>> {
+  const loaded = await loadBoard(path);
+  if (expectedRev && expectedRev !== loaded.rev) {
+    throw new BoardConflictError(loaded.rev);
+  }
+  const result = await mutate(loaded.board);
+  const rev = await saveBoard(path, loaded.board);
+  return { board: loaded.board, rev, result };
+}
+
+function noop(): void {}
 
 export function canonicalItem(item: Item): Item {
   return orderKeys(item as Json, ITEM_KEY_ORDER) as Item;
