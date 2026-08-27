@@ -5,6 +5,8 @@
  * cmux app over its local Unix socket. No other transport is used.
  */
 
+import * as cmuxSocket from "./cmux-socket.ts";
+
 const FALLBACK_BIN = "/Applications/cmux.app/Contents/Resources/bin/cmux";
 const DEFAULT_TIMEOUT_MS = 10_000;
 
@@ -218,14 +220,106 @@ async function withTerminal<T>(
   }
 }
 
+const UUID_PATTERN =
+  /^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$/;
+
+function readScreenArgs(surface: string, lines: number, scrollback: boolean): string[] {
+  const args = ["read-screen", "--surface", surface, "--lines", String(lines)];
+  if (scrollback) args.push("--scrollback");
+  return args;
+}
+
+function readScreenViaCli(
+  surface: string,
+  lines: number,
+  scrollback: boolean,
+): Promise<string> {
+  return withTerminal(surface, () => runOrThrow(readScreenArgs(surface, lines, scrollback)));
+}
+
+/**
+ * surface.read_text over the cmux socket. The CLI prints the same text plus
+ * a trailing newline (measured byte-for-byte), so the newline is appended
+ * here to keep /api/cmux/screen byte-identical with the CLI transport.
+ * RPC failures (ok:false) become CmuxError so withTerminal's one-shot
+ * terminal start still applies; transport failures stay
+ * CmuxSocketUnavailable so callers can fall back to the CLI.
+ */
+async function readTextViaSocket(
+  surfaceId: string,
+  lines: number,
+  scrollback: boolean,
+): Promise<string> {
+  try {
+    const result = await cmuxSocket.request<{ text: string }>("surface.read_text", {
+      surface_id: surfaceId,
+      lines,
+      scrollback,
+    });
+    return `${result.text}\n`;
+  } catch (error) {
+    if (error instanceof cmuxSocket.CmuxRpcError) {
+      const detail = `${error.code}: ${error.message}`;
+      throw new CmuxError(`cmux surface.read_text failed: ${detail}`, {
+        code: 1,
+        stdout: "",
+        stderr: detail,
+        timedOut: false,
+      });
+    }
+    throw error;
+  }
+}
+
+/**
+ * Scrollback reads run one socket/CLI equivalence self-check per process:
+ * the first scrollback request fetches through both transports and compares
+ * bytes. On a match every later read stays on the socket; on a mismatch all
+ * later scrollback reads use the CLI. If the socket is unreachable the
+ * check is deferred to the next scrollback request.
+ */
+let scrollbackTransport: "unchecked" | "socket" | "cli" = "unchecked";
+
+async function scrollbackSelfCheck(surface: string, lines: number): Promise<string> {
+  let viaSocket: string;
+  try {
+    viaSocket = await withTerminal(surface, () => readTextViaSocket(surface, lines, true));
+  } catch (error) {
+    if (error instanceof cmuxSocket.CmuxSocketUnavailable) {
+      return readScreenViaCli(surface, lines, true);
+    }
+    throw error;
+  }
+  const viaCli = await runOrThrow(readScreenArgs(surface, lines, true));
+  scrollbackTransport = viaSocket === viaCli ? "socket" : "cli";
+  return scrollbackTransport === "socket" ? viaSocket : viaCli;
+}
+
+/**
+ * Read a terminal surface's screen (or scrollback) text.
+ *
+ * The socket transport (surface.read_text) is used whenever possible; the
+ * CLI remains the fallback for (a) non-UUID surface identifiers, (b) an
+ * unreachable socket, and (c) scrollback reads after a failed self-check.
+ */
 export async function readScreen(
   surface: string,
   lines: number,
   scrollback: boolean,
 ): Promise<string> {
-  const args = ["read-screen", "--surface", surface, "--lines", String(lines)];
-  if (scrollback) args.push("--scrollback");
-  return withTerminal(surface, () => runOrThrow(args));
+  if (!UUID_PATTERN.test(surface)) return readScreenViaCli(surface, lines, scrollback);
+  if (scrollback) {
+    if (scrollbackTransport === "cli") return readScreenViaCli(surface, lines, true);
+    if (scrollbackTransport === "unchecked") return scrollbackSelfCheck(surface, lines);
+  }
+  try {
+    return await withTerminal(surface, () => readTextViaSocket(surface, lines, scrollback));
+  } catch (error) {
+    if (error instanceof cmuxSocket.CmuxSocketUnavailable) {
+      return readScreenViaCli(surface, lines, scrollback);
+    }
+    throw error;
+  }
 }
 
 /**

@@ -27,7 +27,12 @@ import { screenRefresh } from "@/lib/screen";
 import { dockTemplates } from "@/lib/templates";
 import { cn } from "@/lib/utils";
 
-const SCREEN_INTERVAL_MS = 1500;
+/**
+ * Slow safety-net poll. Timely updates now arrive as {type:"activity"} SSE
+ * frames (see App.tsx), which nudge screenRefresh directly; polling only
+ * covers activity that produces no cmux event (plain terminal output).
+ */
+const SCREEN_INTERVAL_MS = 10000;
 /** Lines fetched for the one-shot scrollback view (mode: "history"). */
 const HISTORY_LINES = 2000;
 
@@ -125,7 +130,8 @@ function DockResizeHandle() {
 /**
  * Terminal mirror of the commander session.
  *
- * mode: "live" (default) polls every 1.5 seconds while mounted (only when
+ * mode: "live" (default) refreshes on cmux activity events (via
+ * screenRefresh) plus a slow safety-net poll while mounted (only when
  * the tab is visible) and follows the tail; unmounting (screenVisible
  * false) stops the polling entirely. mode: "history" fetches the
  * scrollback once (HISTORY_LINES lines) and freezes all DOM updates so

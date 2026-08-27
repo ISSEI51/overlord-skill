@@ -10,6 +10,7 @@
 import { watch, type FSWatcher } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import * as cmux from "./cmux.ts";
+import * as cmuxSocket from "./cmux-socket.ts";
 import {
   boardPathFor,
   canonicalItem,
@@ -88,6 +89,54 @@ function watchBoard(): void {
     });
   } catch (error) {
     console.warn(`board watch unavailable: ${String(error)}`);
+  }
+}
+
+/* --------------------------------------------------------- cmux activity */
+
+/**
+ * cmux events that carry a surface_id or workspace_id become lightweight
+ * {type:"activity"} SSE frames (no content — the frontend re-reads the
+ * screen itself). A 300 ms trailing debounce per key (surface_id, falling
+ * back to workspace_id) coalesces event bursts into one frame. Losing
+ * stream continuity (cmux restart or dropped events) broadcasts an
+ * activity frame with both ids null: "refresh everything".
+ */
+const ACTIVITY_DEBOUNCE_MS = 300;
+const activityTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+function scheduleActivity(surfaceId: string | null, workspaceId: string | null): void {
+  const key = surfaceId ?? workspaceId ?? "*";
+  const existing = activityTimers.get(key);
+  if (existing) clearTimeout(existing);
+  activityTimers.set(
+    key,
+    setTimeout(() => {
+      activityTimers.delete(key);
+      broadcast({ type: "activity", surface_id: surfaceId, workspace_id: workspaceId });
+    }, ACTIVITY_DEBOUNCE_MS),
+  );
+}
+
+/**
+ * Start the event subscription. subscribeEvents never throws (connection
+ * failures are retried internally with backoff), so a broken subscription
+ * can never take the server down.
+ */
+function watchCmuxActivity(): () => void {
+  try {
+    return cmuxSocket.subscribeEvents({
+      onEvent(event) {
+        if (event.surfaceId === null && event.workspaceId === null) return;
+        scheduleActivity(event.surfaceId, event.workspaceId);
+      },
+      onResync() {
+        broadcast({ type: "activity", surface_id: null, workspace_id: null });
+      },
+    });
+  } catch (error) {
+    console.warn(`cmux event subscription unavailable: ${String(error)}`);
+    return () => undefined;
   }
 }
 
@@ -389,6 +438,7 @@ async function handle(request: Request): Promise<Response> {
 /* ----------------------------------------------------------------- start */
 
 watchBoard();
+const stopCmuxActivity = watchCmuxActivity();
 
 // Keep proxies and browsers from dropping idle event streams.
 setInterval(() => {
@@ -432,6 +482,7 @@ if (options.open) {
 }
 
 process.on("SIGINT", () => {
+  stopCmuxActivity();
   watcher?.close();
   server.stop(true);
   process.exit(0);

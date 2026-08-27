@@ -11,7 +11,7 @@ import { Toaster } from "@/components/ui/sonner";
 import { ConsoleContext, type ConsoleController } from "@/console-context";
 import { api, errorMessage } from "@/lib/api";
 import { commanderLink } from "@/lib/board";
-import { refreshScreenSoon } from "@/lib/screen";
+import { refreshScreenSoon, screenRefresh } from "@/lib/screen";
 import {
   DOCK_OPEN_KEY,
   DOCK_WIDTH_KEY,
@@ -306,7 +306,11 @@ export default function App() {
     void load();
   }, [load]);
 
-  /* SSE: reload on board events; reconnect two seconds after a drop. */
+  /*
+   * SSE: reload on board events, nudge the screen mirror on cmux activity;
+   * reconnect two seconds after a drop.
+   */
+  const lastActivityNudge = useRef(0);
   useEffect(() => {
     let source: EventSource | null = null;
     let timer: number | null = null;
@@ -315,9 +319,34 @@ export default function App() {
       source = new EventSource("/api/events");
       source.onmessage = (event) => {
         try {
-          const payload = JSON.parse(event.data) as { type?: string; rev?: string };
+          const payload = JSON.parse(event.data) as {
+            type?: string;
+            rev?: string;
+            surface_id?: string | null;
+            workspace_id?: string | null;
+          };
           if (payload.type === "board" && payload.rev !== dataRef.current?.rev) {
             void load();
+          }
+          if (payload.type === "activity") {
+            const link = commanderLink(dataRef.current);
+            if (!link) return;
+            const surfaceId = payload.surface_id ?? null;
+            const workspaceId = payload.workspace_id ?? null;
+            // A surface-level event must match the commander surface; a
+            // surface-less event matches on workspace, and one with both
+            // ids null ("refresh everything") always matches.
+            const concernsCommander =
+              surfaceId !== null
+                ? surfaceId === link.surface.id
+                : workspaceId === null || workspaceId === link.workspace.id;
+            if (!concernsCommander) return;
+            // Cheap coalescing: bursts within 200 ms cause one refresh.
+            // The mirror's history-mode guard lives inside screenRefresh.
+            const now = Date.now();
+            if (now - lastActivityNudge.current < 200) return;
+            lastActivityNudge.current = now;
+            screenRefresh.current?.();
           }
         } catch {
           /* ignore malformed frames */
