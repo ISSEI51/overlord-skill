@@ -244,9 +244,12 @@ export class BoardConflictError extends Error {
  * runs as one critical section and a second writer always observes the first
  * writer's revision.
  *
- * This only serializes writers inside this process; writers in another
- * process (the `change.ts` CLI) are still caught by the `expectedRev` check,
- * which now runs inside the same critical section as the save.
+ * This only serializes writers inside this process. A writer in another
+ * process (the `change.ts` CLI) is NOT caught: the window between the
+ * `expectedRev` check and the rename is as wide as before, so cross-process
+ * writes still overwrite each other without a 409. Measured at 0 conflicts
+ * detected in 750 rounds, with 2-3% of CLI writes lost. Serializing across
+ * processes needs the lock file in OV-104-C2.
  */
 const writeQueues = new Map<string, Promise<unknown>>();
 
