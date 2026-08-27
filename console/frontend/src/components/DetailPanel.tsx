@@ -25,9 +25,10 @@ import { cardInstructions } from "@/lib/templates";
 import { STATES, type Item } from "@/lib/types";
 
 /**
- * Card detail as a centered modal dialog. Closing (outside click, Escape,
- * or the corner button) only clears the selection; Escape inside an
- * editable field is stopped there and never reaches the dialog.
+ * Card detail as a centered modal dialog. Closing (outside click or
+ * Escape; there is no corner close button) only clears the selection;
+ * Escape inside an editable field is stopped there and never reaches
+ * the dialog.
  */
 export function DetailPanel() {
   const { data, selectedId, select } = useConsole();
@@ -42,7 +43,8 @@ export function DetailPanel() {
     >
       {item && (
         <DialogContent
-          className="flex max-h-[85vh] w-full flex-col gap-0 overflow-hidden p-0 sm:max-w-2xl"
+          className="flex max-h-[85vh] w-full flex-col gap-0 overflow-hidden rounded-2xl border-line-strong p-0 shadow-2xl sm:max-w-2xl"
+          showCloseButton={false}
           aria-describedby={undefined}
           onPointerDownOutside={() => {
             // Commit a pending edit before the dialog unmounts: blur the
@@ -51,7 +53,7 @@ export function DetailPanel() {
             if (active instanceof HTMLElement) active.blur();
           }}
         >
-          <DialogHeader className="shrink-0 gap-0.5 px-4 pt-4 pr-12 pb-2">
+          <DialogHeader className="shrink-0 gap-0.5 px-4 pt-4 pb-2">
             <div className="font-mono text-[11px] text-faint">
               {[item.id, item.project].filter(Boolean).join("  ·  ")}
             </div>

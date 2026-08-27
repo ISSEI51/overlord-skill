@@ -77,19 +77,29 @@ export function BoardView() {
                 <span className="font-normal text-faint">{columnItems.length}</span>
               </div>
               <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto p-2">
-                {columnItems.map((item) => (
-                  <BoardCard
-                    key={item.id}
-                    item={item}
-                    needsUser={
-                      item.state === "acceptance" ||
-                      item.owner === "user" ||
-                      needsUserIds.has(item.id)
-                    }
-                    selected={item.id === selectedId}
-                    onSelect={() => select(item.id)}
-                  />
-                ))}
+                {columnItems.map((item) => {
+                  const needsUser =
+                    item.state === "acceptance" ||
+                    item.owner === "user" ||
+                    needsUserIds.has(item.id);
+                  // AI is actively working on the card. The needs-user
+                  // highlight wins when both apply.
+                  const running =
+                    !needsUser &&
+                    item.owner === "claude" &&
+                    item.state !== "done" &&
+                    item.state !== "blocked";
+                  return (
+                    <BoardCard
+                      key={item.id}
+                      item={item}
+                      needsUser={needsUser}
+                      running={running}
+                      selected={item.id === selectedId}
+                      onSelect={() => select(item.id)}
+                    />
+                  );
+                })}
               </div>
             </section>
           );
@@ -102,11 +112,13 @@ export function BoardView() {
 function BoardCard({
   item,
   needsUser,
+  running,
   selected,
   onSelect,
 }: {
   item: Item;
   needsUser: boolean;
+  running: boolean;
   selected: boolean;
   onSelect: () => void;
 }) {
@@ -124,8 +136,10 @@ function BoardCard({
       className={cn(
         "cursor-pointer rounded-md border bg-card px-2 py-2 hover:border-line-strong",
         needsUser && "border-needs-user hover:border-needs-user",
+        running && "border-running hover:border-running",
         selected && "border-primary hover:border-primary",
         selected && needsUser && "ring-2 ring-needs-user/55",
+        selected && running && "ring-2 ring-running/55",
         dragging && "opacity-40",
       )}
     >

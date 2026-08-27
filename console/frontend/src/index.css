@@ -37,6 +37,7 @@
   --warn: #9a6700;
   --ok: #1a7f37;
   --needs-user: #0e7490;
+  --running: #9a6700;
 
   /* The commander dock (shadcn Sidebar) shares the card palette. */
   --sidebar: var(--card);
@@ -78,6 +79,7 @@
     --warn: #e3b341;
     --ok: #56d364;
     --needs-user: #4dd0e1;
+    --running: #e3b341;
   }
 }
 
@@ -112,6 +114,7 @@
   --color-warn: var(--warn);
   --color-ok: var(--ok);
   --color-needs-user: var(--needs-user);
+  --color-running: var(--running);
   --color-sidebar: var(--sidebar);
   --color-sidebar-foreground: var(--sidebar-foreground);
   --color-sidebar-primary: var(--sidebar-primary);
