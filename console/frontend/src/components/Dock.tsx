@@ -28,6 +28,8 @@ import { dockTemplates } from "@/lib/templates";
 import { cn } from "@/lib/utils";
 
 const SCREEN_INTERVAL_MS = 1500;
+/** Lines fetched for the one-shot scrollback view (mode: "history"). */
+const HISTORY_LINES = 2000;
 
 /** The commander dock, built on the shadcn Sidebar (side="right", offcanvas). */
 export function CommanderSidebar() {
@@ -121,16 +123,45 @@ function DockResizeHandle() {
 }
 
 /**
- * Terminal mirror of the commander session. Polls every 1.5 seconds while
- * mounted (only when the tab is visible), follows the tail, and unmounting
- * (screenVisible false) stops the polling entirely.
+ * Terminal mirror of the commander session.
+ *
+ * mode: "live" (default) polls every 1.5 seconds while mounted (only when
+ * the tab is visible) and follows the tail; unmounting (screenVisible
+ * false) stops the polling entirely. mode: "history" fetches the
+ * scrollback once (HISTORY_LINES lines) and freezes all DOM updates so
+ * the reader can scroll upward without the view jumping.
  */
 function ScreenMirror({ surfaceId }: { surfaceId: string }) {
   const preRef = useRef<HTMLPreElement>(null);
+  const [mode, setMode] = useState<"live" | "history">("live");
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const modeRef = useRef<"live" | "history">("live");
+  const liveRefreshRef = useRef<((follow?: boolean) => Promise<void>) | null>(null);
+  // Bumped whenever the surface changes, so an in-flight history fetch for
+  // an old surface never lands on the new one.
+  const generationRef = useRef(0);
+
+  const switchMode = (next: "live" | "history") => {
+    modeRef.current = next;
+    setMode(next);
+  };
 
   useEffect(() => {
     let stopped = false;
-    const refresh = async () => {
+    generationRef.current += 1;
+    // A (new) surface always starts out live.
+    modeRef.current = "live";
+    setMode("live");
+    setHistoryLoading(false);
+
+    /**
+     * Live refresh. The mode is checked both on entry and again after the
+     * fetch resolves, before any DOM write — so no update path (polling
+     * interval, post-send nudge, or a response that resolves late) can
+     * touch the DOM or move the scroll position while history is shown.
+     */
+    const refresh = async (follow = false) => {
+      if (modeRef.current !== "live") return;
       let text = "";
       let error: string | null = null;
       try {
@@ -141,15 +172,18 @@ function ScreenMirror({ surfaceId }: { surfaceId: string }) {
       } catch (cause) {
         error = `画面を読めません: ${errorMessage(cause)}`;
       }
-      if (stopped) return;
+      if (stopped || modeRef.current !== "live") return;
       const element = preRef.current;
       if (!element) return;
       const atBottom =
         element.scrollHeight - element.scrollTop - element.clientHeight < 24;
       element.textContent = error ?? text;
       element.classList.toggle("opacity-55", Boolean(error));
-      if (atBottom) element.scrollTop = element.scrollHeight;
+      if (follow || atBottom) element.scrollTop = element.scrollHeight;
     };
+    liveRefreshRef.current = refresh;
+    // The post-send nudge funnels through the same guarded refresh, so it
+    // is a no-op while history is shown.
     screenRefresh.current = () => void refresh();
     const timer = window.setInterval(() => {
       if (document.visibilityState === "visible") void refresh();
@@ -159,14 +193,73 @@ function ScreenMirror({ surfaceId }: { surfaceId: string }) {
       stopped = true;
       window.clearInterval(timer);
       screenRefresh.current = null;
+      liveRefreshRef.current = null;
     };
   }, [surfaceId]);
 
+  /**
+   * One-shot scrollback fetch. Only the trigger button is disabled while
+   * loading; the rest of the dock (compose, keys) stays usable. On
+   * failure the mirror still enters history mode showing the usual
+   * 「画面を読めません: …」 text, and 「追従を再開」 recovers.
+   */
+  const showHistory = async () => {
+    if (historyLoading || modeRef.current === "history") return;
+    const generation = generationRef.current;
+    setHistoryLoading(true);
+    let text = "";
+    let error: string | null = null;
+    try {
+      const result = await api<{ text: string }>(
+        `/api/cmux/screen?surface=${encodeURIComponent(surfaceId)}&lines=${HISTORY_LINES}&scrollback=1`,
+      );
+      text = result.text;
+    } catch (cause) {
+      error = `画面を読めません: ${errorMessage(cause)}`;
+    }
+    if (generation !== generationRef.current) return;
+    setHistoryLoading(false);
+    switchMode("history");
+    const element = preRef.current;
+    if (!element) return;
+    element.textContent = error ?? text;
+    element.classList.toggle("opacity-55", Boolean(error));
+    // Land on the tail; from here the reader scrolls upward freely.
+    element.scrollTop = element.scrollHeight;
+  };
+
+  /** Back to live: refresh immediately and jump to the tail. */
+  const resumeLive = () => {
+    switchMode("live");
+    void liveRefreshRef.current?.(true);
+  };
+
   return (
-    <pre
-      ref={preRef}
-      className="m-0 min-h-0 flex-1 overflow-auto bg-sunken p-2.5 font-mono text-[11.5px] leading-[1.45] whitespace-pre text-dim"
-    />
+    <div className="flex min-h-0 flex-1 flex-col">
+      <div className="flex shrink-0 items-center justify-end gap-2 border-b px-2 py-1">
+        {mode === "live" ? (
+          <Button
+            variant="outline"
+            size="xs"
+            disabled={historyLoading}
+            onClick={() => void showHistory()}
+          >
+            {historyLoading ? "取得中…" : "過去の出力を読む"}
+          </Button>
+        ) : (
+          <>
+            <span className="mr-auto text-[11px] text-faint">更新を停止中</span>
+            <Button variant="outline" size="xs" onClick={resumeLive}>
+              追従を再開
+            </Button>
+          </>
+        )}
+      </div>
+      <pre
+        ref={preRef}
+        className="m-0 min-h-0 flex-1 overflow-auto bg-sunken p-2.5 font-mono text-[11.5px] leading-[1.45] whitespace-pre text-dim"
+      />
+    </div>
   );
 }
 
