@@ -15,6 +15,7 @@ import {
   canonicalItem,
   loadBoard,
   nowIso,
+  projectRootFor,
   revisionOf,
   saveBoard,
   STATES,
@@ -331,7 +332,7 @@ async function handle(request: Request): Promise<Response> {
       rev,
       exists,
       boardPath: options.boardPath,
-      projectRoot: resolve(dirname(options.boardPath), "../.."),
+      projectRoot: projectRootFor(options.boardPath),
       cmux: { available: cmuxUp, error: cmuxError, workspaces },
     });
   }
