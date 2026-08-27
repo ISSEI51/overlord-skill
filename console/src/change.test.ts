@@ -15,11 +15,15 @@ import {
   normalizePrState,
   parseArgs,
   parsePrNumber,
+  parseSha,
   parseWorktreePaths,
   pr,
   prBodyFor,
   prTitleFor,
   resolveBoardPath,
+  reviewed,
+  reviewGapLine,
+  sameCommit,
   sync,
   syncLine,
   syncTargets,
@@ -100,6 +104,7 @@ async function captureStderr(
 async function runChangeCli(
   args: string[],
   ghView: Record<string, unknown>,
+  cwd: string = import.meta.dir,
 ): Promise<{ code: number; stdout: string; stderr: string }> {
   const dir = await scratch();
   const script = join(dir, "gh");
@@ -124,7 +129,7 @@ async function runChangeCli(
   const proc = Bun.spawn(
     ["bun", join(import.meta.dir, "change.ts"), ...args],
     {
-      cwd: import.meta.dir,
+      cwd,
       env: { ...process.env, PATH: `${dir}:${process.env.PATH ?? ""}` },
       stdout: "pipe",
       stderr: "pipe",
@@ -460,6 +465,38 @@ describe("parsePrNumber", () => {
   });
 });
 
+describe("parseSha", () => {
+  test("accepts a full object name and an abbreviation", () => {
+    expect(parseSha("a".repeat(40))).toBe("a".repeat(40));
+    expect(parseSha("1a2b3c4")).toBe("1a2b3c4");
+    expect(parseSha("ABCDEF1")).toBe("abcdef1");
+  });
+
+  test("rejects anything that is not a commit name", () => {
+    expect(parseSha("")).toBeNull();
+    expect(parseSha("1a2b3c")).toBeNull(); // 6 digits: too short to be unique
+    expect(parseSha("a".repeat(41))).toBeNull();
+    expect(parseSha("HEAD")).toBeNull();
+    expect(parseSha("overlord/OV-103-C4")).toBeNull();
+    expect(parseSha("1a2b3c4 ")).toBeNull();
+    expect(parseSha("g".repeat(40))).toBeNull();
+  });
+});
+
+describe("sameCommit", () => {
+  test("an abbreviation and the full object name are the same commit", () => {
+    expect(sameCommit("1a2b3c4", "1a2b3c4d5e6f7890" + "0".repeat(24))).toBe(
+      true,
+    );
+    expect(sameCommit("A".repeat(40), "a".repeat(40))).toBe(true);
+  });
+
+  test("different commits are different", () => {
+    expect(sameCommit("a".repeat(40), "b".repeat(40))).toBe(false);
+    expect(sameCommit("1a2b3c4", "9".repeat(40))).toBe(false);
+  });
+});
+
 describe("changeStateForPr", () => {
   test("an open pull request puts the change in review", () => {
     expect(changeStateForPr("open", "implementing")).toBe("reviewing");
@@ -657,6 +694,222 @@ describe("pr", () => {
   });
 });
 
+/** Run a command in `cwd` and return its trimmed stdout, or throw. */
+async function shell(command: string[], cwd: string): Promise<string> {
+  const proc = Bun.spawn(command, {
+    cwd,
+    stdout: "pipe",
+    stderr: "pipe",
+    stdin: "ignore",
+  });
+  const [stdout, stderr] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+  ]);
+  const code = await proc.exited;
+  if (code !== 0) {
+    throw new Error(`${command.join(" ")} exited ${code}: ${stderr || stdout}`);
+  }
+  return stdout.trim();
+}
+
+/**
+ * A throwaway repository with one commit and a real change worktree at the
+ * path `reviewed` looks for, so the worktree HEAD it records is a commit read
+ * by real git rather than a stubbed value.
+ */
+async function repoWithWorktree(
+  changeId: string,
+): Promise<{ root: string; head: string }> {
+  const root = await scratch();
+  await shell(["git", "init", "--quiet", "--initial-branch=main", "."], root);
+  await shell(
+    [
+      "git",
+      "-c",
+      "user.name=Overlord Test",
+      "-c",
+      "user.email=test@example.com",
+      "commit",
+      "--quiet",
+      "--allow-empty",
+      "-m",
+      "init",
+    ],
+    root,
+  );
+  const worktree = join(root, ".overlord/worktrees", changeId);
+  await shell(
+    ["git", "worktree", "add", "--quiet", worktree, "-b", `overlord/${changeId}`],
+    root,
+  );
+  return { root, head: await shell(["git", "-C", worktree, "rev-parse", "HEAD"], root) };
+}
+
+/** A board whose OV-300-C1 is under review and already carries its own pr. */
+function reviewBoard(): Board {
+  return {
+    version: 1,
+    updated_at: "2026-08-01T00:00:00Z",
+    items: [
+      {
+        id: "OV-300",
+        title: "Card under review",
+        state: "implementing",
+        changes: [
+          {
+            id: "OV-300-C1",
+            title: "The change under review",
+            state: "reviewing",
+            branch: "overlord/OV-300-C1",
+            pr: {
+              number: 30,
+              url: "https://github.com/o/r/pull/30",
+              state: "open",
+              head_sha: "e".repeat(40),
+              reviewed_sha: null,
+            },
+          },
+          {
+            id: "OV-300-C2",
+            title: "Never pushed",
+            state: "implementing",
+            branch: "overlord/OV-300-C2",
+            pr: null,
+          },
+        ],
+      },
+    ],
+  };
+}
+
+async function writeReviewBoard(): Promise<string> {
+  const boardPath = join(await scratch(), "board.yaml");
+  await saveBoard(boardPath, reviewBoard());
+  return boardPath;
+}
+
+/** The `gh pr view` answer for the pull request of OV-300-C1. */
+const REVIEW_PR_VIEW = {
+  number: 30,
+  url: "https://github.com/o/r/pull/30",
+  state: "OPEN",
+  headRefOid: "f".repeat(40),
+  headRefName: "overlord/OV-300-C1",
+};
+
+describe("reviewed", () => {
+  test("rejects a --sha that is not a commit name, before touching the board", async () => {
+    const boardPath = await writeReviewBoard();
+    const before = await Bun.file(boardPath).text();
+
+    for (const value of ["HEAD", "1a2b3c", "not-a-sha", "", "a".repeat(41)]) {
+      const { code, stderr } = await captureStderr(() =>
+        reviewed(["OV-300-C1", "--board", boardPath, "--sha", value]),
+      );
+
+      expect(code).toBe(2);
+      expect(stderr).toContain("--sha must be a commit sha");
+      expect(await Bun.file(boardPath).text()).toBe(before);
+    }
+  });
+
+  test("records an explicit --sha and leaves the rest of the record alone", async () => {
+    const boardPath = await writeReviewBoard();
+
+    const { code, stderr } = await capture(() =>
+      reviewed(["OV-300-C1", "--board", boardPath, "--sha", "1A2B3C4"]),
+    );
+
+    expect(stderr).toBe("");
+    expect(code).toBe(0);
+    const after = await loadBoard(boardPath);
+    const change = findChange(after.board, "OV-300-C1")!.change;
+    expect(change.pr).toEqual({
+      number: 30,
+      url: "https://github.com/o/r/pull/30",
+      state: "open",
+      head_sha: "e".repeat(40),
+      reviewed_sha: "1a2b3c4",
+    });
+    // Recording a review does not move the change; acceptance is not automatic.
+    expect(change.state).toBe("reviewing");
+  });
+
+  test("fails without writing the board when the change has no pull request", async () => {
+    const boardPath = await writeReviewBoard();
+    const before = await Bun.file(boardPath).text();
+
+    const { code, stderr } = await captureStderr(() =>
+      reviewed(["OV-300-C2", "--board", boardPath, "--sha", "a".repeat(40)]),
+    );
+
+    expect(code).toBe(1);
+    expect(stderr).toContain("has no pull request on the board");
+    expect(stderr).toContain("change pr OV-300-C2");
+    expect(await Bun.file(boardPath).text()).toBe(before);
+  });
+
+  test("fails without writing the board for an unknown change id", async () => {
+    const boardPath = await writeReviewBoard();
+    const before = await Bun.file(boardPath).text();
+
+    const { code, stderr } = await captureStderr(() =>
+      reviewed(["OV-999-C1", "--board", boardPath, "--sha", "a".repeat(40)]),
+    );
+
+    expect(code).toBe(1);
+    expect(stderr).toContain("unknown change id: OV-999-C1");
+    expect(await Bun.file(boardPath).text()).toBe(before);
+  });
+
+  test("records the HEAD of the change worktree by default", async () => {
+    const repo = await repoWithWorktree("OV-300-C1");
+    const boardPath = await writeReviewBoard();
+
+    // The stub answers a different commit, so a run that recorded the pull
+    // request head instead of the worktree HEAD would be visible here.
+    const { code, stdout, stderr } = await runChangeCli(
+      ["reviewed", "OV-300-C1", "--board", boardPath],
+      REVIEW_PR_VIEW,
+      repo.root,
+    );
+
+    expect(stderr).toBe("");
+    expect(code).toBe(0);
+    expect(stdout).toContain(repo.head);
+    expect(stdout).toContain(join(repo.root, ".overlord/worktrees/OV-300-C1"));
+
+    const after = await loadBoard(boardPath);
+    const change = findChange(after.board, "OV-300-C1")!.change;
+    expect(change.pr!.reviewed_sha).toBe(repo.head);
+    expect(change.pr!.head_sha).toBe("e".repeat(40));
+    expect(change.pr!.number).toBe(30);
+  });
+
+  test("falls back to the pull request head when the worktree is gone", async () => {
+    // A repository with a worktree for another change, so the lookup for
+    // OV-300-C1 finds nothing and the pull request is read instead.
+    const repo = await repoWithWorktree("OV-300-C9");
+    const boardPath = await writeReviewBoard();
+
+    const { code, stdout, stderr } = await runChangeCli(
+      ["reviewed", "OV-300-C1", "--board", boardPath],
+      REVIEW_PR_VIEW,
+      repo.root,
+    );
+
+    expect(stderr).toBe("");
+    expect(code).toBe(0);
+    expect(stdout).toContain("gh pr view 30");
+
+    const after = await loadBoard(boardPath);
+    expect(findChange(after.board, "OV-300-C1")!.change.pr!.reviewed_sha).toBe(
+      "f".repeat(40),
+    );
+  });
+});
+
 describe("updateChanges", () => {
   test("writes every named change in a single board write", async () => {
     const boardPath = await writeSampleBoard();
@@ -749,12 +1002,21 @@ describe("updateChanges", () => {
   });
 });
 
+/**
+ * A `gh pr view` answer for the canned pull request #11.
+ *
+ * `headRefName` is part of `PullRequestView` and both `pr` and `sync` refuse a
+ * pull request that is not on the change's branch, so the default has to be the
+ * branch of the change that owns #11 on the sample boards below; a test that
+ * needs a mismatch overrides it.
+ */
 function viewOf(overrides: Partial<PullRequestView> = {}): PullRequestView {
   return {
     number: 11,
     url: "https://github.com/o/r/pull/11",
     state: "OPEN",
     headRefOid: "a".repeat(40),
+    headRefName: "overlord/OV-200-C1",
     ...overrides,
   };
 }
@@ -863,6 +1125,29 @@ describe("applyPullRequestView", () => {
         changeDone: false,
       }),
     ).toBe("OV-103-C2  unknown -> open");
+  });
+});
+
+describe("reviewGapLine", () => {
+  test("warns when the pull request grew commits after the review", () => {
+    expect(reviewGapLine("OV-200-C1", "b".repeat(40), "a".repeat(40))).toBe(
+      `OV-200-C1: commits were added after the review ` +
+        `(reviewed ${"a".repeat(40)}, head ${"b".repeat(40)}); ` +
+        `review the new commits before merging`,
+    );
+  });
+
+  test("is quiet when the reviewed commit is the head commit", () => {
+    expect(reviewGapLine("OV-200-C1", "a".repeat(40), "a".repeat(40))).toBeNull();
+    // An abbreviation recorded by `reviewed --sha` is not a review gap.
+    expect(reviewGapLine("OV-200-C1", "abc1234" + "0".repeat(33), "abc1234")).toBeNull();
+  });
+
+  test("is quiet while either commit is unknown", () => {
+    expect(reviewGapLine("OV-200-C1", "a".repeat(40), null)).toBeNull();
+    expect(reviewGapLine("OV-200-C1", null, "a".repeat(40))).toBeNull();
+    expect(reviewGapLine("OV-200-C1", undefined, undefined)).toBeNull();
+    expect(reviewGapLine("OV-200-C1", "", "")).toBeNull();
   });
 });
 
@@ -975,9 +1260,32 @@ function syncSampleBoard(): Board {
   };
 }
 
+/**
+ * The branch each canned pull request of `syncSampleBoard` is on. `sync` reads
+ * `headRefName` and skips a pull request that is on any other branch, so the
+ * stub has to answer with the branch the board records for that change.
+ */
+const SYNC_BRANCHES: Record<number, string> = {
+  11: "overlord/OV-200-C1",
+  12: "overlord/OV-200-C2",
+  21: "overlord/OV-201-C1",
+};
+
 async function writeSyncBoard(): Promise<string> {
   const boardPath = join(await scratch(), "board.yaml");
   await saveBoard(boardPath, syncSampleBoard());
+  return boardPath;
+}
+
+/** The sync sample board with `reviewed_sha` recorded on one change. */
+async function writeReviewedSyncBoard(
+  changeId: string,
+  reviewedSha: string,
+): Promise<string> {
+  const board = syncSampleBoard();
+  findChange(board, changeId)!.change.pr!.reviewed_sha = reviewedSha;
+  const boardPath = join(await scratch(), "board.yaml");
+  await saveBoard(boardPath, board);
   return boardPath;
 }
 
@@ -1009,7 +1317,13 @@ async function ghStub(
   for (const [number, answer] of Object.entries(answers)) {
     await Bun.write(
       join(directory, `${number}.json`),
-      JSON.stringify(viewOf({ number: Number(number), ...answer })),
+      JSON.stringify(
+        viewOf({
+          number: Number(number),
+          headRefName: SYNC_BRANCHES[Number(number)],
+          ...answer,
+        }),
+      ),
     );
   }
   return { directory, log };
@@ -1209,6 +1523,100 @@ describe("sync", () => {
     expect(result.saves).toBe(0);
     expect(result.stdout).toContain("no change has a pull request to read");
     expect(await Bun.file(boardPath).text()).toBe(before);
+  });
+
+  test("a pull request on another branch is skipped and never written", async () => {
+    const boardPath = await writeSyncBoard();
+    const stub = await ghStub({
+      // What a wrong `pr.number` produces: a real pull request, on a branch
+      // that has nothing to do with this change. It used to be recorded, with
+      // its merged state moving the change to done, and the run still exited 0.
+      11: {
+        state: "MERGED",
+        headRefOid: "d".repeat(40),
+        headRefName: "totally/unrelated-branch",
+      },
+      12: { state: "CLOSED" },
+    });
+
+    const result = await runSync(["OV-200", "--board", boardPath], stub);
+
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain("OV-200-C1: pull request #11 is on branch");
+    expect(result.stderr).toContain("totally/unrelated-branch");
+    expect(result.stderr).toContain("overlord/OV-200-C1");
+    expect(result.stdout).not.toContain("OV-200-C1");
+
+    // The sibling change is still synchronized, in the one write of the run.
+    expect(result.saves).toBe(1);
+    expect(result.stdout).toContain("OV-200-C2  open -> closed");
+
+    const after = await loadBoard(boardPath);
+    expect(findChange(after.board, "OV-200-C1")!.change).toEqual(
+      findChange(syncSampleBoard(), "OV-200-C1")!.change,
+    );
+  });
+
+  test("a run where nothing could be read does not claim the board is current", async () => {
+    const boardPath = await writeSyncBoard();
+    const stub = await ghStub({
+      21: { headRefName: "someone-elses-branch" },
+    });
+    const before = await Bun.file(boardPath).text();
+
+    const result = await runSync(["OV-201", "--board", boardPath], stub);
+
+    expect(result.code).toBe(1);
+    expect(result.saves).toBe(0);
+    expect(result.stdout).not.toContain("already current");
+    expect(result.stdout).toContain("could not be read");
+    expect(result.stdout).toContain("not known to be current");
+    expect(await Bun.file(boardPath).text()).toBe(before);
+  });
+
+  test("commits added after the review are reported, and the run still succeeds", async () => {
+    const boardPath = await writeReviewedSyncBoard("OV-201-C1", "c".repeat(40));
+    const stub = await ghStub({
+      // A new head commit on the pull request that was reviewed at c...c.
+      21: {
+        url: "https://github.com/o/r/pull/21",
+        headRefOid: "e".repeat(40),
+      },
+    });
+
+    const result = await runSync(["OV-201", "--board", boardPath], stub);
+
+    // A warning, not a failure: the merge gate is the commander's call.
+    expect(result.code).toBe(0);
+    expect(result.stderr).toContain(
+      "OV-201-C1: commits were added after the review",
+    );
+    expect(result.stderr).toContain("e".repeat(40));
+    expect(result.saves).toBe(1);
+
+    const after = await loadBoard(boardPath);
+    const change = findChange(after.board, "OV-201-C1")!.change;
+    expect(change.pr!.head_sha).toBe("e".repeat(40));
+    expect(change.pr!.reviewed_sha).toBe("c".repeat(40));
+  });
+
+  test("the review gap is reported even when the pull request did not move", async () => {
+    const boardPath = await writeReviewedSyncBoard("OV-201-C1", "9".repeat(40));
+    const stub = await ghStub({
+      21: {
+        url: "https://github.com/o/r/pull/21",
+        headRefOid: "c".repeat(40),
+      },
+    });
+
+    const result = await runSync(["OV-201", "--board", boardPath], stub);
+
+    expect(result.code).toBe(0);
+    expect(result.saves).toBe(0);
+    expect(result.stdout).toContain("already current");
+    expect(result.stderr).toContain(
+      "OV-201-C1: commits were added after the review",
+    );
   });
 
   test("one failing pull request is skipped, the rest are still written", async () => {

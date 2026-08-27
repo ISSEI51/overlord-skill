@@ -22,4 +22,13 @@ If no findings are present, state `No blocking findings.` and identify any tests
 
 ## Board Update
 
+When you conclude that no blocking finding remains, first record the commit you actually reviewed. From the project directory, run the Overlord checkout's `change.sh` with its absolute path:
+
+```bash
+cd <project-directory>
+/path/to/overlord/scripts/change.sh reviewed <change-id>
+```
+
+It writes `changes[].pr.reviewed_sha` and nothing else. Do not move a card to `acceptance` while a change's `reviewed_sha` differs from its `head_sha`: those commits were added after the review and no review has read them. Re-review them and run `reviewed` again instead.
+
 Update the matching card in `docs/product-ops/board.yaml`. Set it to `implementing` when blocking fixes remain, `acceptance` when no blocking findings remain but user verification is required, or `done` only after acceptance is confirmed. Record only the compact review outcome, blockers, and one manual scenario. Overlord Console renders the file, so no separate board update is needed. If the file cannot be written, return a `BOARD_UPDATE_REQUIRED` block and do not claim that the board is current.

@@ -51,8 +51,8 @@ The console has one fixed session, the commander, and the user talks only to it.
 - Never ask the user to pick, open, or switch a cmux session. If work needs a session, create it.
 - For an `implementing` card, start one cmux workspace per change on its own worktree and record it in that change's `agent` field, so the console can show which session owns the work. A card without a `changes` list is a single change; record the session on the card's `agent` as before. See [the console reference](references/console.md) for the exact commands.
 - For discovery, card creation, implementation briefs, and independent review, run a subagent inside this session instead of a new workspace, then write the result to the board.
-- Run the independent review with a different subagent from the one that implemented the change. Do not let an implementing subagent accept its own work.
-- Before reporting status or deciding whether a card is complete, run `scripts/change.sh sync <card-id>` to refresh each change's pull request state on the board.
+- Run the independent review with a different subagent from the one that implemented the change. Do not let an implementing subagent accept its own work. The reviewer records the commit it read with `change.sh reviewed <change-id>`; a change whose `reviewed_sha` is not its `head_sha` is not ready for acceptance.
+- Before reporting status or deciding whether a card is complete, refresh each change's pull request state on the board: from the project directory, run `/path/to/overlord/scripts/change.sh sync <card-id>` with the absolute path of the Overlord checkout, as in [the console reference](references/console.md).
 - Report back in the commander session only: the decision needed, or the result. Do not tell the user which subagent produced it unless they ask.
 
 ## AI-Readable Board

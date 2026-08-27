@@ -71,4 +71,13 @@ Use ISO 8601 timestamps in UTC. Do not store credentials, user code, full logs, 
 | `branch` | The branch for this change, e.g. `overlord/RC-UX-001-C1` |
 | `pr` | `number`, `url`, `state` (`open` / `merged` / `closed`), `head_sha`, `reviewed_sha`. Unknown values stay null |
 
+Every `pr` field has exactly one writer, so no agent edits the record by hand:
+
+| Field | Written by |
+| --- | --- |
+| `number`, `url`, `state`, `head_sha` | `change.sh pr` when the pull request is opened or recorded, and `change.sh sync` on every later refresh |
+| `reviewed_sha` | `change.sh reviewed`, run by the independent reviewer at the point it concludes that no blocking finding remains |
+
+`pr` and `sync` carry `reviewed_sha` over untouched, and `reviewed` touches nothing but `reviewed_sha`, so a review result and a pull request refresh never overwrite each other. `head_sha` is the current head of the pull request and `reviewed_sha` is the commit a review actually read: while they differ, the change carries commits no review has read, `sync` says so, and the card is not ready for `acceptance`.
+
 The card-level `agent` is kept for cards written before `changes` existed; when both are present the change's session wins. Cards without `changes` behave exactly as before.
