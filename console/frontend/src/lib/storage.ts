@@ -1,6 +1,5 @@
 /** localStorage keys shared with the previous console (fully compatible). */
 export const DOCK_WIDTH_KEY = "overlord.dockWidth";
-export const SCREEN_OPEN_KEY = "overlord.screenOpen";
 export const DOCK_OPEN_KEY = "overlord.dockOpen";
 
 export const DEFAULT_DOCK_WIDTH = 560;

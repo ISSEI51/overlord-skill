@@ -39,7 +39,6 @@ export type ConsoleController = {
   setupOpen: boolean;
   openSetup: () => void;
   closeSetup: () => void;
-  toggleScreen: () => void;
   dockResize: {
     setWidth: (px: number) => void;
     setResizing: (resizing: boolean) => void;

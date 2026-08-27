@@ -39,7 +39,6 @@ export function CommanderSidebar() {
     setupOpen,
     closeSetup,
     openSetup,
-    toggleScreen,
     focusSurface,
   } = useConsole();
 
@@ -60,9 +59,6 @@ export function CommanderSidebar() {
         <div className="flex shrink-0 gap-1.5">
           {ready && link && (
             <>
-              <Button variant="outline" size="xs" onClick={toggleScreen}>
-                {screenVisible ? "画面を隠す" : "画面を表示"}
-              </Button>
               <Button
                 variant="outline"
                 size="xs"

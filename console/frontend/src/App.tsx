@@ -15,7 +15,6 @@ import { refreshScreenSoon } from "@/lib/screen";
 import {
   DOCK_OPEN_KEY,
   DOCK_WIDTH_KEY,
-  SCREEN_OPEN_KEY,
   clampDockWidth,
   readDockWidth,
   readStorage,
@@ -45,7 +44,6 @@ export default function App() {
 
   /* Persisted dock choices; localStorage keys are shared with the old UI. */
   const [dockOpen, setDockOpen] = useState(() => readStorage(DOCK_OPEN_KEY) !== "0");
-  const [screenOpen, setScreenOpen] = useState(() => readStorage(SCREEN_OPEN_KEY) === "1");
   /** Transient peek (memory only): a successful send re-shows dock + mirror. */
   const [peek, setPeek] = useState(false);
   const [setupOpen, setSetupOpen] = useState(false);
@@ -366,8 +364,8 @@ export default function App() {
   const ready = Boolean(link) && !setupOpen;
   /** Single authority for whether the whole commander dock is shown. */
   const dockVisible = dockOpen || peek;
-  /** Single authority for whether the commander screen mirror is shown. */
-  const screenVisible = ready && dockVisible && (screenOpen || peek);
+  /** The mirror always shows while the dock is visible and a commander is ready. */
+  const screenVisible = ready && dockVisible;
 
   const controller: ConsoleController = {
     data,
@@ -399,13 +397,6 @@ export default function App() {
     setupOpen,
     openSetup: () => setSetupOpen(true),
     closeSetup: () => setSetupOpen(false),
-    toggleScreen: () => {
-      // Hide wins whenever the screen is showing, even via a transient peek.
-      const next = !screenVisible;
-      setScreenOpen(next);
-      setPeek(false);
-      writeStorage(SCREEN_OPEN_KEY, next ? "1" : "0");
-    },
     dockResize: {
       setWidth: (px: number) => {
         const clamped = clampDockWidth(px);
