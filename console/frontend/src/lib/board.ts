@@ -1,4 +1,14 @@
-import type { Board, DecisionEntry, Item, StateData, SurfaceLink } from "./types";
+import { STATES } from "./types";
+import type {
+  Board,
+  Change,
+  DecisionEntry,
+  Item,
+  SessionLink,
+  StateData,
+  StateKey,
+  SurfaceLink,
+} from "./types";
 
 /** Board ids referenced in prose, e.g. "OV-CON-011" or "OV-017". */
 export function findIdInText(text: unknown): string | null {
@@ -57,4 +67,46 @@ export function surfaceLabel(link: SurfaceLink): string {
 export function formatValue(value: unknown): string {
   if (typeof value === "string") return value;
   return JSON.stringify(value, null, 2);
+}
+
+export function stateLabel(state: StateKey): string {
+  return STATES.find((entry) => entry.key === state)?.label ?? state;
+}
+
+export function changesOf(item: Item): Change[] {
+  return item.changes ?? [];
+}
+
+/** done / total, or null when the card has no engineering split. */
+export function changeProgress(item: Item): { done: number; total: number } | null {
+  const changes = changesOf(item);
+  if (changes.length === 0) return null;
+  return {
+    done: changes.filter((change) => change.state === "done").length,
+    total: changes.length,
+  };
+}
+
+/**
+ * The session to show for a card. A change owns its agent (1 change =
+ * 1 agent execution unit), so the first unfinished change with a session
+ * wins; the card-level `agent` stays as the compatibility fallback.
+ */
+export function activeSession(
+  item: Item,
+): { agent: SessionLink; changeId: string | null } | null {
+  for (const change of changesOf(item)) {
+    if (change.state === "done" || change.state === "blocked") continue;
+    if (change.agent?.surface_id) return { agent: change.agent, changeId: change.id };
+  }
+  for (const change of changesOf(item)) {
+    if (change.agent?.surface_id) return { agent: change.agent, changeId: change.id };
+  }
+  if (item.agent?.surface_id) return { agent: item.agent, changeId: null };
+  return null;
+}
+
+/** True when the card or any of its changes points at a cmux session. */
+export function hasSession(item: Item): boolean {
+  return activeSession(item) !== null;
 }

@@ -27,6 +27,30 @@ export type SessionLink = {
   cwd?: string | null;
 };
 
+/** Pull request for a change; fields stay null until the PR exists. */
+export type PullRequest = {
+  number?: number | null;
+  url?: string | null;
+  /** open | merged | closed */
+  state?: string | null;
+  head_sha?: string | null;
+  reviewed_sha?: string | null;
+};
+
+/**
+ * One engineering delivery unit under a card:
+ * 1 change = 1 worktree = 1 branch = 1 pull request = 1 agent execution unit.
+ * Read-only in the console: changes are not a human decision unit.
+ */
+export type Change = {
+  id: string;
+  title?: string | null;
+  state: StateKey;
+  agent?: SessionLink | null;
+  branch?: string | null;
+  pr?: PullRequest | null;
+};
+
 export type Priority = {
   impact?: number | null;
   urgency?: number | null;
@@ -48,7 +72,10 @@ export type Item = {
   next_action?: string | null;
   blocker?: string | null;
   updated_at?: string | null;
+  /** Kept for compatibility; new work records the session on the change. */
   agent?: SessionLink | null;
+  /** Engineering split of this card, in dependency order. */
+  changes?: Change[] | null;
   brief?: unknown;
   review?: unknown;
 };

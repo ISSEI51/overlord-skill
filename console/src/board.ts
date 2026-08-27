@@ -49,7 +49,10 @@ export type Item = {
   next_action?: string | null;
   blocker?: string | null;
   updated_at?: string | null;
+  /** Kept for compatibility; new work records the session on the change. */
   agent?: SessionLink | null;
+  /** Engineering split of this card, in dependency order. */
+  changes?: Change[] | null;
   [key: string]: Json | undefined;
 };
 
@@ -58,6 +61,38 @@ export type SessionLink = {
   workspace_id?: string | null;
   surface_id?: string | null;
   cwd?: string | null;
+};
+
+/**
+ * The pull request for one change. Every field stays null until the PR
+ * exists, so the shape does not change when the PR lifecycle lands.
+ */
+export type PullRequest = {
+  number?: number | null;
+  url?: string | null;
+  /** open | merged | closed */
+  state?: string | null;
+  head_sha?: string | null;
+  reviewed_sha?: string | null;
+};
+
+/**
+ * One engineering delivery unit under a card:
+ * 1 change = 1 worktree = 1 branch = 1 pull request = 1 agent execution unit.
+ *
+ * Changes exist so that a single product outcome can ship as several
+ * reviewable pieces without adding cards to the board. Their state uses the
+ * card vocabulary minus `inbox` / `discovery` / `acceptance`: acceptance is a
+ * human decision and belongs to the card alone.
+ */
+export type Change = {
+  id: string;
+  title: string;
+  state: State;
+  agent?: SessionLink | null;
+  branch?: string | null;
+  pr?: PullRequest | null;
+  [key: string]: Json | undefined;
 };
 
 export type Board = {
@@ -83,8 +118,13 @@ const ITEM_KEY_ORDER = [
   "next_action",
   "blocker",
   "agent",
+  "changes",
   "updated_at",
 ];
+
+const CHANGE_KEY_ORDER = ["id", "title", "state", "agent", "branch", "pr"];
+
+const PR_KEY_ORDER = ["number", "url", "state", "head_sha", "reviewed_sha"];
 
 const BOARD_KEY_ORDER = [
   "version",
@@ -185,6 +225,14 @@ function orderKeys(value: Json, order: string[]): Json {
     result.items = (result.items as Json[]).map((entry) =>
       orderKeys(entry, ITEM_KEY_ORDER),
     );
+  }
+  if (Array.isArray(result.changes)) {
+    result.changes = (result.changes as Json[]).map((entry) =>
+      orderKeys(entry, CHANGE_KEY_ORDER),
+    );
+  }
+  if (result.pr && typeof result.pr === "object" && !Array.isArray(result.pr)) {
+    result.pr = orderKeys(result.pr, PR_KEY_ORDER);
   }
   return result;
 }

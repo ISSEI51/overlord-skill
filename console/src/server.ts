@@ -197,6 +197,7 @@ const PATCHABLE = new Set([
   "acceptance_conditions",
   "priority",
   "agent",
+  "changes",
 ]);
 
 async function patchItem(request: Request, id: string): Promise<Response> {
