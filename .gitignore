@@ -1,3 +1,4 @@
 .DS_Store
 console/node_modules/
 console/frontend/node_modules/
+.overlord/
