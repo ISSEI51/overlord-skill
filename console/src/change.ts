@@ -10,9 +10,10 @@
  * order, the block style and the atomic rename identical to a console write.
  *
  * Implemented subcommands:
- *   change start <change-id> [--board <path>] [--base <branch>]
- *   change pr    <change-id> [--board <path>] [--base <branch>] [--number <n>]
- *   change sync  [<card-id>] [--all] [--board <path>]
+ *   change start    <change-id> [--board <path>] [--base <branch>]
+ *   change pr       <change-id> [--board <path>] [--base <branch>] [--number <n>]
+ *   change reviewed <change-id> [--board <path>] [--sha <sha>]
+ *   change sync     [<card-id>] [--all] [--board <path>]
  */
 
 import { dirname, resolve } from "node:path";
@@ -698,6 +699,162 @@ export async function pr(argv: string[]): Promise<number> {
 }
 
 // ---------------------------------------------------------------------------
+// reviewed
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse a git commit sha.
+ *
+ * `reviewed_sha` is the commit an independent reviewer actually read, and it is
+ * later compared with the pull request head, so a value that is not a commit
+ * name would silently turn that comparison into a permanent mismatch. A full
+ * object name is 40 hex digits; an abbreviated one is accepted from 7 digits
+ * up, which is git's own lower bound for an unambiguous short name.
+ *
+ * The value is lower-cased, because git object names are lower-case hex and the
+ * comparison with `head_sha` is a string comparison.
+ *
+ * Returns null for anything that is not a commit name.
+ */
+export function parseSha(raw: string): string | null {
+  if (!/^[0-9a-fA-F]{7,40}$/.test(raw)) return null;
+  return raw.toLowerCase();
+}
+
+/**
+ * Whether two recorded shas name the same commit.
+ *
+ * `reviewed_sha` may be an abbreviation (`--sha 1a2b3c4`) while `head_sha` is
+ * always the full object name `gh` reports, so a plain string comparison would
+ * report a review gap that does not exist. One being a prefix of the other is
+ * the same commit for this purpose; both are at least 7 digits, so a prefix
+ * collision is not a practical concern.
+ */
+export function sameCommit(a: string, b: string): boolean {
+  const first = a.toLowerCase();
+  const second = b.toLowerCase();
+  const [shorter, longer] =
+    first.length <= second.length ? [first, second] : [second, first];
+  return longer.startsWith(shorter);
+}
+
+/** The full HEAD commit of one worktree, or null when it cannot be read. */
+async function worktreeHead(
+  root: string,
+  worktree: string,
+): Promise<string | null> {
+  const worktrees = parseWorktreePaths(
+    (await gitOrThrow(["worktree", "list", "--porcelain"], root)).stdout,
+  );
+  if (!worktrees.includes(worktree)) return null;
+  const head = await git(["-C", worktree, "rev-parse", "HEAD"], root);
+  if (head.code !== 0) return null;
+  return parseSha(head.stdout.trim());
+}
+
+/**
+ * Record the commit an independent review actually read.
+ *
+ * The review is done on a worktree, so the worktree HEAD is the commit that was
+ * read; the pull request head is used only when the worktree is already gone,
+ * which is the case when the review runs after the worktree was removed. Both
+ * are read, never guessed: `--sha` is the way to record a commit that is
+ * neither.
+ *
+ * The change must already carry a pull request, because `reviewed_sha` lives
+ * inside `pr` and is meaningless without the pull request it qualifies. The
+ * board is written only after the commit is known, so a failure leaves
+ * `board.yaml` untouched.
+ */
+export async function reviewed(argv: string[]): Promise<number> {
+  const { positional, options } = parseArgs(argv);
+  const changeId = positional[0];
+  if (!changeId) {
+    process.stderr.write("usage: change reviewed <change-id> [--sha <sha>]\n");
+    return 2;
+  }
+
+  let sha: string | null = null;
+  if (options.sha !== undefined) {
+    sha = parseSha(options.sha);
+    if (sha === null) {
+      process.stderr.write(
+        `--sha must be a commit sha of 7 to 40 hex digits: ${options.sha}\n`,
+      );
+      return 2;
+    }
+  }
+
+  const boardPath = resolveBoardPath(options.board);
+  const { board, exists } = await loadBoard(boardPath);
+  if (!exists) {
+    process.stderr.write(`board not found: ${boardPath}\n`);
+    return 1;
+  }
+  const found = findChange(board, changeId);
+  if (!found) {
+    process.stderr.write(
+      `unknown change id: ${changeId} (board: ${boardPath})\n`,
+    );
+    return 1;
+  }
+
+  const number = found.change.pr?.number;
+  if (typeof number !== "number") {
+    process.stderr.write(
+      `change ${changeId} has no pull request on the board; ` +
+        `run "change pr ${changeId}" first.\n` +
+        `Nothing was written to ${boardPath}.\n`,
+    );
+    return 1;
+  }
+
+  let source = "--sha";
+  if (sha === null) {
+    const root = await mainRepoRoot();
+    const worktree = worktreePathFor(root, changeId);
+    sha = await worktreeHead(root, worktree);
+    if (sha !== null) {
+      source = worktree;
+    } else {
+      const viewed = await gh(
+        ["pr", "view", String(number), "--json", "headRefOid"],
+        root,
+      );
+      if (viewed.code !== 0) {
+        reportFailure(viewed);
+        return 1;
+      }
+      const view = parseJson<{ headRefOid?: unknown }>(viewed.stdout);
+      const headRefOid =
+        typeof view?.headRefOid === "string" ? view.headRefOid : "";
+      sha = headRefOid ? parseSha(headRefOid) : null;
+      if (sha === null) {
+        process.stderr.write(
+          `could not read: gh pr view ${number} --json headRefOid\n`,
+        );
+        return 1;
+      }
+      source = `gh pr view ${number}`;
+    }
+  }
+
+  await updateChange(boardPath, changeId, (change) => {
+    // Only `reviewed_sha` moves: the rest of the record belongs to `pr` and to
+    // `sync`, and this command must not overwrite what they last read.
+    change.pr = { ...(change.pr ?? {}), reviewed_sha: sha };
+  });
+
+  process.stdout.write(`pull request:     #${number}\n`);
+  process.stdout.write(`reviewed commit:  ${sha}\n`);
+  process.stdout.write(`read from:        ${source}\n`);
+  process.stdout.write(`board updated:    ${boardPath}\n`);
+
+  process.stdout.write(`${sha}\n`);
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
 // sync
 // ---------------------------------------------------------------------------
 
@@ -773,6 +930,32 @@ export function applyPullRequestView(
   return { changed: prMoved || changeDone, previousState, state, changeDone };
 }
 
+/**
+ * The warning for a change whose pull request grew commits after it was
+ * reviewed, or null when there is nothing to warn about.
+ *
+ * This is a warning, not an error: commits after a review are normal while the
+ * change is still being worked on. It matters at merge time, which is why it is
+ * reported on every `sync` rather than only when the pull request moved.
+ *
+ * Nothing is reported while either commit is unknown, because "not recorded"
+ * and "not reviewed" are different states and only the reviewer can tell them
+ * apart.
+ */
+export function reviewGapLine(
+  changeId: string,
+  headSha: string | null | undefined,
+  reviewedSha: string | null | undefined,
+): string | null {
+  if (!headSha || !reviewedSha) return null;
+  if (sameCommit(headSha, reviewedSha)) return null;
+  return (
+    `${changeId}: commits were added after the review ` +
+    `(reviewed ${reviewedSha}, head ${headSha}); ` +
+    `review the new commits before merging`
+  );
+}
+
 /** One reported line: `OV-103-C2  open -> merged  (change done)`. */
 export function syncLine(changeId: string, outcome: SyncOutcome): string {
   const from = outcome.previousState ?? "unknown";
@@ -791,7 +974,9 @@ export function syncLine(changeId: string, outcome: SyncOutcome): string {
  *
  * A `gh` failure on one change is reported and skipped; the remaining changes
  * are still synchronized and still written, and the command then exits
- * non-zero so the caller knows the picture is incomplete.
+ * non-zero so the caller knows the picture is incomplete. A pull request that
+ * is not on the branch recorded for the change is skipped the same way, so a
+ * wrong `pr.number` cannot import another pull request's state.
  */
 export async function sync(argv: string[]): Promise<number> {
   const { positional, options } = parseArgs(argv, ["all"]);
@@ -870,17 +1055,56 @@ export async function sync(argv: string[]): Promise<number> {
   for (const target of targets) {
     const view = views.get(target.change.id);
     if (!view) continue;
+
+    // The pull request has to be the one that belongs to this change, exactly
+    // as `pr` requires when it records the number. Without this check a wrong
+    // `pr.number` — a typo, or a number recorded before a branch was renamed —
+    // imports an unrelated pull request's state, and its merge would move the
+    // change to `done`. Skipped and counted as a failure: the change's real
+    // state is unknown, so nothing is written for it.
+    const branch = target.change.branch ?? null;
+    if (!branch || view.headRefName !== branch) {
+      process.stderr.write(
+        `${target.change.id}: pull request #${view.number} is on branch ` +
+          `"${view.headRefName ?? "(unknown)"}", not the branch recorded for ` +
+          `the change ("${branch ?? "(none)"}"); skipped, nothing written\n`,
+      );
+      views.delete(target.change.id);
+      failures += 1;
+      continue;
+    }
+
     const outcome = applyPullRequestView(target.change, view);
+
+    // Reported whether or not the pull request moved: the gap is a property of
+    // the change, not of this run.
+    const gap = reviewGapLine(
+      target.change.id,
+      target.change.pr?.head_sha,
+      target.change.pr?.reviewed_sha,
+    );
+    if (gap) process.stderr.write(`${gap}\n`);
+
     if (!outcome.changed) continue;
     moved.push(target.change.id);
     lines.push(syncLine(target.change.id, outcome));
   }
 
   if (moved.length === 0) {
+    if (failures > 0) {
+      // Not "already current": a change that could not be read was not
+      // compared with anything, so the board's pull request state is unknown,
+      // and a caller reading only this line must not conclude it is complete.
+      process.stdout.write(
+        `${failures} of ${targets.length} pull requests could not be read; ` +
+          "nothing was written and the board is not known to be current\n",
+      );
+      return 1;
+    }
     process.stdout.write(
       "no pull request moved; the board is already current\n",
     );
-    return failures > 0 ? 1 : 0;
+    return 0;
   }
 
   await updateChanges(boardPath, moved, (change) => {
@@ -904,6 +1128,9 @@ commands:
                       them on the board
   pr <change-id>      push the change branch, open its pull request and record
                       it on the board
+  reviewed <change-id>
+                      record the commit an independent review read, in
+                      changes[].pr.reviewed_sha
   sync [<card-id>]    read the pull request state of every recorded change of
                       one card, or of the whole board with --all, and write it
                       back in a single board write
@@ -915,6 +1142,8 @@ options:
                       (default: the current branch of the main checkout)
   --number <n>        pr only: record the pull request with this number instead
                       of creating one, for a pull request opened by hand
+  --sha <sha>         reviewed only: the reviewed commit, instead of the
+                      worktree HEAD or the pull request head
   --all               sync only: every card on the board instead of one card
 `;
 
@@ -922,6 +1151,7 @@ export async function main(argv: string[]): Promise<number> {
   const command = argv[0];
   if (command === "start") return start(argv.slice(1));
   if (command === "pr") return pr(argv.slice(1));
+  if (command === "reviewed") return reviewed(argv.slice(1));
   if (command === "sync") return sync(argv.slice(1));
   if (command === undefined || command === "--help" || command === "-h") {
     process.stdout.write(USAGE);
