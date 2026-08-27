@@ -13,6 +13,7 @@ const ACTIVE_STATES = ["discovery", "specified", "implementing", "reviewing", "a
 const SCREEN_INTERVAL_MS = 1500;
 const DOCK_WIDTH_KEY = "overlord.dockWidth";
 const SCREEN_OPEN_KEY = "overlord.screenOpen";
+const DOCK_OPEN_KEY = "overlord.dockOpen";
 
 const view = {
   data: null,
@@ -29,12 +30,20 @@ const view = {
   screenOpen: false,
   /** Transient expansion (never persisted); reserved for OV-CON-011. */
   screenPeek: false,
+  /** Persisted choice: keep the whole commander dock shown (default true). */
+  dockOpen: true,
 };
 
 try {
   view.screenOpen = localStorage.getItem(SCREEN_OPEN_KEY) === "1";
 } catch {
   /* missing or blocked storage keeps the collapsed default */
+}
+
+try {
+  view.dockOpen = localStorage.getItem(DOCK_OPEN_KEY) !== "0";
+} catch {
+  /* missing or blocked storage keeps the visible default */
 }
 
 const $ = (selector) => document.querySelector(selector);
@@ -592,13 +601,26 @@ function commanderLink() {
   return terminalSurfaces().find((entry) => entry.surface.id === id) ?? null;
 }
 
+/** Single authority for whether the whole commander dock is shown. */
+function dockVisible() {
+  // A transient peek (sendTemplate) re-shows a hidden dock so the reply is visible.
+  return view.dockOpen || view.screenPeek;
+}
+
 /** Single authority for whether the commander screen is shown. */
 function screenVisible() {
   const ready = Boolean(commanderLink()) && !view.setupOpen;
-  return ready && (view.screenOpen || view.screenPeek);
+  // A hidden dock also stops the screen (and with it the polling fetches).
+  return ready && dockVisible() && (view.screenOpen || view.screenPeek);
 }
 
 function renderDock() {
+  $(".stage").classList.toggle("dock-hidden", !dockVisible());
+
+  const toggle = $("#dock-toggle");
+  toggle.setAttribute("aria-pressed", dockVisible() ? "true" : "false");
+  toggle.title = dockVisible() ? "司令塔を隠す" : "司令塔を表示";
+
   const link = commanderLink();
   const configured = Boolean(view.data.board.commander?.surface_id);
   const ready = Boolean(link) && !view.setupOpen;
@@ -1155,6 +1177,21 @@ $("#resizer").addEventListener("mousedown", (event) => {
 });
 
 $("#detail-close").addEventListener("click", closeDetail);
+
+/* Top-bar toggle that hides the whole commander dock. */
+$("#dock-toggle").addEventListener("click", () => {
+  // Hide wins whenever the dock is showing, even via a transient peek.
+  const visible = dockVisible();
+  view.dockOpen = !visible;
+  view.screenPeek = false;
+  try {
+    // Only the explicit choice is persisted; a peek never is.
+    localStorage.setItem(DOCK_OPEN_KEY, view.dockOpen ? "1" : "0");
+  } catch {
+    /* private windows and blocked storage are fine */
+  }
+  renderDock();
+});
 
 /* Card creation dialog: cancel and Escape keep what was typed. */
 const cardDialog = $("#card-dialog");

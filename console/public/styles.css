@@ -57,6 +57,14 @@ body {
   grid-template-columns: minmax(0, 1fr) 5px var(--dock-width, 560px);
   min-height: 0;
 }
+/* Dock hidden via the top-bar toggle: the board takes the full width. */
+.stage.dock-hidden {
+  grid-template-columns: minmax(0, 1fr);
+}
+.stage.dock-hidden > .resizer,
+.stage.dock-hidden > .dock {
+  display: none;
+}
 .workarea {
   position: relative;
   display: grid;
