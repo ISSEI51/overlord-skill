@@ -54,12 +54,17 @@ export function DetailPanel() {
           }}
         >
           <DialogHeader className="shrink-0 gap-0.5 px-4 pt-4 pb-2">
-            <div className="font-mono text-[11px] text-faint">
-              {[item.id, item.project].filter(Boolean).join("  ·  ")}
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0 flex-1">
+                <div className="font-mono text-[11px] text-faint">
+                  {[item.id, item.project].filter(Boolean).join("  ·  ")}
+                </div>
+                <DialogTitle className="text-[15px] leading-snug">
+                  {item.title ?? ""}
+                </DialogTitle>
+              </div>
+              {item.state === "acceptance" && <AcceptDoneButton item={item} />}
             </div>
-            <DialogTitle className="text-[15px] leading-snug">
-              {item.title ?? ""}
-            </DialogTitle>
           </DialogHeader>
           <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">
             <CommandField item={item} />
@@ -85,6 +90,44 @@ export function DetailPanel() {
         </DialogContent>
       )}
     </Dialog>
+  );
+}
+
+/**
+ * Accept-and-complete for cards awaiting acceptance (state === "acceptance"
+ * only; the caller guards rendering). One PATCH sets state to done and
+ * clears owner / next_action / blocker, then closes the modal. On failure
+ * (e.g. 409 rev conflict) it matches patchField's behavior: error toast and
+ * board reload, with the modal left open.
+ */
+function AcceptDoneButton({ item }: { item: Item }) {
+  const { patchItem, load, select } = useConsole();
+  const [saving, setSaving] = useState(false);
+
+  const complete = async () => {
+    if (saving) return;
+    setSaving(true);
+    try {
+      await patchItem(item.id, {
+        state: "done",
+        owner: null,
+        next_action: null,
+        blocker: null,
+      });
+      toast.success(`${item.id} を完了にしました`);
+      select(null);
+    } catch (error) {
+      toast.error(`更新できません: ${errorMessage(error)}`);
+      await load();
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Button size="sm" className="shrink-0" disabled={saving} onClick={() => void complete()}>
+      受け入れて完了
+    </Button>
   );
 }
 

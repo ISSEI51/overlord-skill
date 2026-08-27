@@ -78,10 +78,15 @@ export function BoardView() {
               </div>
               <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto p-2">
                 {columnItems.map((item) => {
+                  // Done/blocked cards never get the needs-user highlight,
+                  // even if owner === "user" or a decision entry still
+                  // references them (mirrors the exclusion on `running`).
                   const needsUser =
-                    item.state === "acceptance" ||
-                    item.owner === "user" ||
-                    needsUserIds.has(item.id);
+                    item.state !== "done" &&
+                    item.state !== "blocked" &&
+                    (item.state === "acceptance" ||
+                      item.owner === "user" ||
+                      needsUserIds.has(item.id));
                   // AI is actively working on the card. The needs-user
                   // highlight wins when both apply.
                   const running =
