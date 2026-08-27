@@ -1120,8 +1120,8 @@ describe("sync", () => {
     // One `gh pr view` per change that has a number; OV-200-C3 has no pull
     // request and OV-201-C1 belongs to another card, so neither is asked for.
     expect(result.gh).toEqual([
-      "pr view 11 --json number,url,state,headRefOid",
-      "pr view 12 --json number,url,state,headRefOid",
+      "pr view 11 --json number,url,state,headRefOid,headRefName",
+      "pr view 12 --json number,url,state,headRefOid,headRefName",
     ]);
     expect(result.saves).toBe(1);
     expect(result.stdout).toContain("OV-200-C1  open -> merged  (change done)");
@@ -1167,7 +1167,7 @@ describe("sync", () => {
 
     expect(result.code).toBe(0);
     expect(result.gh.length).toBe(3);
-    expect(result.gh[2]).toBe("pr view 21 --json number,url,state,headRefOid");
+    expect(result.gh[2]).toBe("pr view 21 --json number,url,state,headRefOid,headRefName");
     expect(result.saves).toBe(1);
     // The unchanged pull request is not reported.
     expect(result.stdout).not.toContain("OV-201-C1");
