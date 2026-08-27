@@ -4,6 +4,9 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "bun run src/server.ts"
+    "start": "bun run src/server.ts",
+    "build": "bun run --cwd frontend build",
+    "dev": "bun run --cwd frontend dev",
+    "typecheck": "bun run --cwd frontend typecheck"
   }
 }

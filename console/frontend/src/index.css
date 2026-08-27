@@ -1,0 +1,150 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+/*
+ * Theme tokens. Light is the base; dark follows prefers-color-scheme,
+ * matching the old console (no manual theme switch).
+ */
+:root {
+  color-scheme: light dark;
+  --radius: 0.5rem;
+
+  --background: #f6f7f9;
+  --foreground: #12161c;
+  --card: #ffffff;
+  --card-foreground: #12161c;
+  --popover: #ffffff;
+  --popover-foreground: #12161c;
+  --primary: #0d6efd;
+  --primary-foreground: #ffffff;
+  --secondary: #eceef1;
+  --secondary-foreground: #12161c;
+  --muted: #eceef1;
+  --muted-foreground: #4d5866;
+  --accent: #e6e9ed;
+  --accent-foreground: #12161c;
+  --destructive: #c0392b;
+  --destructive-foreground: #ffffff;
+  --border: #dde1e6;
+  --input: #c4cad1;
+  --ring: #0d6efd;
+
+  /* Console-specific tokens carried over from the old stylesheet. */
+  --sunken: #eceef1;
+  --line-strong: #c4cad1;
+  --dim: #4d5866;
+  --faint: #78828f;
+  --warn: #9a6700;
+  --ok: #1a7f37;
+  --needs-user: #0e7490;
+
+  /* The commander dock (shadcn Sidebar) shares the card palette. */
+  --sidebar: var(--card);
+  --sidebar-foreground: var(--card-foreground);
+  --sidebar-primary: var(--primary);
+  --sidebar-primary-foreground: var(--primary-foreground);
+  --sidebar-accent: var(--accent);
+  --sidebar-accent-foreground: var(--accent-foreground);
+  --sidebar-border: var(--border);
+  --sidebar-ring: var(--ring);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #0e1116;
+    --foreground: #e6edf3;
+    --card: #161b22;
+    --card-foreground: #e6edf3;
+    --popover: #161b22;
+    --popover-foreground: #e6edf3;
+    --primary: #5aa9ff;
+    --primary-foreground: #04101f;
+    --secondary: #0a0d12;
+    --secondary-foreground: #e6edf3;
+    --muted: #0a0d12;
+    --muted-foreground: #9aa7b4;
+    --accent: #1b222c;
+    --accent-foreground: #e6edf3;
+    --destructive: #f77067;
+    --destructive-foreground: #0e1116;
+    --border: #262d38;
+    --input: #38404d;
+    --ring: #5aa9ff;
+
+    --sunken: #0a0d12;
+    --line-strong: #38404d;
+    --dim: #9aa7b4;
+    --faint: #6b7684;
+    --warn: #e3b341;
+    --ok: #56d364;
+    --needs-user: #4dd0e1;
+  }
+}
+
+@theme inline {
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-sunken: var(--sunken);
+  --color-line-strong: var(--line-strong);
+  --color-dim: var(--dim);
+  --color-faint: var(--faint);
+  --color-warn: var(--warn);
+  --color-ok: var(--ok);
+  --color-needs-user: var(--needs-user);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --font-sans:
+    -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Noto Sans JP",
+    sans-serif;
+  --font-mono:
+    ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+}
+
+/* While the dock resize handle is dragged, width changes must be instant. */
+[data-resizing] [data-slot="sidebar-gap"],
+[data-resizing] [data-slot="sidebar-container"] {
+  transition: none;
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+  body {
+    @apply bg-background text-foreground overflow-hidden;
+    font-size: 13px;
+    line-height: 1.55;
+  }
+}
