@@ -9,12 +9,33 @@ import {
   branchNameFor,
   ChangeNotFoundError,
   findChange,
+  normalizePrState,
   parseArgs,
   parseWorktreePaths,
+  pr,
+  prBodyFor,
+  prTitleFor,
   resolveBoardPath,
   updateChange,
   worktreePathFor,
 } from "./change.ts";
+
+/** Run something with stderr captured, so a failing command stays quiet. */
+async function captureStderr(
+  body: () => Promise<number>,
+): Promise<{ code: number; stderr: string }> {
+  const original = process.stderr.write.bind(process.stderr);
+  let stderr = "";
+  process.stderr.write = ((chunk: string) => {
+    stderr += chunk;
+    return true;
+  }) as typeof process.stderr.write;
+  try {
+    return { code: await body(), stderr };
+  } finally {
+    process.stderr.write = original;
+  }
+}
 
 const temporaries: string[] = [];
 
@@ -265,6 +286,73 @@ describe("updateChange", () => {
       thrown = error;
     }
     expect(thrown).toBeInstanceOf(ChangeNotFoundError);
+    expect(await Bun.file(boardPath).text()).toBe(before);
+  });
+});
+
+describe("normalizePrState", () => {
+  test("lower-cases the states GitHub reports", () => {
+    expect(normalizePrState("OPEN")).toBe("open");
+    expect(normalizePrState("MERGED")).toBe("merged");
+    expect(normalizePrState("CLOSED")).toBe("closed");
+  });
+
+  test("passes an unknown state through in lower case", () => {
+    expect(normalizePrState("DRAFT")).toBe("draft");
+    expect(normalizePrState(" Open \n")).toBe("open");
+  });
+
+  test("is null when there is no state to record", () => {
+    expect(normalizePrState("")).toBeNull();
+    expect(normalizePrState("   ")).toBeNull();
+    expect(normalizePrState(null)).toBeNull();
+    expect(normalizePrState(undefined)).toBeNull();
+    expect(normalizePrState(3)).toBeNull();
+  });
+});
+
+describe("pull request text", () => {
+  test("the title is the change title with its id appended", () => {
+    const change = findChange(sampleBoard(), "OV-103-C2")!.change;
+    expect(prTitleFor(change)).toBe("Pull request (OV-103-C2)");
+  });
+
+  test("the body names the card, the change and both ids", () => {
+    const found = findChange(sampleBoard(), "OV-103-C2")!;
+    const body = prBodyFor(found.item, found.change);
+    expect(body).toContain("Second card");
+    expect(body).toContain("Pull request");
+    expect(body).toContain("Card: OV-103");
+    expect(body).toContain("Change: OV-103-C2");
+  });
+});
+
+describe("pr", () => {
+  test("fails without writing the board when the change has no branch", async () => {
+    const boardPath = await writeSampleBoard();
+    const before = await Bun.file(boardPath).text();
+
+    // OV-103-C2 has never been started, so there is nothing to push.
+    const { code, stderr } = await captureStderr(() =>
+      pr(["OV-103-C2", "--board", boardPath]),
+    );
+
+    expect(code).not.toBe(0);
+    expect(stderr).toContain("has no branch on the board");
+    expect(stderr).toContain("change start OV-103-C2");
+    expect(await Bun.file(boardPath).text()).toBe(before);
+  });
+
+  test("rejects a --number that is not a pull request number", async () => {
+    const boardPath = await writeSampleBoard();
+    const before = await Bun.file(boardPath).text();
+
+    const { code, stderr } = await captureStderr(() =>
+      pr(["OV-103-C1", "--board", boardPath, "--number", "not-a-number"]),
+    );
+
+    expect(code).toBe(2);
+    expect(stderr).toContain("--number must be a pull request number");
     expect(await Bun.file(boardPath).text()).toBe(before);
   });
 });

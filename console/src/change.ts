@@ -11,9 +11,10 @@
  *
  * Implemented subcommands:
  *   change start <change-id> [--board <path>] [--base <branch>]
+ *   change pr    <change-id> [--board <path>] [--base <branch>] [--number <n>]
  */
 
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 
 import {
   boardPathFor,
@@ -172,6 +173,21 @@ export async function repoRoot(cwd?: string): Promise<string> {
   return resolve(result.stdout.trim());
 }
 
+/**
+ * Root of the main checkout, even when called from inside a linked worktree.
+ *
+ * A change worktree has its own `--show-toplevel`, but branches, remotes and
+ * `gh` all belong to the one repository, so every git and `gh` call in `pr`
+ * runs here.
+ */
+export async function mainRepoRoot(cwd?: string): Promise<string> {
+  const result = await gitOrThrow(
+    ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    cwd,
+  );
+  return dirname(resolve(result.stdout.trim()));
+}
+
 // ---------------------------------------------------------------------------
 // naming
 // ---------------------------------------------------------------------------
@@ -301,6 +317,260 @@ export async function start(argv: string[]): Promise<number> {
 }
 
 // ---------------------------------------------------------------------------
+// pull request
+// ---------------------------------------------------------------------------
+
+/**
+ * GitHub reports the pull request state in upper case (`OPEN`, `MERGED`,
+ * `CLOSED`); the board stores it in lower case.
+ *
+ * Kept as a pure function so every command that reads a pull request maps the
+ * state the same way. An unknown value is lower-cased and passed through
+ * instead of being dropped, so a state GitHub adds later still reaches the
+ * board; a missing or empty value becomes null.
+ */
+export function normalizePrState(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  return trimmed.toLowerCase();
+}
+
+/** Pull request title: the change title with the change id appended. */
+export function prTitleFor(change: Change): string {
+  return `${change.title} (${change.id})`;
+}
+
+/** Pull request body: enough context to find the card and the change again. */
+export function prBodyFor(item: Item, change: Change): string {
+  return [
+    item.title,
+    "",
+    change.title,
+    "",
+    `Card: ${item.id}`,
+    `Change: ${change.id}`,
+    "",
+  ].join("\n");
+}
+
+/** The `gh pr view` fields the board needs. */
+export type PullRequestView = {
+  number: number;
+  url: string;
+  state: string;
+  headRefOid: string;
+};
+
+const PR_VIEW_FIELDS = "number,url,state,headRefOid";
+
+function parseJson<T>(text: string): T | null {
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    return null;
+  }
+}
+
+/** Show a failed command's own diagnostics instead of paraphrasing them. */
+function reportFailure(result: RunResult): void {
+  const message = result.stderr.trim() || result.stdout.trim();
+  if (message) process.stderr.write(`${message}\n`);
+}
+
+/**
+ * Make sure `origin/<branch>` exists and carries the local commits.
+ *
+ * This runs in the main repository rather than in the change worktree, so it
+ * works whichever checkout the command was started from. The branch is always
+ * named explicitly, so the current HEAD of that checkout is never pushed by
+ * accident.
+ */
+async function pushBranch(root: string, branch: string): Promise<number> {
+  const upstream = await git(
+    ["rev-parse", "--abbrev-ref", "--symbolic-full-name", `${branch}@{upstream}`],
+    root,
+  );
+  if (upstream.code !== 0) {
+    process.stdout.write(`push:             git push -u origin ${branch}\n`);
+    const pushed = await git(["push", "-u", "origin", branch], root);
+    if (pushed.code !== 0) {
+      reportFailure(pushed);
+      return 1;
+    }
+    return 0;
+  }
+
+  const ahead = await git(
+    ["rev-list", "--count", `${upstream.stdout.trim()}..${branch}`],
+    root,
+  );
+  if (ahead.code === 0 && Number.parseInt(ahead.stdout.trim(), 10) > 0) {
+    process.stdout.write(`push:             git push origin ${branch}\n`);
+    const pushed = await git(["push", "origin", branch], root);
+    if (pushed.code !== 0) {
+      reportFailure(pushed);
+      return 1;
+    }
+    return 0;
+  }
+
+  process.stdout.write(`push:             origin/${branch} is up to date\n`);
+  return 0;
+}
+
+/**
+ * Push the change branch, open its pull request and record it on the board.
+ *
+ * Idempotent: an open pull request for the branch is recorded instead of a
+ * second one being created. `--number <n>` skips creation entirely and records
+ * the pull request with that number, which is the way to record a pull request
+ * opened from the GitHub web UI on a machine where `gh` cannot create one.
+ *
+ * The board is written only after `gh pr view` succeeded, so a failing `gh`
+ * leaves `board.yaml` untouched and the command can simply be run again.
+ */
+export async function pr(argv: string[]): Promise<number> {
+  const { positional, options } = parseArgs(argv);
+  const changeId = positional[0];
+  if (!changeId) {
+    process.stderr.write("usage: change pr <change-id>\n");
+    return 2;
+  }
+
+  let number: number | null = null;
+  if (options.number !== undefined) {
+    number = Number.parseInt(options.number, 10);
+    if (!Number.isInteger(number) || number <= 0) {
+      process.stderr.write(
+        `--number must be a pull request number: ${options.number}\n`,
+      );
+      return 2;
+    }
+  }
+
+  const boardPath = resolveBoardPath(options.board);
+  const { board, exists } = await loadBoard(boardPath);
+  if (!exists) {
+    process.stderr.write(`board not found: ${boardPath}\n`);
+    return 1;
+  }
+  const found = findChange(board, changeId);
+  if (!found) {
+    process.stderr.write(
+      `unknown change id: ${changeId} (board: ${boardPath})\n`,
+    );
+    return 1;
+  }
+
+  const branch = found.change.branch;
+  if (!branch) {
+    process.stderr.write(
+      `change ${changeId} has no branch on the board; ` +
+        `run "change start ${changeId}" first\n`,
+    );
+    return 1;
+  }
+
+  const root = await mainRepoRoot();
+  const base =
+    options.base ??
+    (await gitOrThrow(["rev-parse", "--abbrev-ref", "HEAD"], root)).stdout.trim();
+
+  process.stdout.write(`base branch:      ${base}\n`);
+  process.stdout.write(`head branch:      ${branch}\n`);
+
+  // What `gh pr view` is asked about: a number when one is already known, the
+  // branch when the pull request was just created.
+  let ref = String(number);
+
+  if (number === null) {
+    const pushed = await pushBranch(root, branch);
+    if (pushed !== 0) return pushed;
+
+    const listed = await gh(
+      ["pr", "list", "--head", branch, "--json", "number"],
+      root,
+    );
+    if (listed.code !== 0) {
+      reportFailure(listed);
+      return 1;
+    }
+    const open = parseJson<{ number: number }[]>(listed.stdout.trim() || "[]");
+    if (!open) {
+      process.stderr.write(`could not read: gh pr list --head ${branch}\n`);
+      return 1;
+    }
+
+    if (open.length > 0) {
+      const existing = open[0]!.number;
+      process.stdout.write(
+        `pull request:     #${existing} is already open, not creating another\n`,
+      );
+      ref = String(existing);
+    } else {
+      process.stdout.write("pull request:     creating a new one\n");
+      const created = await gh(
+        [
+          "pr",
+          "create",
+          "--base",
+          base,
+          "--head",
+          branch,
+          "--title",
+          prTitleFor(found.change),
+          "--body",
+          prBodyFor(found.item, found.change),
+        ],
+        root,
+      );
+      if (created.code !== 0) {
+        reportFailure(created);
+        return 1;
+      }
+      ref = branch;
+    }
+  } else {
+    process.stdout.write(
+      `pull request:     recording existing #${number}, not creating one\n`,
+    );
+  }
+
+  const viewed = await gh(["pr", "view", ref, "--json", PR_VIEW_FIELDS], root);
+  if (viewed.code !== 0) {
+    reportFailure(viewed);
+    return 1;
+  }
+  const view = parseJson<PullRequestView>(viewed.stdout);
+  if (!view || typeof view.number !== "number") {
+    process.stderr.write(`could not read: gh pr view ${ref}\n`);
+    return 1;
+  }
+
+  const state = normalizePrState(view.state);
+  await updateChange(boardPath, changeId, (change) => {
+    // `reviewed_sha` belongs to the review commands, not to this one: it stays
+    // null on a first record and keeps its value when `pr` is run again.
+    const previous = change.pr ?? {};
+    change.pr = {
+      number: view.number,
+      url: view.url ?? null,
+      state,
+      head_sha: view.headRefOid ?? null,
+      reviewed_sha: previous.reviewed_sha ?? null,
+    };
+    change.state = "reviewing";
+  });
+
+  process.stdout.write(`pull request:     #${view.number} (${state})\n`);
+  process.stdout.write(`board updated:    ${boardPath}\n`);
+
+  process.stdout.write(`${view.url}\n`);
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
 
@@ -309,16 +579,22 @@ const USAGE = `usage: change <command> [options]
 commands:
   start <change-id>   create the worktree and branch for a change and record
                       them on the board
+  pr <change-id>      push the change branch, open its pull request and record
+                      it on the board
 
 options:
   --board <path>      board.yaml, or a project directory containing one
                       (default: $OVERLORD_BOARD, else the current directory)
-  --base <branch>     branch to start from (default: the current branch)
+  --base <branch>     branch to start from, and to merge the pull request into
+                      (default: the current branch of the main checkout)
+  --number <n>        pr only: record the pull request with this number instead
+                      of creating one, for a pull request opened by hand
 `;
 
 export async function main(argv: string[]): Promise<number> {
   const command = argv[0];
   if (command === "start") return start(argv.slice(1));
+  if (command === "pr") return pr(argv.slice(1));
   if (command === undefined || command === "--help" || command === "-h") {
     process.stdout.write(USAGE);
     return command === undefined ? 2 : 0;

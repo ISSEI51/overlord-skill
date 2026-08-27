@@ -51,17 +51,28 @@ A cmux workspace does not start its terminal process until the workspace is sele
 
 ## Dispatching a worker session
 
-For an `implementing` card, the commander starts one workspace per card and records it, so the console can show who owns the card:
+Work is dispatched per change, not per card: one change is one worktree, one branch, one pull request and one worker session. The commander does not create the worktree or the branch by hand — `scripts/change.sh` owns them and records them on the board.
 
 ```bash
-cmux new-workspace --name "RC-UX-001 ログイン後の復帰" \
-  --cwd /Users/example/worktrees/RC-UX-001 --command claude
+scripts/change.sh start <change-id>     # worktree と overlord/<change-id> ブランチを作り board に記録
+cmux new-workspace --cwd <出力された worktree パス> --command claude
+# 実装・検証・独立レビューの後
+scripts/change.sh pr <change-id>        # push して PR を作り change.pr を記録
+```
+
+`start` prints the worktree path on its last line and writes `changes[].branch` plus `changes[].state: implementing`. `pr` pushes the branch, opens the pull request — or reuses the one already open for that branch — and writes `changes[].pr` (`number`, `url`, `state`, `head_sha`) plus `changes[].state: reviewing`. `pr --number <n>` records a pull request that was opened from the GitHub web UI instead of creating one. Both commands leave `board.yaml` untouched when the git or `gh` step fails, so they can be run again.
+
+Do not use the `Agent` tool's `isolation: "worktree"` for a change: it names its own branch, which would not be the `overlord/<change-id>` branch recorded on the board.
+
+The instruction is then sent to the new session:
+
+```bash
 cmux tree --all --json --id-format both     # find the new workspace and surface
 cmux rpc surface.send_text '{"surface_id":"<uuid>","text":"<instruction>"}'
 cmux send-key --surface <uuid> -- enter
 ```
 
-Then write the worker session into the card:
+Finally the session is written into the card, with `cwd` set to the worktree `start` printed:
 
 ```yaml
     agent:
