@@ -427,13 +427,13 @@ export default function App() {
         <Toaster position="bottom-center" />
         <SidebarInset className="min-w-0">
           <TopBar />
-          {/* Card detail overlays the board area only, never the dock. */}
           <div className="relative flex min-h-0 flex-1 flex-col">
             <BoardView />
-            <DetailPanel />
           </div>
         </SidebarInset>
         <CommanderSidebar />
+        {/* Card detail is a centered modal dialog (portaled to the body). */}
+        <DetailPanel />
         <CardDialog
           open={dialogOpen}
           onOpenChange={(open) => {
