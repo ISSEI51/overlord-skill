@@ -1,11 +1,13 @@
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, mock, test } from "bun:test";
 import { chmodSync, readFileSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
-import { loadBoard, saveBoard, type Board } from "./board.ts";
+import * as boardModule from "./board.ts";
+import { loadBoard, saveBoard, type Board, type Change } from "./board.ts";
 import {
+  applyPullRequestView,
   branchNameFor,
   ChangeNotFoundError,
   changeStateForPr,
@@ -18,25 +20,69 @@ import {
   prBodyFor,
   prTitleFor,
   resolveBoardPath,
+  sync,
+  syncLine,
+  syncTargets,
   updateChange,
+  updateChanges,
   worktreePathFor,
+  type PullRequestView,
 } from "./change.ts";
+
+/**
+ * Count board writes.
+ *
+ * `sync` must write `board.yaml` once per run, whatever number of pull
+ * requests it read, because every write makes the console re-render. The real
+ * `saveBoard` is kept and only wrapped, so every other test keeps its exact
+ * behaviour and only the counter is added.
+ */
+const realSaveBoard = boardModule.saveBoard;
+let saveCount = 0;
+mock.module("./board.ts", () => ({
+  ...boardModule,
+  saveBoard: (path: string, board: Board) => {
+    saveCount += 1;
+    return realSaveBoard(path, board);
+  },
+}));
+
+/** Board writes performed while `body` ran. */
+async function countSaves(body: () => Promise<unknown>): Promise<number> {
+  const before = saveCount;
+  await body();
+  return saveCount - before;
+}
+
+/** Run something with both streams captured, so a command stays quiet. */
+async function capture(
+  body: () => Promise<number>,
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  const streams = [process.stdout, process.stderr] as const;
+  const originals = streams.map((stream) => stream.write.bind(stream));
+  const captured = ["", ""];
+  streams.forEach((stream, index) => {
+    stream.write = ((chunk: string) => {
+      captured[index] += chunk;
+      return true;
+    }) as typeof stream.write;
+  });
+  try {
+    const code = await body();
+    return { code, stdout: captured[0]!, stderr: captured[1]! };
+  } finally {
+    streams.forEach((stream, index) => {
+      stream.write = originals[index]!;
+    });
+  }
+}
 
 /** Run something with stderr captured, so a failing command stays quiet. */
 async function captureStderr(
   body: () => Promise<number>,
 ): Promise<{ code: number; stderr: string }> {
-  const original = process.stderr.write.bind(process.stderr);
-  let stderr = "";
-  process.stderr.write = ((chunk: string) => {
-    stderr += chunk;
-    return true;
-  }) as typeof process.stderr.write;
-  try {
-    return { code: await body(), stderr };
-  } finally {
-    process.stderr.write = original;
-  }
+  const { code, stderr } = await capture(body);
+  return { code, stderr };
 }
 
 /**
@@ -608,5 +654,583 @@ describe("pr", () => {
     const change = findChange(after.board, "OV-103-C1")!.change;
     expect(change.pr!.state).toBe("closed");
     expect(change.state).toBe("implementing");
+  });
+});
+
+describe("updateChanges", () => {
+  test("writes every named change in a single board write", async () => {
+    const boardPath = await writeSampleBoard();
+    const before = await loadBoard(boardPath);
+
+    const saves = await countSaves(() =>
+      updateChanges(boardPath, ["OV-100-C1", "OV-103-C2"], (change) => {
+        change.state = "done";
+      }),
+    );
+
+    expect(saves).toBe(1);
+    const after = await loadBoard(boardPath);
+    expect(findChange(after.board, "OV-100-C1")!.change.state).toBe("done");
+    expect(findChange(after.board, "OV-103-C2")!.change.state).toBe("done");
+
+    // Changes and cards that were not named keep their previous content.
+    expect(findChange(after.board, "OV-103-C1")!.change).toEqual(
+      findChange(before.board, "OV-103-C1")!.change,
+    );
+    expect(after.board.items[1]!.next_action).toBe("start the first change");
+    expect(after.board.items[1]!.updated_at).toBe("2026-08-02T00:00:00Z");
+    expect(after.board.items[2]).toEqual(before.board.items[2]!);
+    expect(after.board.items.length).toBe(before.board.items.length);
+  });
+
+  test("writes nothing at all for an empty id list", async () => {
+    const boardPath = await writeSampleBoard();
+    const before = await Bun.file(boardPath).text();
+
+    const saves = await countSaves(() =>
+      updateChanges(boardPath, [], () => {
+        throw new Error("must not be called");
+      }),
+    );
+
+    expect(saves).toBe(0);
+    expect(await Bun.file(boardPath).text()).toBe(before);
+  });
+
+  test("re-reads and re-applies when the board changed after loading", async () => {
+    const boardPath = await writeSampleBoard();
+    let mutations = 0;
+
+    const saves = await countSaves(() =>
+      updateChanges(boardPath, ["OV-103-C1", "OV-103-C2"], (change) => {
+        mutations += 1;
+        // On the first pass, simulate a console write landing between the load
+        // and the save, so the revision differs and the helper must re-read.
+        if (mutations === 1) {
+          const text = readFileSync(boardPath, "utf8").replace(
+            '"start the first change"',
+            '"written by the console while the CLI was running"',
+          );
+          writeFileSync(boardPath, text, "utf8");
+        }
+        change.state = "done";
+      }),
+    );
+
+    // Two changes, applied once per change on each of the two passes.
+    expect(mutations).toBe(4);
+    expect(saves).toBe(1);
+    const after = await loadBoard(boardPath);
+    expect(findChange(after.board, "OV-103-C1")!.change.state).toBe("done");
+    expect(findChange(after.board, "OV-103-C2")!.change.state).toBe("done");
+    expect(after.board.items[1]!.next_action).toBe(
+      "written by the console while the CLI was running",
+    );
+  });
+
+  test("throws for an unknown change id and leaves the board byte-identical", async () => {
+    const boardPath = await writeSampleBoard();
+    const before = await Bun.file(boardPath).text();
+
+    let thrown: unknown = null;
+    const saves = await countSaves(async () => {
+      try {
+        await updateChanges(boardPath, ["OV-103-C1", "OV-999-C1"], (change) => {
+          change.state = "done";
+        });
+      } catch (error) {
+        thrown = error;
+      }
+    });
+
+    expect(thrown).toBeInstanceOf(ChangeNotFoundError);
+    expect(saves).toBe(0);
+    expect(await Bun.file(boardPath).text()).toBe(before);
+  });
+});
+
+function viewOf(overrides: Partial<PullRequestView> = {}): PullRequestView {
+  return {
+    number: 11,
+    url: "https://github.com/o/r/pull/11",
+    state: "OPEN",
+    headRefOid: "a".repeat(40),
+    ...overrides,
+  };
+}
+
+function changeWithPr(overrides: Partial<Change> = {}): Change {
+  return {
+    id: "OV-200-C1",
+    title: "A change with a pull request",
+    state: "reviewing",
+    branch: "overlord/OV-200-C1",
+    pr: {
+      number: 11,
+      url: "https://github.com/o/r/pull/11",
+      state: "open",
+      head_sha: "a".repeat(40),
+      reviewed_sha: null,
+    },
+    ...overrides,
+  };
+}
+
+describe("applyPullRequestView", () => {
+  test("a merged pull request also moves the change to done", () => {
+    const change = changeWithPr();
+    const outcome = applyPullRequestView(change, viewOf({ state: "MERGED" }));
+
+    expect(change.pr!.state).toBe("merged");
+    expect(change.state).toBe("done");
+    expect(outcome).toEqual({
+      changed: true,
+      previousState: "open",
+      state: "merged",
+      changeDone: true,
+    });
+  });
+
+  test("a closed pull request leaves the change state to the commander", () => {
+    const change = changeWithPr();
+    const outcome = applyPullRequestView(change, viewOf({ state: "CLOSED" }));
+
+    expect(change.pr!.state).toBe("closed");
+    expect(change.state).toBe("reviewing");
+    expect(outcome.changed).toBe(true);
+    expect(outcome.changeDone).toBe(false);
+  });
+
+  test("records the url and the head commit, and keeps reviewed_sha", () => {
+    const change = changeWithPr({
+      pr: {
+        number: 11,
+        url: null,
+        state: "open",
+        head_sha: "a".repeat(40),
+        reviewed_sha: "0".repeat(40),
+      },
+    });
+    const outcome = applyPullRequestView(
+      change,
+      viewOf({ headRefOid: "b".repeat(40) }),
+    );
+
+    expect(change.pr).toEqual({
+      number: 11,
+      url: "https://github.com/o/r/pull/11",
+      state: "open",
+      head_sha: "b".repeat(40),
+      reviewed_sha: "0".repeat(40),
+    });
+    // A new head commit on an open pull request is a change worth writing.
+    expect(outcome.changed).toBe(true);
+    expect(outcome.changeDone).toBe(false);
+  });
+
+  test("reports no change when the pull request did not move", () => {
+    const change = changeWithPr();
+    const outcome = applyPullRequestView(change, viewOf());
+
+    expect(outcome.changed).toBe(false);
+    expect(change.state).toBe("reviewing");
+  });
+
+  test("is idempotent, so it can be re-applied after a board reload", () => {
+    const change = changeWithPr();
+    applyPullRequestView(change, viewOf({ state: "MERGED" }));
+    const again = applyPullRequestView(change, viewOf({ state: "MERGED" }));
+
+    expect(change.state).toBe("done");
+    expect(again.changed).toBe(false);
+    expect(again.changeDone).toBe(false);
+  });
+
+  test("the reported line names the transition", () => {
+    expect(
+      syncLine("OV-103-C2", {
+        changed: true,
+        previousState: "open",
+        state: "merged",
+        changeDone: true,
+      }),
+    ).toBe("OV-103-C2  open -> merged  (change done)");
+    expect(
+      syncLine("OV-103-C2", {
+        changed: true,
+        previousState: null,
+        state: "open",
+        changeDone: false,
+      }),
+    ).toBe("OV-103-C2  unknown -> open");
+  });
+});
+
+describe("syncTargets", () => {
+  test("takes only the changes that already carry a pull request number", () => {
+    const targets = syncTargets([
+      {
+        id: "OV-200",
+        title: "A card",
+        state: "implementing",
+        changes: [
+          changeWithPr(),
+          // Never pushed: nothing to ask GitHub about.
+          {
+            id: "OV-200-C2",
+            title: "Not started",
+            state: "specified",
+            pr: null,
+          },
+          // Recorded but incomplete: still nothing to ask about.
+          {
+            id: "OV-200-C3",
+            title: "No number",
+            state: "implementing",
+            pr: { url: null, state: null },
+          },
+        ],
+      },
+      { id: "OV-201", title: "No changes at all", state: "inbox" },
+      {
+        id: "OV-202",
+        title: "Another card",
+        state: "reviewing",
+        changes: [changeWithPr({ id: "OV-202-C1" })],
+      },
+    ]);
+
+    expect(targets.map((target) => target.change.id)).toEqual([
+      "OV-200-C1",
+      "OV-202-C1",
+    ]);
+    expect(targets.map((target) => target.item.id)).toEqual([
+      "OV-200",
+      "OV-202",
+    ]);
+    expect(targets[0]!.index).toBe(0);
+  });
+
+  test("takes nothing from a board where no change was pushed", () => {
+    expect(syncTargets(sampleBoard().items)).toEqual([]);
+  });
+});
+
+/**
+ * A board with pull requests already recorded, so `sync` has something to
+ * read: two changes under OV-200 plus one that was never pushed, and one
+ * change under OV-201 that only `--all` reaches.
+ */
+function syncSampleBoard(): Board {
+  return {
+    version: 1,
+    updated_at: "2026-08-01T00:00:00Z",
+    items: [
+      {
+        id: "OV-200",
+        title: "Card with pull requests",
+        state: "implementing",
+        next_action: "review the open changes",
+        changes: [
+          changeWithPr({ id: "OV-200-C1" }),
+          changeWithPr({
+            id: "OV-200-C2",
+            branch: "overlord/OV-200-C2",
+            pr: {
+              number: 12,
+              url: "https://github.com/o/r/pull/12",
+              state: "open",
+              head_sha: "b".repeat(40),
+              reviewed_sha: null,
+            },
+          }),
+          {
+            id: "OV-200-C3",
+            title: "Never pushed",
+            state: "implementing",
+            branch: "overlord/OV-200-C3",
+            pr: null,
+          },
+        ],
+      },
+      {
+        id: "OV-201",
+        title: "Another card",
+        state: "implementing",
+        changes: [
+          changeWithPr({
+            id: "OV-201-C1",
+            branch: "overlord/OV-201-C1",
+            pr: {
+              number: 21,
+              url: "https://github.com/o/r/pull/21",
+              state: "open",
+              head_sha: "c".repeat(40),
+              reviewed_sha: null,
+            },
+          }),
+        ],
+      },
+    ],
+  };
+}
+
+async function writeSyncBoard(): Promise<string> {
+  const boardPath = join(await scratch(), "board.yaml");
+  await saveBoard(boardPath, syncSampleBoard());
+  return boardPath;
+}
+
+/**
+ * A `gh` on PATH that answers from canned files and records its argument
+ * vector, so the command under test is exercised end to end without talking
+ * to GitHub. A pull request number with no canned answer fails, which is how
+ * the failure path is driven.
+ */
+async function ghStub(
+  answers: Record<number, Partial<PullRequestView>>,
+): Promise<{ directory: string; log: string }> {
+  const directory = await scratch();
+  const log = join(directory, "gh.log");
+  // Argument vector: gh pr view <number> --json <fields>
+  const script = [
+    "#!/bin/sh",
+    'printf "%s\\n" "$*" >> "$GH_STUB_LOG"',
+    'if [ -f "$GH_STUB_DIR/$3.json" ]; then',
+    '  cat "$GH_STUB_DIR/$3.json"',
+    "  exit 0",
+    "fi",
+    'echo "no pull requests found for $3" >&2',
+    "exit 1",
+  ].join("\n");
+  const executable = join(directory, "gh");
+  await Bun.write(executable, `${script}\n`);
+  chmodSync(executable, 0o755);
+  for (const [number, answer] of Object.entries(answers)) {
+    await Bun.write(
+      join(directory, `${number}.json`),
+      JSON.stringify(viewOf({ number: Number(number), ...answer })),
+    );
+  }
+  return { directory, log };
+}
+
+/** Run `sync` with the stubbed `gh` first on PATH. */
+async function runSync(
+  argv: string[],
+  stub: { directory: string; log: string },
+): Promise<{
+  code: number;
+  stdout: string;
+  stderr: string;
+  saves: number;
+  gh: string[];
+}> {
+  const previous = {
+    path: process.env.PATH,
+    dir: process.env.GH_STUB_DIR,
+    log: process.env.GH_STUB_LOG,
+  };
+  process.env.PATH = `${stub.directory}:${previous.path ?? ""}`;
+  process.env.GH_STUB_DIR = stub.directory;
+  process.env.GH_STUB_LOG = stub.log;
+  try {
+    const before = saveCount;
+    const result = await capture(() => sync(argv));
+    const logged = await Bun.file(stub.log).exists();
+    return {
+      ...result,
+      saves: saveCount - before,
+      gh: logged
+        ? (await Bun.file(stub.log).text()).split("\n").filter(Boolean)
+        : [],
+    };
+  } finally {
+    process.env.PATH = previous.path ?? "";
+    if (previous.dir === undefined) delete process.env.GH_STUB_DIR;
+    else process.env.GH_STUB_DIR = previous.dir;
+    if (previous.log === undefined) delete process.env.GH_STUB_LOG;
+    else process.env.GH_STUB_LOG = previous.log;
+  }
+}
+
+describe("sync arguments", () => {
+  test("--all is a flag and does not swallow the next argument", () => {
+    expect(parseArgs(["--all", "--board", "/tmp/b.yaml"], ["all"])).toEqual({
+      positional: [],
+      options: { all: "true", board: "/tmp/b.yaml" },
+    });
+    expect(parseArgs(["OV-200", "--all"], ["all"])).toEqual({
+      positional: ["OV-200"],
+      options: { all: "true" },
+    });
+  });
+
+  test("without a card id and without --all it prints the usage and exits 2", async () => {
+    const boardPath = await writeSyncBoard();
+    const before = await Bun.file(boardPath).text();
+
+    const { code, stderr } = await captureStderr(() =>
+      sync(["--board", boardPath]),
+    );
+
+    expect(code).toBe(2);
+    expect(stderr).toContain("usage: change sync");
+    expect(await Bun.file(boardPath).text()).toBe(before);
+  });
+
+  test("a card id together with --all is refused", async () => {
+    const boardPath = await writeSyncBoard();
+    const before = await Bun.file(boardPath).text();
+
+    const { code, stderr } = await captureStderr(() =>
+      sync(["OV-200", "--all", "--board", boardPath]),
+    );
+
+    expect(code).toBe(2);
+    expect(stderr).toContain("not both");
+    expect(await Bun.file(boardPath).text()).toBe(before);
+  });
+
+  test("an unknown card id fails without writing the board", async () => {
+    const boardPath = await writeSyncBoard();
+    const before = await Bun.file(boardPath).text();
+
+    const { code, stderr } = await captureStderr(() =>
+      sync(["OV-999", "--board", boardPath]),
+    );
+
+    expect(code).toBe(1);
+    expect(stderr).toContain("unknown card id: OV-999");
+    expect(await Bun.file(boardPath).text()).toBe(before);
+  });
+});
+
+describe("sync", () => {
+  test("reads every recorded pull request of one card and writes the board once", async () => {
+    const boardPath = await writeSyncBoard();
+    const stub = await ghStub({
+      11: { state: "MERGED", headRefOid: "d".repeat(40) },
+      12: { state: "CLOSED" },
+    });
+
+    const result = await runSync(["OV-200", "--board", boardPath], stub);
+
+    expect(result.code).toBe(0);
+    // One `gh pr view` per change that has a number; OV-200-C3 has no pull
+    // request and OV-201-C1 belongs to another card, so neither is asked for.
+    expect(result.gh).toEqual([
+      "pr view 11 --json number,url,state,headRefOid",
+      "pr view 12 --json number,url,state,headRefOid",
+    ]);
+    expect(result.saves).toBe(1);
+    expect(result.stdout).toContain("OV-200-C1  open -> merged  (change done)");
+    expect(result.stdout).toContain("OV-200-C2  open -> closed");
+    expect(result.stdout).not.toContain("OV-200-C3");
+
+    const after = await loadBoard(boardPath);
+    const merged = findChange(after.board, "OV-200-C1")!.change;
+    expect(merged.pr!.state).toBe("merged");
+    expect(merged.pr!.head_sha).toBe("d".repeat(40));
+    expect(merged.state).toBe("done");
+
+    // A closed pull request is recorded, but the change state is left to the
+    // commander.
+    const closed = findChange(after.board, "OV-200-C2")!.change;
+    expect(closed.pr!.state).toBe("closed");
+    expect(closed.state).toBe("reviewing");
+
+    // Nothing outside the two synchronized changes moved.
+    const before = syncSampleBoard();
+    expect(findChange(after.board, "OV-200-C3")!.change).toEqual(
+      findChange(before, "OV-200-C3")!.change,
+    );
+    expect(findChange(after.board, "OV-201-C1")!.change).toEqual(
+      findChange(before, "OV-201-C1")!.change,
+    );
+    expect(after.board.items[0]!.next_action).toBe("review the open changes");
+  });
+
+  test("--all reaches every card, still in a single board write", async () => {
+    const boardPath = await writeSyncBoard();
+    const stub = await ghStub({
+      11: { state: "MERGED", headRefOid: "d".repeat(40) },
+      12: { state: "CLOSED" },
+      // Unchanged: same state, url and head commit as the board already has.
+      21: {
+        url: "https://github.com/o/r/pull/21",
+        headRefOid: "c".repeat(40),
+      },
+    });
+
+    const result = await runSync(["--all", "--board", boardPath], stub);
+
+    expect(result.code).toBe(0);
+    expect(result.gh.length).toBe(3);
+    expect(result.gh[2]).toBe("pr view 21 --json number,url,state,headRefOid");
+    expect(result.saves).toBe(1);
+    // The unchanged pull request is not reported.
+    expect(result.stdout).not.toContain("OV-201-C1");
+
+    const after = await loadBoard(boardPath);
+    expect(findChange(after.board, "OV-200-C1")!.change.state).toBe("done");
+    expect(findChange(after.board, "OV-201-C1")!.change).toEqual(
+      findChange(syncSampleBoard(), "OV-201-C1")!.change,
+    );
+  });
+
+  test("writes nothing when no pull request moved", async () => {
+    const boardPath = await writeSyncBoard();
+    const stub = await ghStub({
+      21: {
+        url: "https://github.com/o/r/pull/21",
+        headRefOid: "c".repeat(40),
+      },
+    });
+    const before = await Bun.file(boardPath).text();
+
+    const result = await runSync(["OV-201", "--board", boardPath], stub);
+
+    expect(result.code).toBe(0);
+    expect(result.saves).toBe(0);
+    expect(result.stdout).toContain("already current");
+    expect(await Bun.file(boardPath).text()).toBe(before);
+  });
+
+  test("a card whose changes were never pushed reads nothing", async () => {
+    const boardPath = await writeSampleBoard();
+    const stub = await ghStub({});
+    const before = await Bun.file(boardPath).text();
+
+    const result = await runSync(["OV-103", "--board", boardPath], stub);
+
+    expect(result.code).toBe(0);
+    expect(result.gh).toEqual([]);
+    expect(result.saves).toBe(0);
+    expect(result.stdout).toContain("no change has a pull request to read");
+    expect(await Bun.file(boardPath).text()).toBe(before);
+  });
+
+  test("one failing pull request is skipped, the rest are still written", async () => {
+    const boardPath = await writeSyncBoard();
+    // No canned answer for 12, so the stub fails for that change only.
+    const stub = await ghStub({
+      11: { state: "MERGED", headRefOid: "d".repeat(40) },
+    });
+
+    const result = await runSync(["OV-200", "--board", boardPath], stub);
+
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain("OV-200-C2: gh pr view 12 failed");
+    expect(result.stderr).toContain("no pull requests found for 12");
+    // The successful change is still recorded, in the one write of the run.
+    expect(result.saves).toBe(1);
+    expect(result.stdout).toContain("OV-200-C1  open -> merged");
+
+    const after = await loadBoard(boardPath);
+    expect(findChange(after.board, "OV-200-C1")!.change.state).toBe("done");
+    expect(findChange(after.board, "OV-200-C2")!.change).toEqual(
+      findChange(syncSampleBoard(), "OV-200-C2")!.change,
+    );
   });
 });
