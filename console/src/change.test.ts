@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, readFileSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -8,9 +8,11 @@ import { loadBoard, saveBoard, type Board } from "./board.ts";
 import {
   branchNameFor,
   ChangeNotFoundError,
+  changeStateForPr,
   findChange,
   normalizePrState,
   parseArgs,
+  parsePrNumber,
   parseWorktreePaths,
   pr,
   prBodyFor,
@@ -35,6 +37,59 @@ async function captureStderr(
   } finally {
     process.stderr.write = original;
   }
+}
+
+/**
+ * Run the `change` CLI as a subprocess with a fake `gh` in front of PATH.
+ *
+ * The command shells out to `gh`, and Bun resolves executables from the PATH
+ * its process started with, so PATH cannot be redirected from inside the test
+ * process. Running the CLI as a child process is what makes the stub take
+ * effect, and it also guarantees the tests never reach GitHub: the stub
+ * answers `gh pr view` from a fixed JSON document and fails every other `gh`
+ * subcommand, so a test that tried to push or to create a pull request would
+ * fail instead of doing it. The git calls the CLI makes are read-only
+ * (`rev-parse`) and run against the real repository.
+ */
+async function runChangeCli(
+  args: string[],
+  ghView: Record<string, unknown>,
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  const dir = await scratch();
+  const script = join(dir, "gh");
+  writeFileSync(
+    script,
+    [
+      "#!/bin/sh",
+      'if [ "$1" = "pr" ] && [ "$2" = "view" ]; then',
+      "  cat <<'JSON'",
+      JSON.stringify(ghView),
+      "JSON",
+      "  exit 0",
+      "fi",
+      'echo "stub gh: unexpected call: $*" >&2',
+      "exit 1",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+  chmodSync(script, 0o755);
+
+  const proc = Bun.spawn(
+    ["bun", join(import.meta.dir, "change.ts"), ...args],
+    {
+      cwd: import.meta.dir,
+      env: { ...process.env, PATH: `${dir}:${process.env.PATH ?? ""}` },
+      stdout: "pipe",
+      stderr: "pipe",
+      stdin: "ignore",
+    },
+  );
+  const [stdout, stderr] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+  ]);
+  return { code: await proc.exited, stdout, stderr };
 }
 
 const temporaries: string[] = [];
@@ -86,6 +141,27 @@ function sampleBoard(): Board {
 async function writeSampleBoard(): Promise<string> {
   const boardPath = join(await scratch(), "board.yaml");
   await saveBoard(boardPath, sampleBoard());
+  return boardPath;
+}
+
+/**
+ * A board where OV-103-C1 has been started and already carries the correct
+ * pull request record, which is what a mistyped `--number` would overwrite.
+ */
+async function writeStartedBoard(): Promise<string> {
+  const board = sampleBoard();
+  const change = findChange(board, "OV-103-C1")!.change;
+  change.state = "reviewing";
+  change.branch = "overlord/OV-103-C1";
+  change.pr = {
+    number: 3,
+    url: "https://github.com/example/repo/pull/3",
+    state: "open",
+    head_sha: "1111111111111111111111111111111111111111",
+    reviewed_sha: null,
+  };
+  const boardPath = join(await scratch(), "board.yaml");
+  await saveBoard(boardPath, board);
   return boardPath;
 }
 
@@ -311,6 +387,51 @@ describe("normalizePrState", () => {
   });
 });
 
+describe("parsePrNumber", () => {
+  test("accepts a decimal pull request number", () => {
+    expect(parsePrNumber("3")).toBe(3);
+    expect(parsePrNumber("12")).toBe(12);
+    expect(parsePrNumber("007")).toBe(7);
+  });
+
+  test("rejects values Number.parseInt would silently truncate", () => {
+    // Every one of these used to parse: 1abc -> 1, 3.9 -> 3, 1e3 -> 1.
+    expect(parsePrNumber("1abc")).toBeNull();
+    expect(parsePrNumber("3.9")).toBeNull();
+    expect(parsePrNumber("1e3")).toBeNull();
+    expect(parsePrNumber("12 ")).toBeNull();
+    expect(parsePrNumber(" 12")).toBeNull();
+    expect(parsePrNumber("+12")).toBeNull();
+    expect(parsePrNumber("0x10")).toBeNull();
+  });
+
+  test("rejects values that are not a positive number", () => {
+    expect(parsePrNumber("")).toBeNull();
+    expect(parsePrNumber("0")).toBeNull();
+    expect(parsePrNumber("-1")).toBeNull();
+    expect(parsePrNumber("not-a-number")).toBeNull();
+    expect(parsePrNumber("99999999999999999999")).toBeNull();
+  });
+});
+
+describe("changeStateForPr", () => {
+  test("an open pull request puts the change in review", () => {
+    expect(changeStateForPr("open", "implementing")).toBe("reviewing");
+    expect(changeStateForPr("draft", "implementing")).toBe("reviewing");
+    expect(changeStateForPr(null, "implementing")).toBe("reviewing");
+  });
+
+  test("a merged pull request marks the change done", () => {
+    expect(changeStateForPr("merged", "implementing")).toBe("done");
+    expect(changeStateForPr("merged", "reviewing")).toBe("done");
+  });
+
+  test("a closed pull request leaves the change state alone", () => {
+    expect(changeStateForPr("closed", "implementing")).toBe("implementing");
+    expect(changeStateForPr("closed", "blocked")).toBe("blocked");
+  });
+});
+
 describe("pull request text", () => {
   test("the title is the change title with its id appended", () => {
     const change = findChange(sampleBoard(), "OV-103-C2")!.change;
@@ -344,15 +465,148 @@ describe("pr", () => {
   });
 
   test("rejects a --number that is not a pull request number", async () => {
-    const boardPath = await writeSampleBoard();
+    const boardPath = await writeStartedBoard();
     const before = await Bun.file(boardPath).text();
 
-    const { code, stderr } = await captureStderr(() =>
-      pr(["OV-103-C1", "--board", boardPath, "--number", "not-a-number"]),
+    for (const value of ["not-a-number", "1abc", "3.9", "1e3", "0", "-1"]) {
+      const { code, stderr } = await captureStderr(() =>
+        pr(["OV-103-C1", "--board", boardPath, "--number", value]),
+      );
+
+      expect(code).toBe(2);
+      expect(stderr).toContain(`--number must be a pull request number: ${value}`);
+      // The correct record that was already on the board survives.
+      expect(await Bun.file(boardPath).text()).toBe(before);
+    }
+  });
+
+  test("refuses a pull request whose head branch is not the change branch", async () => {
+    const boardPath = await writeStartedBoard();
+    const before = await Bun.file(boardPath).text();
+
+    // The number of an unrelated, already merged pull request: what a typo in
+    // `--number` produces. It used to be recorded over the correct one.
+    const { code, stderr } = await runChangeCli(
+      ["pr", "OV-103-C1", "--board", boardPath, "--base", "main", "--number", "1"],
+      {
+        number: 1,
+        url: "https://github.com/example/repo/pull/1",
+        state: "MERGED",
+        headRefOid: "2222222222222222222222222222222222222222",
+        headRefName: "some/other-branch",
+      },
     );
 
-    expect(code).toBe(2);
-    expect(stderr).toContain("--number must be a pull request number");
+    expect(code).not.toBe(0);
+    expect(stderr).toContain("pull request #1 is on branch");
+    expect(stderr).toContain("some/other-branch");
+    expect(stderr).toContain("overlord/OV-103-C1");
+    // Nothing is written, so the pull request already recorded is intact.
     expect(await Bun.file(boardPath).text()).toBe(before);
+  });
+
+  test("records a matching pull request and marks a merged one done", async () => {
+    const boardPath = await writeStartedBoard();
+
+    const { code, stderr } = await runChangeCli(
+      [
+        "pr",
+        "OV-103-C1",
+        "--board",
+        boardPath,
+        "--base",
+        "main",
+        "--number",
+        "12",
+      ],
+      {
+        number: 12,
+        url: "https://github.com/example/repo/pull/12",
+        state: "MERGED",
+        headRefOid: "3333333333333333333333333333333333333333",
+        headRefName: "overlord/OV-103-C1",
+      },
+    );
+
+    expect(stderr).toBe("");
+    expect(code).toBe(0);
+    const after = await loadBoard(boardPath);
+    const change = findChange(after.board, "OV-103-C1")!.change;
+    expect(change.pr).toEqual({
+      number: 12,
+      url: "https://github.com/example/repo/pull/12",
+      state: "merged",
+      head_sha: "3333333333333333333333333333333333333333",
+      reviewed_sha: null,
+    });
+    // A merged pull request means the change is delivered, not under review.
+    expect(change.state).toBe("done");
+  });
+
+  test("records an open pull request and puts the change in review", async () => {
+    const boardPath = await writeStartedBoard();
+    await updateChange(boardPath, "OV-103-C1", (change) => {
+      change.state = "implementing";
+    });
+
+    const { code } = await runChangeCli(
+      [
+        "pr",
+        "OV-103-C1",
+        "--board",
+        boardPath,
+        "--base",
+        "main",
+        "--number",
+        "12",
+      ],
+      {
+        number: 12,
+        url: "https://github.com/example/repo/pull/12",
+        state: "OPEN",
+        headRefOid: "4444444444444444444444444444444444444444",
+        headRefName: "overlord/OV-103-C1",
+      },
+    );
+
+    expect(code).toBe(0);
+    const after = await loadBoard(boardPath);
+    const change = findChange(after.board, "OV-103-C1")!.change;
+    expect(change.pr!.number).toBe(12);
+    expect(change.pr!.state).toBe("open");
+    expect(change.state).toBe("reviewing");
+  });
+
+  test("leaves the change state alone for a closed pull request", async () => {
+    const boardPath = await writeStartedBoard();
+    await updateChange(boardPath, "OV-103-C1", (change) => {
+      change.state = "implementing";
+    });
+
+    const { code } = await runChangeCli(
+      [
+        "pr",
+        "OV-103-C1",
+        "--board",
+        boardPath,
+        "--base",
+        "main",
+        "--number",
+        "12",
+      ],
+      {
+        number: 12,
+        url: "https://github.com/example/repo/pull/12",
+        state: "CLOSED",
+        headRefOid: "5555555555555555555555555555555555555555",
+        headRefName: "overlord/OV-103-C1",
+      },
+    );
+
+    expect(code).toBe(0);
+    const after = await loadBoard(boardPath);
+    const change = findChange(after.board, "OV-103-C1")!.change;
+    expect(change.pr!.state).toBe("closed");
+    expect(change.state).toBe("implementing");
   });
 });

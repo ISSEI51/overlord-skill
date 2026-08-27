@@ -53,14 +53,19 @@ A cmux workspace does not start its terminal process until the workspace is sele
 
 Work is dispatched per change, not per card: one change is one worktree, one branch, one pull request and one worker session. The commander does not create the worktree or the branch by hand — `scripts/change.sh` owns them and records them on the board.
 
+`change.sh` is run from the project directory, with the absolute path of the Overlord checkout — the same way `console.sh` is started:
+
 ```bash
-scripts/change.sh start <change-id>     # worktree と overlord/<change-id> ブランチを作り board に記録
-cmux new-workspace --cwd <出力された worktree パス> --command claude
+cd <project-directory>
+/path/to/overlord/scripts/change.sh start <change-id>   # worktree と overlord/<change-id> ブランチを作り board に記録
+cmux new-workspace --name "<change-id> <title>" --cwd <出力された worktree パス> --command claude
 # 実装・検証・独立レビューの後
-scripts/change.sh pr <change-id>        # push して PR を作り change.pr を記録
+/path/to/overlord/scripts/change.sh pr <change-id>      # push して PR を作り change.pr を記録
 ```
 
-`start` prints the worktree path on its last line and writes `changes[].branch` plus `changes[].state: implementing`. `pr` pushes the branch, opens the pull request — or reuses the one already open for that branch — and writes `changes[].pr` (`number`, `url`, `state`, `head_sha`) plus `changes[].state: reviewing`. `pr --number <n>` records a pull request that was opened from the GitHub web UI instead of creating one. Both commands leave `board.yaml` untouched when the git or `gh` step fails, so they can be run again.
+Both subcommands take `--board <path>` (a `board.yaml`, or a project directory containing one) when the board is not the one under the current directory; without it they fall back to `$OVERLORD_BOARD` and then to the current directory. Both also take `--base <branch>`, which defaults to the current branch of the main checkout: `start` branches from it and `pr` opens the pull request against it. A change that builds on the previous one is stacked by passing `--base overlord/<前の change-id>` to both commands, so its diff shows only its own work.
+
+`start` prints the worktree path on its last line — `<repo>/.overlord/worktrees/<change-id>` — and writes `changes[].branch` plus `changes[].state: implementing`. `pr` pushes the branch, opens the pull request — or reuses the one already open for that branch — and writes `changes[].pr` (`number`, `url`, `state`, `head_sha`). The change state follows the pull request: `reviewing` for an open one, `done` for one that is already merged, unchanged for a closed one. `pr --number <n>` records a pull request that was opened from the GitHub web UI instead of creating one; the number is checked against `changes[].branch` (`gh pr view --json headRefName`), and a pull request on any other branch is refused without writing the board, so a mistyped number cannot overwrite the record of the correct pull request. Both commands leave `board.yaml` untouched when the git or `gh` step fails, so they can be run again.
 
 Do not use the `Agent` tool's `isolation: "worktree"` for a change: it names its own branch, which would not be the `overlord/<change-id>` branch recorded on the board.
 
@@ -78,7 +83,7 @@ Finally the session is written into the card, with `cwd` set to the worktree `st
     agent:
       workspace_id: "50BC5A54-92C7-4A08-B31F-3DB33591D052"
       surface_id: "973ECD38-E9D7-4AF8-88AB-56F226E24C5B"
-      cwd: "/Users/example/worktrees/RC-UX-001"
+      cwd: "/Users/example/dev/project/.overlord/worktrees/OV-103-C2"
 ```
 
 The console shows this session read-only on the card with a `cmux で開く` button. The identifiers become stale when the workspace is closed; the console then reports the session as not found. Work that does not need its own terminal — discovery, card creation, briefs, independent review — runs as a subagent inside the commander session and never appears in `agent`.

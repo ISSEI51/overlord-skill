@@ -25,6 +25,7 @@ import {
   type Board,
   type Change,
   type Item,
+  type State,
 } from "./board.ts";
 
 // ---------------------------------------------------------------------------
@@ -354,15 +355,58 @@ export function prBodyFor(item: Item, change: Change): string {
   ].join("\n");
 }
 
-/** The `gh pr view` fields the board needs. */
+/**
+ * The `gh pr view` fields the board needs.
+ *
+ * `headRefName` is not written to the board: it is read so the pull request
+ * can be checked against the branch recorded for the change before anything
+ * is written.
+ */
 export type PullRequestView = {
   number: number;
   url: string;
   state: string;
   headRefOid: string;
+  headRefName: string;
 };
 
-const PR_VIEW_FIELDS = "number,url,state,headRefOid";
+const PR_VIEW_FIELDS = "number,url,state,headRefOid,headRefName";
+
+/**
+ * Parse a `--number <n>` value.
+ *
+ * `Number.parseInt` stops at the first character it cannot read, so it turns
+ * `1abc` into 1, `3.9` into 3 and `1e3` into 1. Recording the wrong pull
+ * request on a change is silent and destructive — it overwrites the correct
+ * `pr` record — so the value has to be all digits before it is parsed.
+ *
+ * Returns null for anything that is not a positive decimal pull request
+ * number.
+ */
+export function parsePrNumber(raw: string): number | null {
+  if (!/^[0-9]+$/.test(raw)) return null;
+  const value = Number.parseInt(raw, 10);
+  if (!Number.isSafeInteger(value) || value <= 0) return null;
+  return value;
+}
+
+/**
+ * The change state that goes with a recorded pull request.
+ *
+ * Recording a pull request normally means the change is waiting for review.
+ * A pull request that is already merged says the change is delivered, so it
+ * lands on `done` instead of being sent back to `reviewing`; a closed pull
+ * request says nothing about where the change stands, so whatever state the
+ * board already holds is kept.
+ */
+export function changeStateForPr(
+  prState: string | null,
+  current: State,
+): State {
+  if (prState === "merged") return "done";
+  if (prState === "closed") return current;
+  return "reviewing";
+}
 
 function parseJson<T>(text: string): T | null {
   try {
@@ -440,8 +484,8 @@ export async function pr(argv: string[]): Promise<number> {
 
   let number: number | null = null;
   if (options.number !== undefined) {
-    number = Number.parseInt(options.number, 10);
-    if (!Number.isInteger(number) || number <= 0) {
+    number = parsePrNumber(options.number);
+    if (number === null) {
       process.stderr.write(
         `--number must be a pull request number: ${options.number}\n`,
       );
@@ -548,6 +592,20 @@ export async function pr(argv: string[]): Promise<number> {
     return 1;
   }
 
+  // The pull request has to be the one that belongs to this change. Without
+  // this check a mistyped `--number` records an unrelated pull request over
+  // the correct `pr` record and still exits 0. Checked on both paths: the
+  // branch lookup can also return a pull request from a renamed branch.
+  if (view.headRefName !== branch) {
+    process.stderr.write(
+      `pull request #${view.number} is on branch ` +
+        `"${view.headRefName ?? "(unknown)"}", not the branch recorded for ` +
+        `${changeId} ("${branch}").\n` +
+        `Nothing was written to ${boardPath}.\n`,
+    );
+    return 1;
+  }
+
   const state = normalizePrState(view.state);
   await updateChange(boardPath, changeId, (change) => {
     // `reviewed_sha` belongs to the review commands, not to this one: it stays
@@ -560,7 +618,7 @@ export async function pr(argv: string[]): Promise<number> {
       head_sha: view.headRefOid ?? null,
       reviewed_sha: previous.reviewed_sha ?? null,
     };
-    change.state = "reviewing";
+    change.state = changeStateForPr(state, change.state);
   });
 
   process.stdout.write(`pull request:     #${view.number} (${state})\n`);
