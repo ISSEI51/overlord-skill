@@ -137,7 +137,7 @@ export default function App() {
   );
 
   const createItem = useCallback(
-    async (payload: { title: string; project?: string; evidence?: string }) => {
+    async (payload: { title: string; evidence?: string }) => {
       const result = await api<{ item: Item; rev: string }>("/api/items", {
         method: "POST",
         body: JSON.stringify(payload),

@@ -16,11 +16,7 @@ export type ConsoleController = {
   moveItem: (id: string, state: StateKey, label: string) => Promise<void>;
   /** DELETE a done card; toasts the outcome and reloads the board. */
   deleteItem: (id: string) => Promise<void>;
-  createItem: (payload: {
-    title: string;
-    project?: string;
-    evidence?: string;
-  }) => Promise<Item>;
+  createItem: (payload: { title: string; evidence?: string }) => Promise<Item>;
 
   setCommander: (link: SessionLink) => Promise<void>;
   startCommanderWorkspace: (cwd: string) => Promise<void>;
