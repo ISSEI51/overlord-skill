@@ -24,8 +24,8 @@ The commander is stored at the top level of the board:
 
 ```yaml
 commander:
-  workspace_id: "C06728B8-B8BA-4D83-A69D-9ADE254532CB"
-  surface_id: "93EF686E-FAF3-4474-850A-0DEAC3C5BD8D"
+  workspace_id: "11111111-1111-1111-1111-111111111111"
+  surface_id: "22222222-2222-2222-2222-222222222222"
   cwd: "/Users/example/dev/project"
 ```
 
@@ -93,8 +93,8 @@ Finally the session is written into the card, with `cwd` set to the worktree `st
 
 ```yaml
     agent:
-      workspace_id: "50BC5A54-92C7-4A08-B31F-3DB33591D052"
-      surface_id: "973ECD38-E9D7-4AF8-88AB-56F226E24C5B"
+      workspace_id: "33333333-3333-3333-3333-333333333333"
+      surface_id: "44444444-4444-4444-4444-444444444444"
       cwd: "/Users/example/dev/project/.overlord/worktrees/OV-103-C2"
 ```
 
