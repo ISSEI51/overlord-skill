@@ -14,18 +14,23 @@ Overlord is a control layer that runs your Claude Code and Codex agents as a dev
 
 - **Only decisions reach you** — the "decisions today" bar holds at most three items. A cyan border means a card is waiting on you; a yellow border means an AI is working on it. Those two signals are the whole dashboard
 - **Agents work as a team** — you talk to exactly one session, the commander. It dispatches each card's discovery, brief, implementation, and review to subagents
-- **Parallel work, one pull request at a time** — 1 change = 1 worktree = 1 branch = 1 pull request = 1 agent run. Large work is split into changes, not into more cards
-- **No AI signs off on its own change** — the independent review runs in a different subagent, and a change whose reviewed commit is not the pull request head never reaches acceptance
-- **One file holds the state** — agents read and write only `docs/product-ops/board.yaml`; you see it as a kanban in the browser. Writes are guarded by optimistic locking
+- **Parallel work, one pull request per change** — 1 change = 1 worktree = 1 branch = 1 pull request = 1 agent run. Large work is split into changes, not into more cards
+- **No AI signs off on its own change** — the independent review runs in a different subagent. When a change's reviewed commit is not the pull request head, `sync` prints a warning, and the skills require that such a change is re-reviewed before it moves to acceptance
+- **One file holds the state** — the board file is the only state agents read and write; you see `docs/product-ops/board.yaml` as a kanban in the browser. Writes are guarded by optimistic locking
 - **Local only** — the console listens on `127.0.0.1` and rejects any request whose `Host` or `Origin` is not loopback
 
 ## Quick start
+
+The console interface is in Japanese. The steps below quote the on-screen labels and give their meaning in English.
 
 You need:
 
 - [Claude Code](https://claude.com/claude-code) (or Codex)
 - [Bun](https://bun.sh) — required to run Overlord Console
-- cmux — required for the commander sidebar and the card instruction buttons. Without cmux you can still browse and edit the kanban and add observations
+- `git` and the [GitHub CLI](https://cli.github.com/) (`gh`) — `scripts/change.sh`'s `pr`, `sync`, and `deliver` invoke `git` and `gh` directly (`gh pr create`, `gh pr list`, `gh pr view`, `gh pr edit`, `gh repo view`), so `gh` has to be authenticated with `gh auth login`
+- [cmux](https://cmux.com/) — a macOS terminal, required for the commander sidebar and the card instruction buttons
+
+Platform: the console and the skills contain no macOS-specific code, so they run anywhere Bun runs (macOS and Linux). cmux is a macOS app; when `cmux` is not on `PATH` the console falls back to `/Applications/cmux.app/Contents/Resources/bin/cmux`. Without cmux you can still browse and edit the kanban, add observations, and run every `scripts/change.sh` command. What you lose is the commander sidebar, the card instruction buttons, and `console.sh --open`.
 
 1. **Install the skills**
 
@@ -35,7 +40,7 @@ You need:
    ./scripts/install.sh claude          # for Codex: ./scripts/install.sh codex
    ```
 
-2. **Start the console against the project you want to run**
+2. **Start the console against the project you want to manage**
 
    ```bash
    ./scripts/console.sh ~/dev/your-project
@@ -64,7 +69,7 @@ observation -> work card -> prioritize -> implementation brief -> implement -> i
 | Piece | Role |
 | --- | --- |
 | Five skills | The AI's operating procedures (below) |
-| `docs/product-ops/board.yaml` | The single machine-readable source of truth |
+| `docs/product-ops/board.yaml` | The only state agents read and write; the single machine-readable source of truth |
 | Overlord Console | A browser dashboard that renders and edits the board file |
 | Commander | The one cmux session you talk to; it dispatches each card's work to subagents |
 
@@ -78,7 +83,7 @@ The board has three levels, and **you only manage the top one**.
 | **Change** | One delivery unit: 1 change = 1 worktree = 1 branch = 1 PR = 1 agent execution unit | Read-only inside the card modal |
 | **Task** | A step inside an agent's run | Never shown |
 
-A change moves one pull request at a time: `start` creates its worktree and branch, `pr` pushes it and opens the pull request, `reviewed` records the commit the independent review read, and `sync` writes the pull request state back after the merge. `scripts/change.sh` runs each step and records it on the board, so nobody edits the board by hand. A change whose reviewed commit is not the pull request head does not go to acceptance.
+A change is delivered as a single pull request: `start` creates its worktree and branch, `pr` pushes it and opens the pull request, `reviewed` records the commit the independent review read, and `sync` writes the pull request state back after the merge. `scripts/change.sh` runs each step and records it on the board, so nobody edits the board by hand. When a change's reviewed commit is not the pull request head, `sync` prints a warning; keeping that change out of acceptance is a rule the skills enforce, not something the command blocks.
 
 Large work is split into **changes**. Many files, a backend/frontend divide, a migration, a desire for smaller pull requests — all of these become changes, and **the card count stays the same**.
 
@@ -96,11 +101,12 @@ A new card is created only when the piece is a separate product outcome: somethi
 
 ## Overlord Console
 
-A local dashboard built with React + shadcn/ui. Changes to `board.yaml` appear on screen automatically. The interface is in Japanese.
+A local dashboard built with React + shadcn/ui. Changes to `board.yaml` appear on screen automatically.
 
 ### Board
 
-- An eight-column kanban (inbox / discovery / specified / implementing / reviewing / acceptance / done / blocked) with drag & drop
+- An eight-column kanban with drag & drop. The columns are labelled in Japanese; their board keys are the words in parentheses:
+  受信箱 (inbox) / 調査中 (discovery) / 実装準備完了 (specified) / 実装中 (implementing) / 確認中 (reviewing) / 完成確認待ち (acceptance) / 完了 (done) / 停止中 (blocked)
 - **Cyan border** = a card that needs you (awaiting acceptance, owned by you, or listed in today's decisions)
 - **Yellow border** = a card the AI is actively working on
 - The "decisions today" bar shows at most three things only you can decide
@@ -112,9 +118,9 @@ A local dashboard built with React + shadcn/ui. Changes to `board.yaml` appear o
 
 Clicking a card opens a centered modal.
 
-- **Instruction buttons** (ask status / advance / implementation brief / independent review / ready to close?) send to the commander with a single press; skill command strings never appear on screen
-- **Detailed instruction**: free-form text is sent to the commander prefixed with the card ID
-- **Accept & complete**: shown on cards awaiting acceptance; one click marks them done
+- **Instruction buttons** under 司令塔への指示 — 状況を聞く (ask status) / 進める (advance) / 実装ブリーフ (implementation brief) / 独立レビュー (independent review) / 完了の可否 (ready to close?) — send to the commander with a single press; skill command strings never appear on screen
+- **このカードへの詳細指示** (detailed instruction): free-form text is sent to the commander prefixed with the card ID
+- **受け入れて完了** (accept & complete): shown on cards awaiting acceptance; one click marks them done
 - State, next action, owner, and blocker are editable in place (Escape cancels)
 
 ### Commander sidebar
@@ -203,10 +209,10 @@ For the repository's merge-method setting, see [Why merge commits](#why-merge-co
 
 ## Daily use
 
-1. **Capture observations**: "Add an observation" in the top bar, or "capture an observation" in the sidebar
-2. **Advance**: open a card and press "advance" once; the commander runs the state-appropriate step (card → brief → implement → independent review) with subagents
-3. **Decide**: you only need to look at "decisions today" and cyan-bordered cards; approving briefs and accepting work happens with the card's buttons
-4. **Accept**: check cards awaiting acceptance and press "accept & complete"; clear finished cards via right-click
+1. **Capture observations**: 気づきを追加 (add an observation) in the top bar, or 気づきをカードに (capture an observation) in the sidebar
+2. **Advance**: open a card and press 進める (advance) once; the commander runs the state-appropriate step (card → brief → implement → independent review) with subagents
+3. **Decide**: you only need to look at the 今日の判断 (decisions today) bar and the cyan-bordered cards; approving briefs and accepting work happens with the card's buttons
+4. **Accept**: check cards in 完成確認待ち (awaiting acceptance) and press 受け入れて完了 (accept & complete); clear finished cards via right-click
 
 ## Operating rules
 

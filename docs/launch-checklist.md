@@ -72,12 +72,12 @@ Release ノートに書くこと:
 
 - Overlord が何をする道具か（README の冒頭2行）
 - 含まれるスキル5件と Overlord Console
-- 前提（Claude Code または Codex / Bun / cmux）
-- 既知の制約（コンソールの UI は日本語、macOS の cmux 前提）
+- 前提（Claude Code または Codex / Bun / `git` と `gh` / cmux）
+- 既知の制約（コンソールの UI は日本語。cmux は macOS アプリで、司令塔サイドバーとカードの指示ボタンは macOS でのみ使える。コンソールとスキル自体は Bun が動く環境であれば動作する）
 
 ## 4. 秘密情報の確認（実施済み）
 
-公開前に実際に走査した結果です。走査対象は Git の管理下にあるファイル（66件）のみです。
+実際に走査した結果です。走査対象は Git の管理下にあるテキストファイル（`git ls-files` で70件、うち画像2件は `git grep` の対象外）です。画像に写り込んでいる情報は文字列走査では検出できないため、別項目として下に挙げてあります。
 
 ```bash
 # 1. .env / 鍵ファイルが追跡されていないか
@@ -99,9 +99,10 @@ git grep -nI '/Users/' -- .
 #=> skills/overlord-ops/references/console.md:29,96       /Users/example/...（サンプル。対処不要）
 
 # 5. コミット作者
-git log --format='%an <%ae>' | sort -u
-#=> issei <issei60issei60@gmail.com>
-#=> Issei Kunimasa <135028254+ISSEI51@users.noreply.github.com>
+git log --format='%ae' | sort | uniq -c | sort -rn
+#=> 38  issei60issei60@gmail.com
+#=> 13  135028254+ISSEI51@users.noreply.github.com
+#   （overlord-console ブランチの 51 コミット時点の実測値）
 ```
 
 判定と対応:
@@ -109,7 +110,8 @@ git log --format='%an <%ae>' | sort -u
 - [x] API キー・アクセストークン・秘密鍵: **なし**
 - [x] `.env` などの設定ファイル: **追跡されていない**（`.gitignore` に `.overlord/` あり）
 - [ ] **`docs/product-ops/board.yaml` の扱いを決める（要判断）** — このファイルは Overlord 自身の作業ボードで、`commander.cwd` に `/Users/kunimasa/dev/overlord`、`commander.workspace_id` / `surface_id` にローカルの cmux UUID、各カードに開発中の内部メモが入っています。秘密情報ではありませんが、ホームディレクトリの実名と作業内容が公開されます。選択肢は「そのまま公開する（開発の実例として見せる）」「`commander` ブロックだけ削って公開する」「サンプル board に差し替える」の3つ。**この worktree では board.yaml を編集していません。**
-- [ ] **コミット作者のメールアドレス（要判断）** — Git 履歴の一部が `issei60issei60@gmail.com` で記録されています。公開すると誰でも読めます。隠したい場合は履歴の書き換え（`git filter-repo`）が必要で、公開前にしかできません。今後のコミットだけを `@users.noreply.github.com` に統一する場合は、GitHub の「Keep my email addresses private」設定と `git config user.email` の変更で足ります。
+- [ ] **同梱スクリーンショットに写り込んでいる情報の確認** — `docs/images/console-board.jpg` と `docs/images/card-modal.jpg` は追跡されており、README から表示されます。文字列走査の対象外なので、画像を開いて次を目視で確認します。トップバーの board のパス、カードモーダルの「担当セッション」欄に出る worktree のパス、カード本文とプロジェクト名、PR URL。ホームディレクトリの実名や実プロジェクト名が読めるなら、デモ用のボードで撮り直します（§2 の Social Preview と同じ注意です）。
+- [ ] **今後のコミット作者メールを `@users.noreply.github.com` に統一する** — `gh repo view ISSEI51/overlord-skill --json visibility` は `PUBLIC` を返します。**リポジトリはすでに公開済みで、`issei60issei60@gmail.com` を含むコミット履歴（51 コミット中 38 件）は誰でも読める状態です。** 今から `git filter-repo` で履歴を書き換えても、GitHub 側に残る到達可能な旧オブジェクト、フォーク、キャッシュ、既存のクローンは取り消せません。したがって取れる対策は今後のコミットの統一だけです。GitHub の「Keep my email addresses private」を有効にし、`git config user.email 135028254+ISSEI51@users.noreply.github.com` を設定します。
 
 ## 5. 告知（**このリポジトリからは投稿しない。文面案のみ**）
 
@@ -155,7 +157,7 @@ git log --format='%an <%ae>' | sort -u
 
 - 1段落目: 解いた問題（複数の AI エージェントを同時に動かすと、人間が状況を把握できなくなる）
 - 2段落目: 仕組み（1つの司令塔セッション + カード単位のサブエージェント + `board.yaml` + ローカルのカンバン）
-- 3段落目: 前提と制約（macOS / cmux / Bun、UI は日本語）を先に書く。後から指摘されるより良い
+- 3段落目: 前提と制約（Bun / `git` と `gh` / cmux は macOS アプリ、UI は日本語）を先に書く。後から指摘されるより良い
 - 最後: MIT、リポジトリ URL、フィードバックの依頼
 
 ## 6. 公開直後
