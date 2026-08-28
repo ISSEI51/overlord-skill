@@ -1,5 +1,5 @@
 ---
-name: product-change-review
+name: overlord-change-review
 description: Independently review a proposed or completed product change for requirement gaps, regressions, unsafe behavior, and missing verification. Use after implementation; do not make code changes unless explicitly requested.
 ---
 

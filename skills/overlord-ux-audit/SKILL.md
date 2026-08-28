@@ -1,5 +1,5 @@
 ---
-name: product-ux-audit
+name: overlord-ux-audit
 description: Audit an application workflow for usability friction, interaction regressions, and recovery from errors using representative user scenarios. Use for product-quality inspection, not for visual redesign without a user flow.
 ---
 
@@ -21,7 +21,7 @@ Smallest useful improvement:
 Acceptance condition:
 ```
 
-Limit findings to five unless a user explicitly asks for a full audit. Do not implement fixes during the audit. Turn accepted findings into improvement cards with `product-improvement-card`.
+Limit findings to five unless a user explicitly asks for a full audit. Do not implement fixes during the audit. Turn accepted findings into improvement cards with `overlord-improvement-card`.
 
 ## Board Update
 
