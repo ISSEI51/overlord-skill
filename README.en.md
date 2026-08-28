@@ -101,21 +101,23 @@ For Codex use `./scripts/install.sh codex`. The installer refuses to overwrite e
 
 ### Removing the old `product-*` install
 
-The skills were renamed from `product-*` to `overlord-*`, so any install made under the old names has to be removed by hand. Otherwise `~/.claude/skills` keeps five broken symlinks and `~/.codex/skills` keeps five real copies of the old content.
+The skills were renamed from `product-*` to `overlord-*`, so any install made under the old names has to be removed by hand. Otherwise the old skills stay installed: `scripts/install.sh` copies with `cp -R`, so an installer-made install leaves five real copies; a hand-made symlink install leaves five broken symlinks.
+
+Real copies keep working with their old content, so `/product-ops` and the other four still run. Their descriptions are nearly identical to the new ones, so until you remove them the wrong skill can be picked.
 
 ```bash
 # check what will be removed first
 ls -l ~/.claude/skills | grep product-
 ls -l ~/.codex/skills | grep product-
 
-# Claude Code: five symlinks, broken by the rename
+# Claude Code
 rm -rf ~/.claude/skills/product-ops \
        ~/.claude/skills/product-improvement-card \
        ~/.claude/skills/product-ux-audit \
        ~/.claude/skills/product-implementation-brief \
        ~/.claude/skills/product-change-review
 
-# Codex: five real copies that keep the old content
+# Codex
 rm -rf ~/.codex/skills/product-ops \
        ~/.codex/skills/product-improvement-card \
        ~/.codex/skills/product-ux-audit \
@@ -124,6 +126,8 @@ rm -rf ~/.codex/skills/product-ops \
 ```
 
 On a symlink, `rm -rf` removes the link itself and leaves its target untouched. If you installed per project, remove `.claude/skills/product-*` from that repository the same way.
+
+Skills are read when a session starts, so restart Claude Code / Codex after removing them.
 
 ### Console
 

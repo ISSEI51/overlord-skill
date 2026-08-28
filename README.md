@@ -101,21 +101,23 @@ Codex 向けは `./scripts/install.sh codex` です。同名スキルがある�
 
 ### 旧スキル（`product-*`）の削除
 
-スキル名を `product-*` から `overlord-*` に変更したため、旧名でインストール済みのスキルは手動で削除してください。削除しないと、`~/.claude/skills` にはリンク切れの symlink 5本が残り、`~/.codex/skills` には旧内容の実体コピー5件が残り続けます。
+スキル名を `product-*` から `overlord-*` に変更したため、旧名でインストール済みのスキルは手動で削除してください。削除しないと旧スキルが残り続けます。`scripts/install.sh` は `cp -R` でコピーするため、インストーラーで導入した場合は実体コピー5件です。手動で symlink を張っていた場合はリンク切れの symlink 5本になります。
+
+実体コピーが残っていると、旧 `/product-ops` などが旧内容のまま動作し続けます。説明文がほぼ同じスキルが新旧あわせて10件並ぶため、削除するまでは意図しない方が選ばれることがあります。
 
 ```bash
 # 削除対象を先に確認する
 ls -l ~/.claude/skills | grep product-
 ls -l ~/.codex/skills | grep product-
 
-# Claude Code: symlink 5本（改名でリンク切れになる）
+# Claude Code
 rm -rf ~/.claude/skills/product-ops \
        ~/.claude/skills/product-improvement-card \
        ~/.claude/skills/product-ux-audit \
        ~/.claude/skills/product-implementation-brief \
        ~/.claude/skills/product-change-review
 
-# Codex: 実体コピー5件（旧内容が残り続ける）
+# Codex
 rm -rf ~/.codex/skills/product-ops \
        ~/.codex/skills/product-improvement-card \
        ~/.codex/skills/product-ux-audit \
@@ -124,6 +126,8 @@ rm -rf ~/.codex/skills/product-ops \
 ```
 
 `rm -rf` は symlink に対してはリンク自体だけを削除し、リンク先には影響しません。プロジェクト単位でインストールしている場合は、対象リポジトリの `.claude/skills/product-*` も同じ手順で削除してください。
+
+スキルはセッションの開始時に読み込まれます。削除したら Claude Code / Codex のセッションを起動し直してください。
 
 ### コンソール
 
