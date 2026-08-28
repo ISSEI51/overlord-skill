@@ -7,7 +7,7 @@ OSS として公開するまでに確認・実施することの一覧です。G
 - [x] **MIT License** — ルートの `LICENSE`（`Copyright (c) 2026 Issei Kunimasa`）
 - [x] **README.md（日本語）** — キャッチコピー → 説明 → スクリーンショット → 主な特徴 → Quick Start → 詳細、の順
 - [x] **README.en.md（英語）** — 日本語版と同じ情報構造
-- [x] **`docs/launch-demo.md`** — 30〜60秒デモの撮影手順
+- [x] **`docs/launch-demo.md`** — 30〜60秒デモ動画の撮影手順と、README 用スクリーンショット2枚の撮り直し手順
 - [x] **`CONTRIBUTING.md`** — 開発の入口（テストの実行、フロントエンドの再ビルド）
 - [ ] **リポジトリ名の確定** — 現在の remote は `ISSEI51/overlord-skill`。README の `git clone` URL とディレクトリ名（`cd overlord-skill`）はこの名前に合わせてあります。**リポジトリ名を変えるなら、両 README の URL と `cd` 行を同時に直すこと**
 - [ ] **デモ動画（30〜60秒）** — `docs/launch-demo.md` のとおりに撮影。README への埋め込みは任意
@@ -77,7 +77,7 @@ Release ノートに書くこと:
 
 ## 4. 秘密情報の確認（実施済み）
 
-実際に走査した結果です。走査対象は Git の管理下にあるテキストファイル（`git ls-files` で70件、うち画像2件は `git grep` の対象外）です。画像に写り込んでいる情報は文字列走査では検出できないため、別項目として下に挙げてあります。
+実際に走査した結果です。走査対象は Git の管理下にあるテキストファイル（`git ls-files` で70件、うち画像2件は `git grep` の対象外）です。画像に写り込んでいる情報は文字列走査では検出できないため、別項目として下に挙げてあります。以下は `docs/product-ops/board.yaml` を追跡から外したあと、ブランチ `overlord/OV-110-C3` で取り直した実測値です。
 
 ```bash
 # 1. .env / 鍵ファイルが追跡されていないか
@@ -90,28 +90,36 @@ git grep -nIE '(sk-[A-Za-z0-9]{16,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]
 
 # 3. メールアドレス
 git grep -nIE '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' -- .
-#=> console/src/change.test.ts:740  "user.email=test@example.com"（テスト用のダミー。対処不要）
+#=> console/src/change.test.ts:751,1795  "user.email=test@example.com"（テスト用のダミー。対処不要）
+#=> docs/launch-checklist.md               この文書自身が引用しているアドレス（下の「6. コミット作者」と同じもの）
 
 # 4. 個人のホームディレクトリなど内部パス
 git grep -nI '/Users/' -- .
-#=> docs/product-ops/board.yaml:6                       cwd: "/Users/kunimasa/dev/overlord"
 #=> skills/overlord-ops/references/board-schema.md:11,40  /Users/example/...（サンプル。対処不要）
-#=> skills/overlord-ops/references/console.md:29,96       /Users/example/...（サンプル。対処不要）
+#=> skills/overlord-ops/references/console.md:29,98       /Users/example/...（サンプル。対処不要）
+#=> docs/launch-checklist.md                              この文書自身が引用しているパス
+#   docs/product-ops/board.yaml は追跡外になったため、この走査には現れません
 
-# 5. コミット作者
+# 5. board.yaml が追跡されていないこと
+git ls-files docs/product-ops/
+#=> docs/product-ops/board.example.yaml
+git check-ignore -v docs/product-ops/board.yaml
+#=> .gitignore:9:docs/product-ops/board.yaml	docs/product-ops/board.yaml
+
+# 6. コミット作者
 git log --format='%ae' | sort | uniq -c | sort -rn
-#=> 38  issei60issei60@gmail.com
+#=> 39  issei60issei60@gmail.com
 #=> 13  135028254+ISSEI51@users.noreply.github.com
-#   （overlord-console ブランチの 51 コミット時点の実測値）
+#   （overlord/OV-110-C3 の 52 コミット時点の実測値）
 ```
 
 判定と対応:
 
 - [x] API キー・アクセストークン・秘密鍵: **なし**
 - [x] `.env` などの設定ファイル: **追跡されていない**（`.gitignore` に `.overlord/` あり）
-- [ ] **`docs/product-ops/board.yaml` の扱いを決める（要判断）** — このファイルは Overlord 自身の作業ボードで、`commander.cwd` に `/Users/kunimasa/dev/overlord`、`commander.workspace_id` / `surface_id` にローカルの cmux UUID、各カードに開発中の内部メモが入っています。秘密情報ではありませんが、ホームディレクトリの実名と作業内容が公開されます。選択肢は「そのまま公開する（開発の実例として見せる）」「`commander` ブロックだけ削って公開する」「サンプル board に差し替える」の3つ。**この worktree では board.yaml を編集していません。**
-- [ ] **同梱スクリーンショットに写り込んでいる情報の確認** — `docs/images/console-board.jpg` と `docs/images/card-modal.jpg` は追跡されており、README から表示されます。文字列走査の対象外なので、画像を開いて次を目視で確認します。トップバーの board のパス、カードモーダルの「担当セッション」欄に出る worktree のパス、カード本文とプロジェクト名、PR URL。ホームディレクトリの実名や実プロジェクト名が読めるなら、デモ用のボードで撮り直します（§2 の Social Preview と同じ注意です）。
-- [ ] **今後のコミット作者メールを `@users.noreply.github.com` に統一する** — `gh repo view ISSEI51/overlord-skill --json visibility` は `PUBLIC` を返します。**リポジトリはすでに公開済みで、`issei60issei60@gmail.com` を含むコミット履歴（51 コミット中 38 件）は誰でも読める状態です。** 今から `git filter-repo` で履歴を書き換えても、GitHub 側に残る到達可能な旧オブジェクト、フォーク、キャッシュ、既存のクローンは取り消せません。したがって取れる対策は今後のコミットの統一だけです。GitHub の「Keep my email addresses private」を有効にし、`git config user.email 135028254+ISSEI51@users.noreply.github.com` を設定します。
+- [x] **`docs/product-ops/board.yaml` の扱い（解消済み）** — 判断は「追跡から外して example を配る」。`git rm --cached` で追跡を外し、`.gitignore` に `docs/product-ops/board.yaml` の1行を追加しました。ファイル自体はローカルに残るため、このリポジトリでの Overlord の運用は変わりません。これで `commander.cwd` のホームディレクトリ実名、ローカルの cmux UUID、各カードの開発中メモは追跡対象から外れ、コントリビューターがこのリポジトリで Overlord を動かしても差分が出なくなりました。**すでに公開済みの過去のコミットには残っています**（履歴の書き換えが有効な対策にならない理由は下のコミット作者メールと同じです）。代わりに `docs/product-ops/board.example.yaml` を追跡し、新規利用者向けの雛形とスクリーンショット用のデモボードを兼ねさせています。
+- [ ] **同梱スクリーンショットの撮り直し（未実施）** — `docs/images/console-board.jpg` と `docs/images/card-modal.jpg` は追跡されており、README から表示されます。目視で確認した結果、プロジェクト名 `WhiteDB` / `RaidCoder`、それらのカード本文、`-Users-kunimasa-dev-` を含むパスが読める大きさで写っています。画像は文字列走査の対象外なので、board.yaml を追跡から外しても解消しません。`docs/launch-demo.md` の「スクリーンショットの撮り直し」の手順で、`board.example.yaml` を使って撮り直し、同じファイル名で差し替えます（§2 の Social Preview はこの画像を素材にするため、先に撮り直すこと）。
+- [ ] **今後のコミット作者メールを `@users.noreply.github.com` に統一する（未実施）** — `gh repo view ISSEI51/overlord-skill --json visibility` は `PUBLIC` を返します。**リポジトリはすでに公開済みで、`issei60issei60@gmail.com` を含むコミット履歴（52 コミット中 39 件）は誰でも読める状態です。** 今から `git filter-repo` で履歴を書き換えても、GitHub 側に残る到達可能な旧オブジェクト、フォーク、キャッシュ、既存のクローンは取り消せません。したがって取れる対策は今後のコミットの統一だけです。GitHub の「Keep my email addresses private」を有効にし、`git config user.email 135028254+ISSEI51@users.noreply.github.com` を設定します。
 
 ## 5. 告知（**このリポジトリからは投稿しない。文面案のみ**）
 

@@ -202,6 +202,8 @@ docs/product-ops/board.yaml を作成してください。
 
 別のターミナルでコンソールを起動し、サイドバーの「変更」からこの Claude Code セッションを司令塔として登録します（司令塔側から `cmux identify --json --id-format both` で自分の ID を読み、board の `commander` に書き込む方法もあります）。
 
+board 自体を手で書きたい場合は、このリポジトリの `docs/product-ops/board.example.yaml` を対象リポジトリの `docs/product-ops/board.yaml` にコピーして出発点にできます。中身は架空のサンプルなので、`items` を自分のカードに置き換えてください（スキーマは `skills/overlord-ops/references/board-schema.md`）。
+
 リポジトリのマージ方式の設定については、[なぜ merge commit なのか](#なぜ-merge-commit-なのか)を参照してください。
 
 ## 日常の使い方
@@ -223,7 +225,7 @@ docs/product-ops/board.yaml を作成してください。
 
 squash は main に新しいコミットを1つ作ります。作業ブランチ側の元のコミットは main の履歴に入らないため、内容が同じでもマージ後に merge-base が前進しません。この状態で、main の squash コミットが変更した行、またはその近傍の行を作業ブランチが再度変更すると、次の main 向けPRがその行で競合します。実際に PR #10 がこの経路で競合し、手作業で解消しました。
 
-squash を使うと**必ず**競合するわけではありません。両側の差分が同じ内容なら git は解決できます。競合するのは、squash が変更した行と重なる範囲を作業ブランチが再度書き換えた場合です。同じファイルでも変更行が十分に離れていれば git は自動で解決します。ただし `.gitignore` や `console/src/board.ts`、`docs/product-ops/board.yaml` のように繰り返し変更するファイルでは、squash を続ける限り再発します。
+squash を使うと**必ず**競合するわけではありません。両側の差分が同じ内容なら git は解決できます。競合するのは、squash が変更した行と重なる範囲を作業ブランチが再度書き換えた場合です。同じファイルでも変更行が十分に離れていれば git は自動で解決します。ただし `.gitignore` や `console/src/board.ts`、`console/src/change.ts` のように繰り返し変更するファイルでは、squash を続ける限り再発します。
 
 merge commit なら配送のたびに merge-base が前進するため、この分岐そのものが起きません。
 

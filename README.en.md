@@ -205,6 +205,8 @@ Give me at most three decisions to make first.
 
 Start the console in another terminal and register that session as the commander from the sidebar's "変更" (change) button. A session can also write its own IDs to the board's `commander` field after reading them with `cmux identify --json --id-format both`.
 
+To write the board yourself instead, copy this repository's `docs/product-ops/board.example.yaml` to `docs/product-ops/board.yaml` in the target repository and start from there. Its contents are invented, so replace `items` with your own cards; the schema is documented in `skills/overlord-ops/references/board-schema.md`.
+
 For the repository's merge-method setting, see [Why merge commits](#why-merge-commits).
 
 ## Daily use
@@ -226,7 +228,7 @@ For the repository's merge-method setting, see [Why merge commits](#why-merge-co
 
 A squash merge creates one new commit on `main`. The original commits from the working branch never enter `main`'s history, so the merge base does not advance even though the content is identical. If the working branch then rewrites a line the squash commit also changed — or a line close enough to it — the next PR targeting `main` conflicts on that line. PR #10 conflicted this way and was resolved by hand.
 
-Squashing does not **always** cause a conflict. When both sides carry the same content, git resolves it. The conflict occurs when the working branch rewrites lines that overlap the squash commit's own changes; changes to distant lines in the same file still merge cleanly. Since files such as `.gitignore`, `console/src/board.ts`, and `docs/product-ops/board.yaml` are edited repeatedly, it recurs as long as squashing continues.
+Squashing does not **always** cause a conflict. When both sides carry the same content, git resolves it. The conflict occurs when the working branch rewrites lines that overlap the squash commit's own changes; changes to distant lines in the same file still merge cleanly. Since files such as `.gitignore`, `console/src/board.ts`, and `console/src/change.ts` are edited repeatedly, it recurs as long as squashing continues.
 
 With merge commits the merge base advances on every delivery, so the divergence never forms in the first place.
 

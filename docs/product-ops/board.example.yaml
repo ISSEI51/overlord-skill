@@ -1,0 +1,267 @@
+# Example board for Overlord.
+#
+# Two uses:
+#   1. A starting point when you would rather write the first board by hand
+#      than have the overlord-ops skill generate one.
+#   2. The demo board used to take the screenshots in docs/images
+#      (see docs/launch-demo.md).
+#
+# Every project, card, branch, pull request, and commit id below is invented.
+# `commander` is intentionally absent: it holds cmux session ids that are
+# local to one machine, and the console writes it for you when you register a
+# commander from the sidebar.
+#
+# To use this file as your own board:
+#   cp docs/product-ops/board.example.yaml docs/product-ops/board.yaml
+# then replace `items` with your own cards. The schema is documented in
+# skills/overlord-ops/references/board-schema.md.
+version: 1
+updated_at: "2026-08-28T09:00:00Z"
+decisions_required:
+  - id: "NOTE-009"
+    question: "NOTE-009 の実装ブリーフを承認し、実装を開始してよいか"
+  - "BILL-008 の完成を確認し、受け入れて完了にしてよいか"
+items:
+  - id: "NOTE-014"
+    project: "Notes App"
+    title: "オフラインで作成したメモが再接続後に重複する"
+    state: "inbox"
+    evidence: "利用者報告: 機内モードで作成したメモが、オンライン復帰後に同じ本文で2件表示された。発生条件と再現手順は未確認。"
+    owner: null
+    next_action: "再現手順を確定する"
+    blocker: null
+    updated_at: "2026-08-28T08:40:00Z"
+  - id: "BILL-021"
+    project: "Billing API"
+    title: "月末の請求書PDF生成がタイムアウトする"
+    state: "discovery"
+    priority:
+      impact: 4
+      urgency: 4
+      confidence: 3
+      ease: 2
+      override: null
+    evidence: |-
+      月末バッチのログに HTTP 504 が3件。いずれも明細500行以上の請求書で、499行以下の請求書は全件成功している。
+      所要時間の内訳はまだ測っていないため、PDF描画とデータ取得のどちらが支配的かは不明。
+    owner: "claude"
+    next_action: "失敗した3件の所要時間の内訳を測る"
+    blocker: null
+    updated_at: "2026-08-28T08:10:00Z"
+  - id: "NOTE-009"
+    project: "Notes App"
+    title: "検索結果の2ページ目で検索語が失われる"
+    state: "specified"
+    priority:
+      impact: 4
+      urgency: 3
+      confidence: 5
+      ease: 4
+      override: null
+    evidence: "ページネーションのリンクが検索語のクエリパラメータを引き継がないため、2ページ目を開くと全件一覧に戻る。3件の報告すべてで再現。"
+    acceptance_conditions:
+      - "2ページ目以降でも検索語が保持される"
+      - "検索語が空のときの一覧表示は変わらない"
+      - "ブラウザの戻る操作で直前の検索結果に戻る"
+    out_of_scope: "検索アルゴリズムの変更、検索条件の保存機能"
+    owner: "user"
+    next_action: "実装ブリーフを承認する"
+    blocker: null
+    updated_at: "2026-08-28T08:55:00Z"
+    brief: |-
+      変更範囲: 検索結果ページのページネーション部品と、その URL 生成関数のみ。
+      検索語は既にクエリパラメータとしてサーバーに渡っているため、リンク生成時に現在のクエリを引き継ぐだけで足りる。
+      検証: 検索語ありで2ページ目・3ページ目を開き、検索語が保持されることと件数が変わらないことを確認する。
+  - id: "BILL-013"
+    project: "Billing API"
+    title: "支払い失敗の理由を利用者に表示する"
+    state: "implementing"
+    priority:
+      impact: 4
+      urgency: 4
+      confidence: 4
+      ease: 3
+      override: null
+    evidence: |-
+      決済プロバイダから返るエラーコードをすべて HTTP 500 として扱っており、画面には「エラーが発生しました」としか出ない。
+      直近の問い合わせ12件のうち7件がこの経路で、うち5件は残高不足かカード期限切れだった。
+    acceptance_conditions:
+      - "カード拒否・残高不足・期限切れを利用者向けの文言で出し分ける"
+      - "再試行できる失敗と、できない失敗を区別して表示する"
+      - "プロバイダの生のエラーコードは画面に出さない"
+    out_of_scope: "決済プロバイダの追加、請求書レイアウトの変更"
+    owner: "claude"
+    next_action: "BILL-013-C2 の実装を進める"
+    blocker: null
+    changes:
+      - id: "BILL-013-C1"
+        title: "プロバイダのエラーコードを内部の失敗種別へ変換する"
+        state: "done"
+        agent: null
+        branch: "overlord/BILL-013-C1"
+        pr:
+          number: 12
+          url: "https://github.com/example/billing-api/pull/12"
+          state: "merged"
+          head_sha: "3f9c1ad7b2e04c85916d0f7a4c2b8e13d5a6079c"
+          reviewed_sha: "3f9c1ad"
+      - id: "BILL-013-C2"
+        title: "失敗種別ごとの文言と再試行可否を API 応答に載せる"
+        state: "implementing"
+        agent: null
+        branch: "overlord/BILL-013-C2"
+        pr: null
+      - id: "BILL-013-C3"
+        title: "支払い画面に失敗理由と次にとる操作を表示する"
+        state: "specified"
+        agent: null
+        branch: null
+        pr: null
+    updated_at: "2026-08-28T08:50:00Z"
+    brief: |-
+      失敗種別は decline / insufficient_funds / expired_card / provider_error の4つに閉じる。プロバイダ固有のコードは変換表で吸収し、その表だけをテスト対象にする。
+      再試行可否は失敗種別から導出し、API 応答の retryable フィールドで返す。画面側で分岐条件を持たない。
+  - id: "NOTE-022"
+    project: "Notes App"
+    title: "共有リンクを開いた相手にログインを求めない"
+    state: "reviewing"
+    priority:
+      impact: 4
+      urgency: 3
+      confidence: 4
+      ease: 3
+      override: null
+    evidence: "共有リンクの閲覧にもログイン済みセッションを要求しているため、リンクを受け取った側がログイン画面に遷移する。共有機能の利用が想定より少ない原因として最有力。"
+    acceptance_conditions:
+      - "共有リンクの閲覧にログインを求めない"
+      - "共有を解除したリンクは 404 を返す"
+      - "閲覧専用リンクから編集操作ができない"
+    out_of_scope: "共有リンクの有効期限設定、パスワード保護"
+    owner: "claude"
+    next_action: "独立レビューの指摘を反映する"
+    blocker: null
+    changes:
+      - id: "NOTE-022-C1"
+        title: "共有トークンによる匿名閲覧を許可する"
+        state: "done"
+        agent: null
+        branch: "overlord/NOTE-022-C1"
+        pr:
+          number: 18
+          url: "https://github.com/example/notes-app/pull/18"
+          state: "merged"
+          head_sha: "b04e7c25d1983af6027e5b4c8d1f60a93e2b7c48"
+          reviewed_sha: "b04e7c2"
+      - id: "NOTE-022-C2"
+        title: "共有解除の反映と編集操作の遮断"
+        state: "reviewing"
+        agent: null
+        branch: "overlord/NOTE-022-C2"
+        pr:
+          number: 21
+          url: "https://github.com/example/notes-app/pull/21"
+          state: "open"
+          head_sha: "5d2a908e14bc7f3069a5e8d240c1b7f6a3809e52"
+          reviewed_sha: null
+    updated_at: "2026-08-28T08:35:00Z"
+  - id: "BILL-008"
+    project: "Billing API"
+    title: "請求先メールアドレスの変更が次回の請求書に反映されない"
+    state: "acceptance"
+    priority:
+      impact: 5
+      urgency: 4
+      confidence: 5
+      ease: 4
+      override: null
+    evidence: |-
+      設定画面で請求先メールを変更しても、次回の請求書が変更前の宛先に送られる。報告4件。
+      原因: 請求書生成が顧客レコードではなく、契約作成時点のスナップショットの宛先を参照していた。
+    acceptance_conditions:
+      - "変更後に発行した請求書が新しい宛先に届く"
+      - "発行済みの請求書の宛先は変更されない"
+      - "宛先の変更が監査ログに残る"
+    out_of_scope: "請求先メールの複数登録、宛先ごとの言語設定"
+    owner: "user"
+    next_action: "内容を確認して受け入れる"
+    blocker: null
+    changes:
+      - id: "BILL-008-C1"
+        title: "請求書生成の宛先参照を顧客レコードへ切り替える"
+        state: "done"
+        agent: null
+        branch: "overlord/BILL-008-C1"
+        pr:
+          number: 24
+          url: "https://github.com/example/billing-api/pull/24"
+          state: "merged"
+          head_sha: "7ac31be05f2d94861073ce5a20b9d84f6e137ac2"
+          reviewed_sha: "7ac31be"
+      - id: "BILL-008-C2"
+        title: "宛先変更の監査ログを記録する"
+        state: "done"
+        agent: null
+        branch: "overlord/BILL-008-C2"
+        pr:
+          number: 26
+          url: "https://github.com/example/billing-api/pull/26"
+          state: "merged"
+          head_sha: "e18d40b7c952a6f3018b4d7e2c095a6f18d3b402"
+          reviewed_sha: "e18d40b"
+    updated_at: "2026-08-28T08:58:00Z"
+    brief: |-
+      宛先の解決を1か所（請求書生成時の顧客参照）に集約する。スナップショットは金額と明細のためだけに残し、宛先は含めない。
+      発行済み請求書の宛先を変えないため、送信履歴には送信時点の宛先を記録する。
+    review: |-
+      実装したサブエージェントとは別のサブエージェントが確認した。受け入れ条件3件をいずれも実データで再現。
+      宛先変更 → 請求書発行の順で実行し、新しい宛先に届くことを確認。発行済み1件の宛先が変わらないことも確認。
+      監査ログには変更前後の宛先と実行者が記録される。ブロッキングの指摘なし。
+  - id: "NOTE-003"
+    project: "Notes App"
+    title: "自動保存が入力していない間も3秒ごとに走り続ける"
+    state: "done"
+    priority:
+      impact: 3
+      urgency: 2
+      confidence: 5
+      ease: 5
+      override: null
+    evidence: "編集画面を開いたままにすると、変更がなくても3秒ごとに保存要求が飛ぶ。1セッションあたり平均420件の無駄な書き込みを確認。"
+    acceptance_conditions:
+      - "変更がないときは保存要求を送らない"
+      - "変更後の保存は従来どおり3秒以内に完了する"
+    out_of_scope: "保存間隔の設定機能"
+    owner: null
+    next_action: null
+    blocker: null
+    changes:
+      - id: "NOTE-003-C1"
+        title: "本文が変化したときだけ保存要求を送る"
+        state: "done"
+        agent: null
+        branch: "overlord/NOTE-003-C1"
+        pr:
+          number: 7
+          url: "https://github.com/example/notes-app/pull/7"
+          state: "merged"
+          head_sha: "2c6f815a9e0d34b7f18a205c6d9e3b41708fa2c9"
+          reviewed_sha: "2c6f815"
+    updated_at: "2026-08-27T10:20:00Z"
+    review: |-
+      別のサブエージェントが確認。編集画面を10分開いたままにして保存要求が0件であること、1文字入力後は3秒以内に1件だけ送られることを確認した。
+  - id: "BILL-005"
+    project: "Billing API"
+    title: "税率の切り替え日を国ごとに設定できるようにする"
+    state: "blocked"
+    priority:
+      impact: 3
+      urgency: 2
+      confidence: 3
+      ease: 2
+      override: null
+    evidence: "現在の税率は単一の値で、切り替え日を持たない。対象国が増えると請求金額の誤りにつながる。"
+    out_of_scope: "税額の申告書出力"
+    owner: "user"
+    next_action: "対象国と適用開始日の一覧を確定する"
+    blocker: "対象国と適用開始日が未確定。利用者の回答待ちのため実装に入れない。"
+    updated_at: "2026-08-26T07:15:00Z"
