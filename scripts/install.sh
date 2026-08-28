@@ -7,7 +7,8 @@ if [[ $# -ne 1 ]]; then
 fi
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source_dir="$(cd "$script_dir/.." && pwd)/skills"
+overlord_root="$(cd "$script_dir/.." && pwd)"
+source_dir="$overlord_root/skills"
 
 case "$1" in
   claude)
@@ -35,5 +36,12 @@ for skill_dir in "$source_dir"/*; do
     exit 1
   fi
   cp -R "$skill_dir" "$target"
+  # インストールされたスキルは scripts/ も console/ も持たないので、
+  # Overlord チェックアウトの絶対パスを各スキル配下に記録しておく。
+  # スキルからは次のように呼ぶ:
+  #   "$(cat <skill-dir>/overlord-checkout)/scripts/console.sh" ensure <project>
+  printf '%s\n' "$overlord_root" > "$target/overlord-checkout"
   echo "Installed $skill_name -> $target"
 done
+
+echo "Recorded overlord checkout: $overlord_root"
