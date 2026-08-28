@@ -128,6 +128,8 @@ Give me at most three decisions to make first.
 
 Start the console in another terminal and register that Claude Code session as the commander from the sidebar's "change" button (or let the session register itself via `cmux identify --json`).
 
+For the repository's merge-method setting, see [Why merge commits](#why-merge-commits).
+
 ## Daily use
 
 1. **Capture observations**: "Add an observation" in the top bar, or "capture an observation" in the sidebar
@@ -145,11 +147,13 @@ Start the console in another terminal and register that Claude Code session as t
 
 ### Why merge commits
 
-A squash merge creates one new commit on `main`. The original commits from the working branch never enter `main`'s history, so the merge base does not advance even though the content is identical. If the working branch then changes a region that the squash commit also changed, the next PR targeting `main` conflicts. PR #10 conflicted this way and was resolved by hand.
+A squash merge creates one new commit on `main`. The original commits from the working branch never enter `main`'s history, so the merge base does not advance even though the content is identical. If the working branch then rewrites a line the squash commit also changed — or a line close enough to it — the next PR targeting `main` conflicts on that line. PR #10 conflicted this way and was resolved by hand.
 
-Squashing does not **always** cause a conflict. When both sides carry the same content, git resolves it. The conflict occurs when the working branch rewrites a region the squash commit touched. Since `.gitignore`, `console/src/board.ts`, and `docs/product-ops/board.yaml` are edited repeatedly, it recurs as long as squashing continues.
+Squashing does not **always** cause a conflict. When both sides carry the same content, git resolves it. The conflict occurs when the working branch rewrites lines that overlap the squash commit's own changes; changes to distant lines in the same file still merge cleanly. Since files such as `.gitignore`, `console/src/board.ts`, and `docs/product-ops/board.yaml` are edited repeatedly, it recurs as long as squashing continues.
 
 With merge commits the merge base advances on every delivery, so the divergence never forms in the first place.
+
+PR #10 was itself squash-merged, so the divergence is still present. Merging the next PR targeting `main` with a merge commit clears it.
 
 This rule is about PRs targeting `main`. Change-level PRs target the working branch and are out of scope here.
 
@@ -165,4 +169,4 @@ To allow merge commits only, either use the checkboxes under Settings > General 
 gh repo edit --enable-merge-commit=true --enable-squash-merge=false --enable-rebase-merge=false
 ```
 
-Use the same setting when you start using Overlord in a new repository.
+This is a per-repository setting you apply by hand. Until you do, keep the rule by choosing the merge-commit option on the merge screen. Use the same setting when you start using Overlord in a new repository.
