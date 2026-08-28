@@ -60,6 +60,8 @@ Use ISO 8601 timestamps in UTC. Do not store credentials, user code, full logs, 
 
 `commander` is the single cmux session the user talks to in Overlord Console. It is optional and holds cmux UUIDs. See [the console reference](console.md).
 
+`project` names the product a card belongs to. Overlord Console shows it as a tag on the card and in the card detail header. The server writes it: `POST /api/items` takes the board's project when the board names exactly one and leaves it null when the board names none or more than one, so the "気づきを追加" dialog does not ask for it. A card id never encodes the project; a new id follows the prefix the board's other cards already use. Correct either afterwards with `PATCH /api/items/<id>` or by editing this file.
+
 `changes` is the engineering split of one card, in dependency order. A card is a product outcome and a change is one delivery unit: 1 change = 1 worktree = 1 branch = 1 pull request = 1 agent execution unit. Splitting work into changes never adds cards to the kanban, and the console shows changes read-only inside the card.
 
 | Field | Meaning |

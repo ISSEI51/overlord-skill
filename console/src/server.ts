@@ -290,12 +290,15 @@ async function deleteItem(request: Request, id: string): Promise<Response> {
  * did before. A caller that does send `rev` gets the same 409 as the other
  * write endpoints. Either way the write runs through the serialized board
  * write path, so a concurrent edit is no longer overwritten wholesale.
+ *
+ * `project` is not part of the payload: the server derives it from the board
+ * (see `inheritedProject`), and `PATCH /api/items/:id` sets it for the cases
+ * that cannot be derived.
  */
 async function createItem(request: Request): Promise<Response> {
   const payload = await body<{
     rev?: string;
     title?: string;
-    project?: string;
     state?: State;
     evidence?: string;
   }>(request);
@@ -307,8 +310,8 @@ async function createItem(request: Request): Promise<Response> {
       payload.rev,
       (board) => {
         const item = canonicalItem({
-          id: nextId(board, payload.project),
-          project: payload.project ?? null,
+          id: nextId(board),
+          project: inheritedProject(board),
           title,
           state:
             payload.state && STATES.includes(payload.state) ? payload.state : "inbox",
@@ -329,14 +332,57 @@ async function createItem(request: Request): Promise<Response> {
   }
 }
 
-function nextId(board: Board, project?: string): string {
-  const prefix = (project ?? "OV").replace(/[^A-Za-z0-9]/g, "").slice(0, 4).toUpperCase() || "OV";
+/**
+ * Id for a new card: the prefix the board already uses, one past the highest
+ * number on it.
+ *
+ * The prefix used to be built from the request's `project`, so a card created
+ * with project "Overlord" landed as `OVER-111` on a board of `OV-` cards, and
+ * nothing on screen said so. No field of a create request selects it now.
+ */
+function nextId(board: Board): string {
   let max = 0;
   for (const item of board.items) {
     const match = item.id.match(/(\d+)\s*$/);
     if (match) max = Math.max(max, Number(match[1]));
   }
-  return `${prefix}-${String(max + 1).padStart(3, "0")}`;
+  return `${idPrefix(board)}-${String(max + 1).padStart(3, "0")}`;
+}
+
+/** The prefix most card ids on the board use; `OV` when the board has none. */
+function idPrefix(board: Board): string {
+  const counts = new Map<string, number>();
+  for (const item of board.items) {
+    const match = item.id.match(/^([A-Za-z][A-Za-z0-9-]*)-\d+\s*$/);
+    if (match) counts.set(match[1]!, (counts.get(match[1]!) ?? 0) + 1);
+  }
+  let prefix = "OV";
+  let best = 0;
+  for (const [candidate, count] of counts) {
+    if (count > best) {
+      prefix = candidate;
+      best = count;
+    }
+  }
+  return prefix;
+}
+
+/**
+ * `project` for a new card, decided from the board instead of asked for.
+ *
+ * A board that names exactly one project gives every new card that project; a
+ * board that mixes projects, or names none, leaves it null because there is
+ * nothing to infer. `PATCH /api/items/:id` still writes `project`, so the
+ * mixed-board case stays reachable.
+ */
+function inheritedProject(board: Board): string | null {
+  const projects = new Set<string>();
+  for (const item of board.items) {
+    if (typeof item.project === "string" && item.project !== "") {
+      projects.add(item.project);
+    }
+  }
+  return projects.size === 1 ? [...projects][0]! : null;
 }
 
 /**
