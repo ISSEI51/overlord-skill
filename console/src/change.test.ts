@@ -1856,6 +1856,121 @@ async function advanceBase(
   await gitIn(["checkout", "--quiet", "feature"], root);
 }
 
+/**
+ * Merge `feature` into `main` with `--no-ff` and push it, so `origin/main` is
+ * ahead of `feature` by the merge commit while the two trees stay identical —
+ * a card whose work already landed, on a branch nobody deleted yet.
+ *
+ * Leaves `feature` checked out, which is where `deliveryRepo` left the
+ * repository.
+ */
+async function mergeHeadIntoBase(root: string): Promise<void> {
+  await gitIn(["checkout", "--quiet", "main"], root);
+  await gitIn(
+    ["merge", "--quiet", "--no-ff", "-m", "merge feature", "feature"],
+    root,
+  );
+  await gitIn(["push", "--quiet", "origin", "main"], root);
+  await gitIn(["checkout", "--quiet", "feature"], root);
+}
+
+/**
+ * Add a branch with a history of its own — a root commit with an empty tree,
+ * built with plumbing so the working tree is left alone — and push it, so
+ * `origin/<name>` shares no commit with `feature`.
+ *
+ * This is what a `--base` naming another repository's branch looks like, and
+ * the one way a delivery can make `git merge-tree` refuse the merge outright.
+ */
+async function unrelatedBase(root: string, name: string): Promise<void> {
+  const tree = await gitIn(["hash-object", "-w", "-t", "tree", "/dev/null"], root);
+  const commit = await gitIn(["commit-tree", tree, "-m", "unrelated root"], root);
+  await gitIn(["branch", name, commit], root);
+  await gitIn(["push", "--quiet", "origin", name], root);
+}
+
+/**
+ * Commit `count` files on `feature`, then a different version of each of them
+ * on `main`, so merging the two conflicts in every one of them.
+ *
+ * The names are zero-padded so their lexical order — the order
+ * `git merge-tree --name-only` prints them in — is their numeric order.
+ */
+async function conflictingFiles(root: string, count: number): Promise<string[]> {
+  const paths = Array.from(
+    { length: count },
+    (_, index) => `conflict-${String(index + 1).padStart(2, "0")}.txt`,
+  );
+  for (const path of paths) await Bun.write(join(root, path), "from the card\n");
+  await gitIn(["add", "-A"], root);
+  await gitIn(["commit", "--quiet", "-m", "the card writes every file"], root);
+
+  await gitIn(["checkout", "--quiet", "main"], root);
+  for (const path of paths) await Bun.write(join(root, path), "from main\n");
+  await gitIn(["add", "-A"], root);
+  await gitIn(["commit", "--quiet", "-m", "main writes every file"], root);
+  await gitIn(["push", "--quiet", "origin", "main"], root);
+  await gitIn(["checkout", "--quiet", "feature"], root);
+  return paths;
+}
+
+/**
+ * A `git` on PATH that answers any invocation carrying `subcommand` from a
+ * canned exit code and canned streams, and hands every other invocation to the
+ * real `git`.
+ *
+ * `git merge-tree` reports a conflict with exit 1 and the merged tree on
+ * stdout, and reports a merge it could not attempt with exit 1 as well when a
+ * ref does not resolve, so the exit code alone cannot separate the two and
+ * `baseGapWarnings` reads stdout instead. That combination — exit 1 with
+ * nothing on stdout — cannot be built out of a repository on the delivery path,
+ * because a ref the delivery already diffed against resolves for `merge-tree`
+ * too, so it is injected here.
+ */
+async function gitStub(
+  subcommand: string,
+  answer: { code: number; stdout?: string; stderr?: string },
+): Promise<{ dir: string }> {
+  const dir = await scratch();
+  const real = await shell(["/bin/sh", "-c", "command -v git"], dir);
+  // The streams go through files rather than through the script, so what the
+  // stub writes is byte for byte what the test asked for.
+  const out = join(dir, "stdout");
+  const err = join(dir, "stderr");
+  await Bun.write(out, answer.stdout ?? "");
+  await Bun.write(err, answer.stderr ?? "");
+  const script = [
+    "#!/bin/sh",
+    'for argument in "$@"; do',
+    `  if [ "$argument" = ${JSON.stringify(subcommand)} ]; then`,
+    `    cat ${JSON.stringify(out)}`,
+    `    cat ${JSON.stringify(err)} >&2`,
+    `    exit ${answer.code}`,
+    "  fi",
+    "done",
+    `exec ${JSON.stringify(real)} "$@"`,
+    "",
+  ].join("\n");
+  const executable = join(dir, "git");
+  await Bun.write(executable, script);
+  chmodSync(executable, 0o755);
+  return { dir };
+}
+
+/** Run `body` with `stub` first on PATH, so its `git` shadows the real one. */
+async function withGitStub<T>(
+  stub: { dir: string },
+  body: () => Promise<T>,
+): Promise<T> {
+  const previous = process.env.PATH;
+  process.env.PATH = `${stub.dir}:${previous ?? ""}`;
+  try {
+    return await body();
+  } finally {
+    process.env.PATH = previous ?? "";
+  }
+}
+
 /** US, the ASCII unit separator: what the `gh` stub joins its argv with. */
 const ARG_SEPARATOR = "\u001f";
 
@@ -2305,7 +2420,7 @@ describe("deliverCard", () => {
     // The changes and the other card are untouched by the delivery.
     expect(findChange(after.board, "OV-500-C1")!.change).toEqual(MERGED_CHANGE);
     expect(after.board.items[1]!.delivery).toBeUndefined();
-  });
+  }, 20_000);
 
   test("(a) the head defaults to the current branch of the main checkout", async () => {
     const repo = await deliveryRepo();
@@ -2325,7 +2440,7 @@ describe("deliverCard", () => {
     expect((await loadBoard(boardPath)).board.items[0]!.delivery!.branch).toBe(
       "feature",
     );
-  });
+  }, 20_000);
 
   test("(b) an open pull request is edited, never created, and keeps its title", async () => {
     const repo = await deliveryRepo();
@@ -2367,7 +2482,7 @@ describe("deliverCard", () => {
     expect((await loadBoard(boardPath)).board.items[0]!.delivery!.pr!.number).toBe(
       99,
     );
-  });
+  }, 20_000);
 
   test("(c) a card with an unmerged change is blocked, and nothing is created or written", async () => {
     const repo = await deliveryRepo();
@@ -2404,7 +2519,7 @@ describe("deliverCard", () => {
         .code,
     ).not.toBe(0);
     expect(await Bun.file(boardPath).text()).toBe(before);
-  });
+  }, 20_000);
 
   test("(d) a change the synchronization finds merged does not block the delivery", async () => {
     const repo = await deliveryRepo();
@@ -2432,7 +2547,7 @@ describe("deliverCard", () => {
     expect(change.state).toBe("done");
     expect(change.pr!.state).toBe("merged");
     expect(after.board.items[0]!.delivery!.pr!.number).toBe(99);
-  });
+  }, 20_000);
 
   test("(e) a head with nothing to propose is skipped without calling gh", async () => {
     const repo = await deliveryRepo();
@@ -2452,7 +2567,7 @@ describe("deliverCard", () => {
     expect(outcome.warnings).toEqual([]);
     expect(await ghCalls(stub)).toEqual([]);
     expect(await Bun.file(boardPath).text()).toBe(before);
-  });
+  }, 20_000);
 
   test("(e) delivering the base branch into itself is skipped", async () => {
     const repo = await deliveryRepo();
@@ -2468,7 +2583,7 @@ describe("deliverCard", () => {
     expect(outcome.status).toBe("skipped");
     expect(outcome.reason).toBe("same-branch");
     expect(await ghCalls(stub)).toEqual([]);
-  });
+  }, 20_000);
 
   test("(f) a pull request on another head branch fails and the board is untouched", async () => {
     const repo = await deliveryRepo();
@@ -2490,7 +2605,7 @@ describe("deliverCard", () => {
     expect(outcome.reason).toContain('not "feature" -> "main"');
     expect(outcome.pr).toBeUndefined();
     expect(await Bun.file(boardPath).text()).toBe(before);
-  });
+  }, 20_000);
 
   test("(f) a pull request against another base fails and the board is untouched", async () => {
     const repo = await deliveryRepo();
@@ -2510,7 +2625,7 @@ describe("deliverCard", () => {
     expect(outcome.status).toBe("failed");
     expect(outcome.reason).toContain('"feature" -> "some-release"');
     expect(await Bun.file(boardPath).text()).toBe(before);
-  });
+  }, 20_000);
 
   test("(g) a base the head does not contain is warned about, and the delivery completes", async () => {
     const repo = await deliveryRepo();
@@ -2544,7 +2659,7 @@ describe("deliverCard", () => {
       (await git(["merge-base", "--is-ancestor", "origin/main", "feature"], repo.root))
         .code,
     ).toBe(1);
-  });
+  }, 20_000);
 
   test("(g) a base that conflicts with the head is reported as a conflict too", async () => {
     const repo = await deliveryRepo();
@@ -2575,7 +2690,7 @@ describe("deliverCard", () => {
     expect((await loadBoard(boardPath)).board.items[0]!.delivery!.pr!.number).toBe(
       99,
     );
-  });
+  }, 20_000);
 
   test("(g) a base the head already contains is not warned about", async () => {
     const repo = await deliveryRepo();
@@ -2600,7 +2715,134 @@ describe("deliverCard", () => {
 
     expect(outcome.status).toBe("created");
     expect(outcome.warnings).toEqual([]);
-  });
+  }, 20_000);
+
+  test("(g) a base with a history of its own is reported as a merge that could not be attempted", async () => {
+    const repo = await deliveryRepo();
+    await unrelatedBase(repo.root, "unrelated");
+    const boardPath = await writeDeliveryBoard([MERGED_CHANGE]);
+    const stub = await deliverGhStub({
+      "view-50.json": VIEW_50_UNCHANGED,
+      "pr-list.json": [],
+      "pr-create.txt": "created\n",
+      "view-feature.json": { ...DELIVERY_VIEW, baseRefName: "unrelated" },
+    });
+
+    const outcome = await withGhStub(stub, () =>
+      deliverCard({
+        boardPath,
+        cardId: "OV-500",
+        cwd: repo.root,
+        head: "feature",
+        base: "unrelated",
+      }),
+    );
+
+    // `git merge-tree` refuses two histories with no commit in common, so
+    // whether they conflict was never decided and the warning says so instead
+    // of claiming a clean merge.
+    expect(outcome.warnings).toEqual([
+      "origin/unrelated has 1 commit not in feature; this delivery does not " +
+        "merge origin/unrelated into feature",
+      "git merge-tree --write-tree origin/unrelated feature failed, so whether " +
+        "those commits conflict is unknown: " +
+        "fatal: refusing to merge unrelated histories",
+    ]);
+    // Not knowing does not stop the delivery either.
+    expect(outcome.status).toBe("created");
+    expect((await loadBoard(boardPath)).board.items[0]!.delivery!.pr!.number).toBe(
+      99,
+    );
+  }, 20_000);
+
+  test("(g) a merge-tree that exits like a conflict with nothing on stdout is still a failure", async () => {
+    const repo = await deliveryRepo();
+    await advanceBase(repo.root, "release.txt", "shipped\n");
+    const boardPath = await writeDeliveryBoard([MERGED_CHANGE]);
+    const stub = await deliverGhStub({
+      "view-50.json": VIEW_50_UNCHANGED,
+      "pr-list.json": [],
+      "pr-create.txt": "created\n",
+      "view-feature.json": DELIVERY_VIEW,
+    });
+    // Exit 1 is what a conflict exits with too, so only the empty stdout
+    // separates this from one.
+    const failingMergeTree = await gitStub("merge-tree", {
+      code: 1,
+      stderr: "merge-tree: origin/main - not something we can merge\n",
+    });
+
+    const outcome = await withGitStub(failingMergeTree, () =>
+      withGhStub(stub, () =>
+        deliverCard({ boardPath, cardId: "OV-500", cwd: repo.root, head: "feature" }),
+      ),
+    );
+
+    // Read as the failure it is, and never as a conflict in no files.
+    expect(outcome.warnings).toEqual([
+      "origin/main has 1 commit not in feature; this delivery does not merge " +
+        "origin/main into feature",
+      "git merge-tree --write-tree origin/main feature failed, so whether " +
+        "those commits conflict is unknown: " +
+        "merge-tree: origin/main - not something we can merge",
+    ]);
+    expect(outcome.status).toBe("created");
+  }, 20_000);
+
+  test("(g) a conflict in more files than fit names the first few and counts the rest", async () => {
+    const repo = await deliveryRepo();
+    const paths = await conflictingFiles(repo.root, 7);
+    const boardPath = await writeDeliveryBoard([MERGED_CHANGE]);
+    const stub = await deliverGhStub({
+      "view-50.json": VIEW_50_UNCHANGED,
+      "pr-list.json": [],
+      "pr-create.txt": "created\n",
+      "view-feature.json": DELIVERY_VIEW,
+    });
+
+    const outcome = await withGhStub(stub, () =>
+      deliverCard({ boardPath, cardId: "OV-500", cwd: repo.root, head: "feature" }),
+    );
+
+    // The total is on the same line, so the list stops at five paths rather
+    // than growing with the size of the conflict.
+    expect(outcome.warnings[1]).toBe(
+      `merging origin/main into feature conflicts in 7 files: ` +
+        `${paths.slice(0, 5).join(", ")}, and 2 more`,
+    );
+    expect(outcome.status).toBe("created");
+  }, 20_000);
+
+  test("(g) a base ahead of a head it already holds every change of is skipped, and warned about not at all", async () => {
+    const repo = await deliveryRepo();
+    await mergeHeadIntoBase(repo.root);
+    // No change carries a pull request, so nothing is synchronized and any
+    // `gh` call would be this delivery's own.
+    const boardPath = await writeDeliveryBoard([
+      { id: "OV-500-C1", title: "Merged by hand", state: "done", pr: null },
+    ]);
+    const before = await Bun.file(boardPath).text();
+    const stub = await deliverGhStub({});
+
+    // `origin/main` really is ahead of `feature`, by the merge commit: asked
+    // about, it would produce a warning.
+    expect(
+      (await git(["merge-base", "--is-ancestor", "origin/main", "feature"], repo.root))
+        .code,
+    ).toBe(1);
+
+    const outcome = await withGhStub(stub, () =>
+      deliverCard({ boardPath, cardId: "OV-500", cwd: repo.root, head: "feature" }),
+    );
+
+    // There is nothing to propose, so the base is never asked about: a card
+    // whose work already landed is reported as skipped and nothing else.
+    expect(outcome.status).toBe("skipped");
+    expect(outcome.reason).toBe("no-diff");
+    expect(outcome.warnings).toEqual([]);
+    expect(await ghCalls(stub)).toEqual([]);
+    expect(await Bun.file(boardPath).text()).toBe(before);
+  }, 20_000);
 
   test("writes nothing to stdout or stderr, on either the delivered or the blocked path", async () => {
     const repo = await deliveryRepo();
@@ -2633,7 +2875,7 @@ describe("deliverCard", () => {
     expect(statuses).toEqual(["created", "blocked"]);
     expect(stdout).toBe("");
     expect(stderr).toBe("");
-  });
+  }, 20_000);
 
   test("a pull request that could not be read is a warning, and the card stays blocked", async () => {
     const repo = await deliveryRepo();
@@ -2652,7 +2894,7 @@ describe("deliverCard", () => {
     );
     expect(outcome.unmerged).toEqual(["OV-500-C2  The open change"]);
     expect(await Bun.file(boardPath).text()).toBe(before);
-  });
+  }, 20_000);
 
   test("a detached HEAD fails before anything is pushed or written", async () => {
     const repo = await deliveryRepo();
@@ -2671,7 +2913,7 @@ describe("deliverCard", () => {
     expect(outcome.reason).toContain("detached HEAD");
     expect(await ghCalls(stub)).toEqual([]);
     expect(await Bun.file(boardPath).text()).toBe(before);
-  });
+  }, 20_000);
 
   test("an unknown card id fails without touching the repository", async () => {
     const repo = await deliveryRepo();
@@ -2687,7 +2929,7 @@ describe("deliverCard", () => {
     expect(outcome.reason).toContain("unknown card id: OV-999");
     expect(await ghCalls(stub)).toEqual([]);
     expect(await Bun.file(boardPath).text()).toBe(before);
-  });
+  }, 20_000);
 
   test("the base falls back to the GitHub default branch when origin/HEAD is unset", async () => {
     const repo = await deliveryRepo();
@@ -2712,7 +2954,7 @@ describe("deliverCard", () => {
     const calls = await ghCalls(stub);
     expect(calls[1]).toEqual(["repo", "view", "--json", "defaultBranchRef"]);
     expect((await loadBoard(boardPath)).board.items[0]!.delivery!.base).toBe("main");
-  });
+  }, 20_000);
 });
 
 describe("deliver", () => {
@@ -2735,7 +2977,7 @@ describe("deliver", () => {
     const { code, stderr } = await captureStderr(() => deliver([]));
     expect(code).toBe(2);
     expect(stderr).toContain("usage: change deliver <card-id>");
-  });
+  }, 20_000);
 
   test("a delivered card is reported and exits 0", async () => {
     const repo = await deliveryRepo();
@@ -2762,7 +3004,7 @@ describe("deliver", () => {
     expect(stdout.trimEnd().split("\n").at(-1)).toBe(
       "https://github.com/o/r/pull/99",
     );
-  });
+  }, 20_000);
 
   test("a blocked card names the unmerged changes and exits 1", async () => {
     const repo = await deliveryRepo();
@@ -2784,7 +3026,7 @@ describe("deliver", () => {
     expect(stdout).not.toContain("board updated");
     expect(stderr).toContain("not merged:       OV-500-C2  The open change");
     expect(await Bun.file(boardPath).text()).toBe(before);
-  });
+  }, 20_000);
 
   test("a base the head does not contain is warned about on stderr and still exits 0", async () => {
     const repo = await deliveryRepo();
@@ -2811,7 +3053,7 @@ describe("deliver", () => {
     );
     expect(stdout).toContain("delivery:         created");
     expect(stdout).toContain("pull request:     #99 (open)");
-  });
+  }, 20_000);
 
   test("a skipped run reports why and still exits 0", async () => {
     const repo = await deliveryRepo();
@@ -2830,5 +3072,5 @@ describe("deliver", () => {
     expect(code).toBe(0);
     expect(stdout).toContain("delivery:         skipped");
     expect(stdout).toContain("reason:           no-diff");
-  });
+  }, 20_000);
 });

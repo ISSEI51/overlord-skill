@@ -1534,8 +1534,8 @@ export async function deliverCard(
   const fetched = await git(["fetch", "origin", base], root, timeoutMs);
   if (fetched.code !== 0) {
     warnings.push(
-      `git fetch origin ${base} failed; comparing against the local ref: ` +
-        failureMessage(fetched),
+      `git fetch origin ${base} failed; comparing against the ref already ` +
+        `in this repository: ${failureMessage(fetched)}`,
     );
   }
 
@@ -1825,6 +1825,16 @@ async function syncCardChanges(
 }
 
 /**
+ * How many conflicted paths the conflict warning names before it stops and
+ * counts the rest.
+ *
+ * The warning already carries the total, so the list only has to say where the
+ * conflict is. Five paths keep the line about as long as the other warnings
+ * even when the paths are long, and the full list is one `git merge-tree` away.
+ */
+const MAX_NAMED_CONFLICT_PATHS = 5;
+
+/**
  * Report the commits `base` holds that `head` does not, and whether they
  * conflict, as warnings.
  *
@@ -1847,7 +1857,9 @@ async function syncCardChanges(
  * Neither answer stops the delivery: the pull request is where the base and
  * the head meet, and GitHub reports the same conflict on it. A base that
  * merges cleanly needs no second warning, so only a conflict, or a merge that
- * could not be attempted, adds one.
+ * could not be attempted, adds one. A conflict names at most
+ * `MAX_NAMED_CONFLICT_PATHS` paths and counts the rest, so a wide conflict
+ * cannot turn one warning into a line thousands of characters long.
  *
  * `base` is the ref the delivery diffed against, so on the usual path this
  * compares against the `origin/<base>` that step 4 just fetched rather than a
@@ -1868,7 +1880,7 @@ async function baseGapWarnings(
   if (ancestor.code !== 1) {
     return [
       `git merge-base --is-ancestor ${base} ${head} failed, so whether ` +
-        `${base} has commits ${head} does not is unknown: ` +
+        `${base} has commits that ${head} does not have is unknown: ` +
         failureMessage(ancestor),
     ];
   }
@@ -1909,10 +1921,13 @@ async function baseGapWarnings(
     if (!line) break;
     paths.push(line);
   }
+  const rest = paths.length - MAX_NAMED_CONFLICT_PATHS;
   warnings.push(
     paths.length > 0
       ? `merging ${base} into ${head} conflicts in ${paths.length} ` +
-          `file${paths.length === 1 ? "" : "s"}: ${paths.join(", ")}`
+          `file${paths.length === 1 ? "" : "s"}: ` +
+          paths.slice(0, MAX_NAMED_CONFLICT_PATHS).join(", ") +
+          (rest > 0 ? `, and ${rest} more` : "")
       : `merging ${base} into ${head} conflicts`,
   );
   return warnings;
