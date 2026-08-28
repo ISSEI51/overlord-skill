@@ -6,7 +6,7 @@
  * concurrent writes by an agent through a revision token.
  */
 
-import { mkdir, rename, stat, writeFile } from "node:fs/promises";
+import { mkdir, open, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, resolve, sep } from "node:path";
 
 export const STATES = [
@@ -208,13 +208,39 @@ export async function loadBoard(path: string): Promise<LoadedBoard> {
   return { board, rev, exists: true };
 }
 
+/**
+ * Counter that makes the temporary file name unique inside this process.
+ * The pid alone is not enough: two overlapping writes in one process would
+ * still collide on the same name.
+ */
+let tempWriteCounter = 0;
+
+/**
+ * Write the board through a temporary file and an atomic rename.
+ *
+ * The temporary file name carries the pid and a per-call counter. It used to
+ * be the fixed `<path>.overlord-tmp`, which two processes writing at the same
+ * time both created and both renamed: 92-97% of concurrent write pairs had one
+ * side fail with `rename ENOENT` (its temp file had already been renamed away
+ * by the other process), and one measured run left board.yaml itself
+ * truncated and NUL-padded, after which `Bun.YAML.parse` failed and every
+ * server write answered 500 until the file was repaired by hand.
+ *
+ * A failed write removes its own temporary file, so a full disk or a
+ * permission error does not leave `<path>.overlord-tmp.<pid>.<n>` behind.
+ */
 export async function saveBoard(path: string, board: Board): Promise<string> {
   board.updated_at = nowIso();
   const text = toBlockYaml(orderKeys(board as Json, BOARD_KEY_ORDER));
   await mkdir(dirname(path), { recursive: true });
-  const temp = `${path}.overlord-tmp`;
-  await writeFile(temp, text, "utf8");
-  await rename(temp, path);
+  const temp = `${path}.overlord-tmp.${process.pid}.${(tempWriteCounter++).toString(36)}`;
+  try {
+    await writeFile(temp, text, "utf8");
+    await rename(temp, path);
+  } catch (error) {
+    await rm(temp, { force: true }).catch(noop);
+    throw error;
+  }
   return revisionOf(path);
 }
 
@@ -235,6 +261,129 @@ export class BoardConflictError extends Error {
 }
 
 /**
+ * Raised when the board lock could not be taken within
+ * `boardLock.acquireTimeoutMs`. It is a `BoardConflictError`, so the console
+ * server answers 409 for it exactly as it does for a stale revision, and the
+ * CLI exits non-zero; the `rev` it carries is the revision on disk at the
+ * moment the attempt was abandoned.
+ */
+export class BoardLockError extends BoardConflictError {
+  readonly lockPath: string;
+
+  constructor(rev: string, lockPath: string) {
+    super(rev);
+    this.name = "BoardLockError";
+    this.message = `board is locked by another process: ${lockPath}`;
+    this.lockPath = lockPath;
+  }
+}
+
+/**
+ * Lock timings. Mutable so a test can shorten them; production code never
+ * writes to this object.
+ *
+ * `acquireTimeoutMs` is how long a writer waits for the lock before it gives
+ * up and reports a conflict. `staleAfterMs` is how old a lock file's mtime
+ * has to be before it is treated as left behind by a process that died
+ * without releasing it.
+ */
+export const boardLock = {
+  acquireTimeoutMs: 5_000,
+  staleAfterMs: 30_000,
+};
+
+const LOCK_RETRY_MIN_MS = 2;
+const LOCK_RETRY_MAX_MS = 25;
+
+export function lockPathFor(boardPath: string): string {
+  return `${boardPath}.lock`;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((done) => setTimeout(done, ms));
+}
+
+/**
+ * Decide whether an existing lock file was abandoned, and remove it if so.
+ *
+ * Returns true when the caller should retry the `wx` create immediately: the
+ * lock was removed here, disappeared on its own, or changed while being
+ * inspected. Returns false when the lock is held by a live writer.
+ *
+ * The mtime is read twice with a short random pause in between. That closes
+ * the case where two writers see the same abandoned lock at the same moment:
+ * whichever one removes it first creates its own lock with a different mtime,
+ * and the other observes the change and retries instead of deleting a lock
+ * that is now held.
+ */
+async function breakStaleLock(lockPath: string): Promise<boolean> {
+  const first = await lockMtimeNs(lockPath);
+  if (first === null) return true;
+  if (!isStale(first)) return false;
+
+  await sleep(10 + Math.random() * 50);
+  const second = await lockMtimeNs(lockPath);
+  if (second === null) return true;
+  if (second !== first) return true;
+  if (!isStale(second)) return false;
+
+  await rm(lockPath, { force: true }).catch(noop);
+  return true;
+}
+
+async function lockMtimeNs(lockPath: string): Promise<bigint | null> {
+  try {
+    return (await stat(lockPath, { bigint: true })).mtimeNs;
+  } catch {
+    return null;
+  }
+}
+
+function isStale(mtimeNs: bigint): boolean {
+  const ageMs = Number(BigInt(Date.now()) - mtimeNs / 1_000_000n);
+  return ageMs > boardLock.staleAfterMs;
+}
+
+/**
+ * Take the cross-process lock for one board and return its release function.
+ *
+ * `open(..., "wx")` is O_EXCL: exactly one process creates the file. Everyone
+ * else retries with a capped, jittered backoff until `acquireTimeoutMs`
+ * passes, then reports a conflict rather than writing anyway.
+ */
+async function acquireBoardLock(boardPath: string): Promise<() => Promise<void>> {
+  const lockPath = lockPathFor(boardPath);
+  const deadline = Date.now() + boardLock.acquireTimeoutMs;
+  let delay = LOCK_RETRY_MIN_MS;
+  await mkdir(dirname(boardPath), { recursive: true });
+
+  for (;;) {
+    try {
+      const handle = await open(lockPath, "wx");
+      try {
+        await handle.writeFile(`${process.pid}\n`, "utf8");
+      } finally {
+        await handle.close();
+      }
+      let released = false;
+      return async () => {
+        if (released) return;
+        released = true;
+        await rm(lockPath, { force: true }).catch(noop);
+      };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      if (await breakStaleLock(lockPath)) continue;
+      if (Date.now() >= deadline) {
+        throw new BoardLockError(await revisionOf(boardPath), lockPath);
+      }
+      await sleep(delay * (0.5 + Math.random()));
+      delay = Math.min(delay * 2, LOCK_RETRY_MAX_MS);
+    }
+  }
+}
+
+/**
  * In-process write queue, keyed by resolved board path.
  *
  * Bun.serve runs request handlers concurrently, so two overlapping writes
@@ -244,12 +393,12 @@ export class BoardConflictError extends Error {
  * runs as one critical section and a second writer always observes the first
  * writer's revision.
  *
- * This only serializes writers inside this process. A writer in another
- * process (the `change.ts` CLI) is NOT caught: the window between the
- * `expectedRev` check and the rename is as wide as before, so cross-process
- * writes still overwrite each other without a 409. Measured at 0 conflicts
- * detected in 750 rounds, with 2-3% of CLI writes lost. Serializing across
- * processes needs the lock file in OV-104-C2.
+ * The queue only covers this process; the `<board>.lock` file taken inside
+ * `applyMutation` covers the other processes (the `change.ts` CLI). Both are
+ * needed: the lock alone would make two concurrent handlers in this process
+ * spin against each other, and the queue alone left the CLI free to overwrite
+ * a console write (measured at 0 conflicts detected in 750 rounds, 2-3% of
+ * CLI writes lost, up to 49% of console writes rolled back).
  */
 const writeQueues = new Map<string, Promise<unknown>>();
 
@@ -280,14 +429,17 @@ export async function mutateBoard<T>(
   expectedRev: string | null | undefined,
   mutate: (board: Board) => T | Promise<T>,
 ): Promise<BoardMutation<T>> {
-  const previous = writeQueues.get(path);
+  // Resolved, so that a relative path from the CLI and the absolute path the
+  // server holds queue against each other instead of getting a queue each.
+  const key = resolve(path);
+  const previous = writeQueues.get(key);
   const run = (previous ? previous.then(noop, noop) : Promise.resolve()).then(
-    () => applyMutation(path, expectedRev, mutate),
+    () => applyMutation(key, expectedRev, mutate),
   );
   const tail = run.then(noop, noop);
-  writeQueues.set(path, tail);
+  writeQueues.set(key, tail);
   void tail.then(() => {
-    if (writeQueues.get(path) === tail) writeQueues.delete(path);
+    if (writeQueues.get(key) === tail) writeQueues.delete(key);
   });
   return run;
 }
@@ -297,13 +449,33 @@ async function applyMutation<T>(
   expectedRev: string | null | undefined,
   mutate: (board: Board) => T | Promise<T>,
 ): Promise<BoardMutation<T>> {
-  const loaded = await loadBoard(path);
-  if (expectedRev && expectedRev !== loaded.rev) {
-    throw new BoardConflictError(loaded.rev);
+  const release = await acquireBoardLock(path);
+  try {
+    const loaded = await loadBoard(path);
+    if (expectedRev && expectedRev !== loaded.rev) {
+      throw new BoardConflictError(loaded.rev);
+    }
+
+    let board = loaded.board;
+    let result = await mutate(board);
+
+    // Guard against a writer that does not take the lock at all: a person
+    // editing board.yaml in an editor, or an older build. If the file moved
+    // while `mutate` ran, that edit is re-read and the mutation is applied on
+    // top of it, instead of the edit being overwritten. Every writer that
+    // does take the lock is already excluded here, so this normally never
+    // fires; it does mean `mutate` has to tolerate being called twice.
+    if ((await revisionOf(path)) !== loaded.rev) {
+      const reloaded = await loadBoard(path);
+      board = reloaded.board;
+      result = await mutate(board);
+    }
+
+    const rev = await saveBoard(path, board);
+    return { board, rev, result };
+  } finally {
+    await release();
   }
-  const result = await mutate(loaded.board);
-  const rev = await saveBoard(path, loaded.board);
-  return { board: loaded.board, rev, result };
 }
 
 function noop(): void {}

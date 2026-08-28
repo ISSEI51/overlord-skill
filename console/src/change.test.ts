@@ -37,17 +37,25 @@ import {
  * Count board writes.
  *
  * `sync` must write `board.yaml` once per run, whatever number of pull
- * requests it read, because every write makes the console re-render. The real
- * `saveBoard` is kept and only wrapped, so every other test keeps its exact
- * behaviour and only the counter is added.
+ * requests it read, because every write makes the console re-render. The
+ * counter sits on `mutateBoard`, which is the single write path the CLI uses;
+ * `saveBoard` is called from inside board.ts and a wrapper on it would not be
+ * seen. The real `mutateBoard` is kept and only wrapped, so every other test
+ * keeps its exact behaviour and only the counter is added. A mutation that
+ * throws never reaches the save, so it is not counted.
  */
-const realSaveBoard = boardModule.saveBoard;
+const realMutateBoard = boardModule.mutateBoard;
 let saveCount = 0;
 mock.module("./board.ts", () => ({
   ...boardModule,
-  saveBoard: (path: string, board: Board) => {
+  mutateBoard: async <T>(
+    path: string,
+    expectedRev: string | null | undefined,
+    mutate: (board: Board) => T | Promise<T>,
+  ) => {
+    const written = await realMutateBoard(path, expectedRev, mutate);
     saveCount += 1;
-    return realSaveBoard(path, board);
+    return written;
   },
 }));
 
@@ -1641,4 +1649,122 @@ describe("sync", () => {
       findChange(syncSampleBoard(), "OV-200-C2")!.change,
     );
   });
+});
+
+/**
+ * Cross-process serialization (OV-104-C2).
+ *
+ * Before the `<board>.lock`, the CLI's `updateChange` and a console write
+ * raced: measured at 0 conflicts reported in 750 rounds, 2-3% of CLI writes
+ * lost, 17-49% of console writes rolled back, and 92-97% of concurrent write
+ * pairs failing with `rename ENOENT` on the shared staging file. Both writers
+ * now go through `mutateBoard`, so they take the same lock.
+ */
+const CLI_WRITER_SOURCE = `
+const [modulePath, boardPath, changeId, tag, roundsRaw] = Bun.argv.slice(2);
+const { updateChange } = await import(modulePath);
+const rounds = Number(roundsRaw);
+const failures = [];
+const errors = [];
+for (let round = 0; round < rounds; round += 1) {
+  try {
+    await updateChange(boardPath, changeId, (change) => {
+      change.branch = \`\${tag}-\${round}\`;
+    });
+  } catch (error) {
+    failures.push(round);
+    const name = error && error.name ? error.name : "Error";
+    const code = error && error.code ? error.code : "";
+    if (name !== "BoardLockError" && name !== "BoardConflictError") {
+      errors.push(\`\${name}/\${code}: \${error && error.message}\`);
+    }
+  }
+}
+process.stdout.write(JSON.stringify({ tag, failures, errors }));
+`;
+
+/** A console-style writer: the server's own write path, on another card. */
+const CONSOLE_WRITER_SOURCE = `
+const [modulePath, boardPath, itemId, tag, roundsRaw] = Bun.argv.slice(2);
+const { mutateBoard } = await import(modulePath);
+const rounds = Number(roundsRaw);
+const failures = [];
+const errors = [];
+for (let round = 0; round < rounds; round += 1) {
+  try {
+    await mutateBoard(boardPath, undefined, (board) => {
+      const item = board.items.find((entry) => entry.id === itemId);
+      if (!item) throw new Error("card vanished from the board: " + itemId);
+      item.next_action = \`\${tag}-\${round}\`;
+    });
+  } catch (error) {
+    failures.push(round);
+    const name = error && error.name ? error.name : "Error";
+    const code = error && error.code ? error.code : "";
+    if (name !== "BoardLockError" && name !== "BoardConflictError") {
+      errors.push(\`\${name}/\${code}: \${error && error.message}\`);
+    }
+  }
+}
+process.stdout.write(JSON.stringify({ tag, failures, errors }));
+`;
+
+describe("cross-process writes from the CLI and the console", () => {
+  test(
+    "100 interleaved rounds: no ENOENT, no corruption, neither writer is lost",
+    async () => {
+      const boardPath = await writeSampleBoard();
+      const dir = resolve(boardPath, "..");
+      const cliScript = join(dir, "cli-writer.ts");
+      const consoleScript = join(dir, "console-writer.ts");
+      writeFileSync(cliScript, CLI_WRITER_SOURCE, "utf8");
+      writeFileSync(consoleScript, CONSOLE_WRITER_SOURCE, "utf8");
+      const rounds = 100;
+      const changeModule = join(import.meta.dir, "change.ts");
+      const boardModule = join(import.meta.dir, "board.ts");
+
+      const children = [
+        Bun.spawn(
+          ["bun", "run", cliScript, changeModule, boardPath, "OV-103-C1", "cli", String(rounds)],
+          { stdout: "pipe", stderr: "pipe", stdin: "ignore" },
+        ),
+        Bun.spawn(
+          ["bun", "run", consoleScript, boardModule, boardPath, "OV-100", "console", String(rounds)],
+          { stdout: "pipe", stderr: "pipe", stdin: "ignore" },
+        ),
+      ];
+
+      const reports: { tag: string; failures: number[]; errors: string[] }[] = [];
+      for (const child of children) {
+        const stdout = await new Response(child.stdout).text();
+        const stderr = await new Response(child.stderr).text();
+        expect(stderr).toBe("");
+        expect(await child.exited).toBe(0);
+        reports.push(JSON.parse(stdout));
+      }
+
+      // No `rename ENOENT` and no other unexpected failure on either side.
+      for (const report of reports) expect(report.errors).toEqual([]);
+      // Short writes never wait out the 5 s acquire timeout, so nothing is
+      // even reported as a conflict.
+      for (const report of reports) expect(report.failures).toEqual([]);
+
+      // The board still parses and both writers' last value survived: the
+      // CLI did not roll the console's card back, and the console did not
+      // drop the CLI's change.
+      const after = await loadBoard(boardPath);
+      expect(after.board.version).toBe(1);
+      expect(findChange(after.board, "OV-103-C1")!.change.branch).toBe(
+        `cli-${rounds - 1}`,
+      );
+      expect(after.board.items.find((entry) => entry.id === "OV-100")!.next_action).toBe(
+        `console-${rounds - 1}`,
+      );
+      // Untouched cards are intact, so no partial write landed.
+      expect(findChange(after.board, "OV-103-C2")!.change).toEqual(
+        findChange(sampleBoard(), "OV-103-C2")!.change,
+      );
+    },
+    120_000,
+  );
 });

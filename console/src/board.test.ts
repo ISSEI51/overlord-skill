@@ -1,21 +1,31 @@
 /**
  * board.yaml write path.
  *
- * Covers the two defects OV-104-C1 fixes:
+ * Covers the defects OV-104-C1 and OV-104-C2 fix:
  *   - `revisionOf` used millisecond mtime, so two writes of equal byte length
- *     inside one millisecond produced the same token;
+ *     inside one millisecond produced the same token (C1);
  *   - `loadBoard` -> mutate -> `saveBoard` was not a critical section, so two
- *     concurrent writers interleaved and the first write was lost silently.
+ *     concurrent writers in one process interleaved and the first write was
+ *     lost silently (C1);
+ *   - the atomic-rename staging file had a fixed name, so two processes
+ *     writing at once collided on it: `rename ENOENT` on one side and, once
+ *     measured, a truncated NUL-padded board.yaml (C2);
+ *   - nothing serialized writers across processes, so the console and the
+ *     `change` CLI overwrote each other with no conflict reported (C2).
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdir, mkdtemp, readdir, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  boardLock,
   BoardConflictError,
+  BoardLockError,
   EMPTY_BOARD,
   loadBoard,
+  lockPathFor,
   mutateBoard,
   revisionOf,
   saveBoard,
@@ -31,7 +41,10 @@ beforeEach(async () => {
   boardPath = join(dir, "board.yaml");
 });
 
+const LOCK_DEFAULTS = { ...boardLock };
+
 afterEach(async () => {
+  Object.assign(boardLock, LOCK_DEFAULTS);
   await rm(dir, { recursive: true, force: true });
 });
 
@@ -233,5 +246,272 @@ describe("mutateBoard", () => {
     expect(a.rev).toBe(await revisionOf(boardPath));
     expect(b.rev).toBe(await revisionOf(other));
     expect((await loadBoard(other)).board.items.map((e) => e.id)).toEqual(["B-1"]);
+  });
+});
+
+/**
+ * Source of the child process used by the cross-process tests.
+ *
+ * It is written to the test's temporary directory and run with the same bun
+ * binary, importing board.ts by absolute path, so the child exercises exactly
+ * the write path under test.
+ */
+const WRITER_SOURCE = `
+const [modulePath, boardPath, tag, roundsRaw] = Bun.argv.slice(2);
+const { mutateBoard } = await import(modulePath);
+const rounds = Number(roundsRaw);
+const failures = [];
+const errors = [];
+for (let round = 0; round < rounds; round += 1) {
+  try {
+    await mutateBoard(boardPath, undefined, (board) => {
+      board.items.push({ id: \`\${tag}-\${round}\`, title: tag, state: "inbox" });
+    });
+  } catch (error) {
+    failures.push(round);
+    const name = error && error.name ? error.name : "Error";
+    const code = error && error.code ? error.code : "";
+    if (name !== "BoardLockError" && name !== "BoardConflictError") {
+      errors.push(\`\${name}/\${code}: \${error && error.message}\`);
+    }
+  }
+}
+process.stdout.write(JSON.stringify({ tag, failures, errors }));
+`;
+
+/** Holds the lock and never releases it, so the parent has to time it out. */
+const HOLDER_SOURCE = `
+const [modulePath, boardPath] = Bun.argv.slice(2);
+const { mutateBoard } = await import(modulePath);
+await mutateBoard(boardPath, undefined, async () => {
+  process.stdout.write("held\\n");
+  // Never returns: the parent kills this process while the lock is held.
+  await new Promise(() => {});
+});
+`;
+
+type WriterReport = { tag: string; failures: number[]; errors: string[] };
+
+const boardModulePath = join(import.meta.dir, "board.ts");
+
+describe("cross-process board writes", () => {
+  test(
+    "two processes, 100 rounds each: no ENOENT, no corruption, no lost write",
+    async () => {
+      await seed([]);
+      const script = join(dir, "writer.ts");
+      await writeFile(script, WRITER_SOURCE, "utf8");
+      const rounds = 100;
+
+      const children = ["P1", "P2"].map((tag) =>
+        Bun.spawn(
+          [process.execPath, "run", script, boardModulePath, boardPath, tag, String(rounds)],
+          { stdout: "pipe", stderr: "pipe" },
+        ),
+      );
+      const reports: WriterReport[] = [];
+      for (const child of children) {
+        const stdout = await new Response(child.stdout).text();
+        const stderr = await new Response(child.stderr).text();
+        const code = await child.exited;
+        expect(stderr).toBe("");
+        expect(code).toBe(0);
+        reports.push(JSON.parse(stdout) as WriterReport);
+      }
+
+      // (a) No writer hit `rename ENOENT` (or any error other than a
+      // reported conflict) on the shared staging file.
+      for (const report of reports) expect(report.errors).toEqual([]);
+
+      // (b) The board is still parseable YAML with the shape it started with.
+      const { board } = await loadBoard(boardPath);
+      expect(board.version).toBe(1);
+
+      // (c) Every write that was not reported as a conflict is on the board,
+      // and nothing else is: no writer's item was silently overwritten.
+      const expected = new Set<string>();
+      for (const report of reports) {
+        const failed = new Set(report.failures);
+        for (let round = 0; round < rounds; round += 1) {
+          if (!failed.has(round)) expected.add(`${report.tag}-${round}`);
+        }
+      }
+      const written = board.items.map((entry) => entry.id);
+      expect(new Set(written)).toEqual(expected);
+      expect(written).toHaveLength(expected.size);
+
+      // With writes this short neither process should ever wait out the
+      // 5 s acquire timeout, so in practice nothing is dropped at all.
+      for (const report of reports) expect(report.failures).toEqual([]);
+
+      // No staging file and no lock file survive the run.
+      const leftovers = (await readdir(dir)).filter(
+        (name) => name.includes(".overlord-tmp.") || name.endsWith(".lock"),
+      );
+      expect(leftovers).toEqual([]);
+    },
+    120_000,
+  );
+
+  test(
+    "reclaims the lock of a process that was killed while holding it",
+    async () => {
+      await seed([item("A-1")]);
+      const script = join(dir, "holder.ts");
+      await writeFile(script, HOLDER_SOURCE, "utf8");
+
+      const holder = Bun.spawn(
+        [process.execPath, "run", script, boardModulePath, boardPath],
+        { stdout: "pipe", stderr: "pipe" },
+      );
+      // Wait until the child reports that it owns the lock.
+      const reader = holder.stdout.getReader();
+      await reader.read();
+      expect(existsSync(lockPathFor(boardPath))).toBe(true);
+      holder.kill("SIGKILL");
+      await holder.exited;
+      // The lock file outlives the process that was killed.
+      expect(existsSync(lockPathFor(boardPath))).toBe(true);
+
+      boardLock.staleAfterMs = 200;
+      boardLock.acquireTimeoutMs = 10_000;
+      await mutateBoard(boardPath, undefined, (board) => {
+        board.items.push(item("A-2"));
+      });
+
+      const { board } = await loadBoard(boardPath);
+      expect(board.items.map((entry) => entry.id)).toEqual(["A-1", "A-2"]);
+      expect(existsSync(lockPathFor(boardPath))).toBe(false);
+    },
+    30_000,
+  );
+});
+
+describe("board lock", () => {
+  test("takes over a lock whose mtime is older than staleAfterMs", async () => {
+    await seed([item("A-1")]);
+    const lockPath = lockPathFor(boardPath);
+    await writeFile(lockPath, "99999\n", "utf8");
+    const longAgo = new Date(Date.now() - 60_000);
+    await utimes(lockPath, longAgo, longAgo);
+
+    await mutateBoard(boardPath, undefined, (board) => {
+      board.items.push(item("A-2"));
+    });
+
+    const { board } = await loadBoard(boardPath);
+    expect(board.items.map((entry) => entry.id)).toEqual(["A-1", "A-2"]);
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  test("reports a conflict instead of writing when the lock is held", async () => {
+    const rev = await seed([item("A-1")]);
+    const lockPath = lockPathFor(boardPath);
+    await writeFile(lockPath, "99999\n", "utf8");
+    boardLock.acquireTimeoutMs = 150;
+
+    const failure = await mutateBoard(boardPath, undefined, (board) => {
+      board.items.push(item("A-2"));
+    }).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(BoardLockError);
+    // A lock timeout is a conflict, so the server answers 409 for it.
+    expect(failure).toBeInstanceOf(BoardConflictError);
+    expect((failure as BoardLockError).rev).toBe(rev);
+    // Nothing was written and the live lock was left alone.
+    expect(await revisionOf(boardPath)).toBe(rev);
+    expect(existsSync(lockPath)).toBe(true);
+  });
+
+  test("releases the lock when the mutation throws", async () => {
+    await seed([item("A-1")]);
+    const lockPath = lockPathFor(boardPath);
+
+    const failure = await mutateBoard(boardPath, undefined, () => {
+      expect(existsSync(lockPath)).toBe(true);
+      throw new Error("rejected by the handler");
+    }).catch((error: unknown) => error);
+
+    expect((failure as Error).message).toBe("rejected by the handler");
+    expect(existsSync(lockPath)).toBe(false);
+
+    // And the next writer can still take it.
+    await mutateBoard(boardPath, undefined, (board) => {
+      board.items.push(item("A-2"));
+    });
+    expect(existsSync(lockPath)).toBe(false);
+    const { board } = await loadBoard(boardPath);
+    expect(board.items.map((entry) => entry.id)).toEqual(["A-1", "A-2"]);
+  });
+
+  test("releases the lock when a stale expected revision is rejected", async () => {
+    const stale = await seed([item("A-1")]);
+    await mutateBoard(boardPath, stale, (board) => board.items.push(item("A-2")));
+
+    const conflict = await mutateBoard(boardPath, stale, (board) => {
+      board.items.push(item("A-3"));
+    }).catch((error: unknown) => error);
+
+    expect(conflict).toBeInstanceOf(BoardConflictError);
+    expect(existsSync(lockPathFor(boardPath))).toBe(false);
+  });
+
+  test("re-applies the mutation when an unlocked writer changed the file", async () => {
+    await seed([item("A-1")]);
+    let passes = 0;
+
+    await mutateBoard(boardPath, undefined, async (board) => {
+      passes += 1;
+      if (passes === 1) {
+        // A writer that ignores the lock entirely (a person with an editor).
+        const { board: outside } = await loadBoard(boardPath);
+        outside.items.push(item("OUTSIDE"));
+        await saveBoard(boardPath, outside);
+      }
+      board.items.push(item("MINE"));
+    });
+
+    expect(passes).toBe(2);
+    const { board } = await loadBoard(boardPath);
+    // Neither the outside edit nor the mutation was lost.
+    expect(board.items.map((entry) => entry.id)).toEqual([
+      "A-1",
+      "OUTSIDE",
+      "MINE",
+    ]);
+  });
+});
+
+describe("saveBoard staging file", () => {
+  test("no longer uses the fixed name two processes collided on", async () => {
+    // The old staging name, occupied by something `writeFile` cannot write
+    // to. Before OV-104-C2 the save would fail here with EISDIR, which is
+    // the in-process shadow of the `rename ENOENT` two processes hit.
+    await mkdir(`${boardPath}.overlord-tmp`);
+
+    await seed([item("A-1")]);
+
+    const { board } = await loadBoard(boardPath);
+    expect(board.items.map((entry) => entry.id)).toEqual(["A-1"]);
+    const leftovers = (await readdir(dir)).filter(
+      (name) => name.startsWith("board.yaml.overlord-tmp."),
+    );
+    expect(leftovers).toEqual([]);
+  });
+
+  test("removes its staging file when the rename fails", async () => {
+    // A non-empty directory where the board file should be: the write
+    // succeeds, the rename onto it cannot.
+    const target = join(dir, "occupied.yaml");
+    await mkdir(join(target, "child"), { recursive: true });
+    const board: Board = { ...structuredClone(EMPTY_BOARD), items: [item("A-1")] };
+
+    const failure = await saveBoard(target, board).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(Error);
+    const leftovers = (await readdir(dir)).filter((name) =>
+      name.includes(".overlord-tmp."),
+    );
+    expect(leftovers).toEqual([]);
   });
 });

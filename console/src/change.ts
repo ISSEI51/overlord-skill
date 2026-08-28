@@ -5,9 +5,10 @@
  * execution unit. This command owns the git side of that contract and records
  * the result on `board.yaml`, so an agent never has to hand-edit the board.
  *
- * Board writes go through the same helpers the console server uses
- * (`loadBoard` / `saveBoard` / `canonicalItem`), which keeps the YAML key
- * order, the block style and the atomic rename identical to a console write.
+ * Board writes go through the same write path the console server uses
+ * (`mutateBoard`), which keeps the YAML key order, the block style, the
+ * atomic rename and the `<board>.lock` cross-process lock identical to a
+ * console write.
  *
  * Implemented subcommands:
  *   change start    <change-id> [--board <path>] [--base <branch>]
@@ -22,8 +23,7 @@ import {
   boardPathFor,
   canonicalItem,
   loadBoard,
-  revisionOf,
-  saveBoard,
+  mutateBoard,
   type Board,
   type Change,
   type Item,
@@ -66,39 +66,30 @@ export class ChangeNotFoundError extends Error {
 /**
  * Read the board, mutate one change, write the board back.
  *
- * This bypasses the console server, so it cannot use the server's `rev`
- * optimistic lock. Instead the revision is re-read immediately before saving:
- * if the file changed since it was loaded, the board is re-read once and the
- * mutation is re-applied to the target change only, so a concurrent console
- * edit to a different card is preserved instead of being overwritten.
+ * This bypasses the console server, so it has no client-supplied `rev` to
+ * check. It does take the same `<board>.lock` as the server, because the
+ * write goes through `mutateBoard`: a console write can no longer land
+ * between the load and the save, and a console write already in progress
+ * makes this call wait rather than overwrite it.
  *
  * Nothing outside the target change is rewritten; `board.updated_at` is
- * stamped by `saveBoard` as it is for every other writer.
+ * stamped by the write path as it is for every other writer. `mutate` may be
+ * called more than once (see `mutateBoard`), so it has to be idempotent.
  */
 export async function updateChange(
   boardPath: string,
   changeId: string,
   mutate: (change: Change) => void,
 ): Promise<Change> {
-  const loaded = await loadBoard(boardPath);
-  let board = loaded.board;
-  let found = findChange(board, changeId);
-  if (!found) throw new ChangeNotFoundError(changeId);
-  mutate(found.change);
-
-  const current = await revisionOf(boardPath);
-  if (current !== loaded.rev) {
-    const reloaded = await loadBoard(boardPath);
-    board = reloaded.board;
-    found = findChange(board, changeId);
+  const { result } = await mutateBoard(boardPath, undefined, (board) => {
+    const found = findChange(board, changeId);
     if (!found) throw new ChangeNotFoundError(changeId);
     mutate(found.change);
-  }
-
-  const itemIndex = board.items.indexOf(found.item);
-  if (itemIndex >= 0) board.items[itemIndex] = canonicalItem(found.item);
-  await saveBoard(boardPath, board);
-  return found.change;
+    const itemIndex = board.items.indexOf(found.item);
+    if (itemIndex >= 0) board.items[itemIndex] = canonicalItem(found.item);
+    return found.change;
+  });
+  return result;
 }
 
 /**
@@ -106,14 +97,13 @@ export async function updateChange(
  *
  * `sync` reads many pull requests in one run, and every board write makes the
  * console re-render, so the whole run must land as a single write. The
- * concurrency safety is the same as `updateChange`: the revision is re-read
- * immediately before saving and, if the file moved, the board is re-read once
- * and every mutation is re-applied to its own change, so a concurrent console
- * edit elsewhere on the board survives. The mutation therefore has to be
- * idempotent, exactly as it is for `updateChange`.
+ * concurrency safety is the same as `updateChange`: one `mutateBoard` call,
+ * so one lock, one load and one save for the whole set.
  *
- * An empty id list writes nothing at all, so a run that found no update leaves
- * the file, and the console, untouched.
+ * An empty id list writes nothing at all, so a run that found no update
+ * leaves the file, and the console, untouched. An unknown id throws from
+ * inside the mutation, which aborts the write: either every named change is
+ * written or none is.
  */
 export async function updateChanges(
   boardPath: string,
@@ -122,8 +112,7 @@ export async function updateChanges(
 ): Promise<void> {
   if (changeIds.length === 0) return;
 
-  /** Apply every mutation to one loaded board; report the cards touched. */
-  const applyAll = (board: Board): Item[] => {
+  await mutateBoard(boardPath, undefined, (board) => {
     const touched: Item[] = [];
     for (const changeId of changeIds) {
       const found = findChange(board, changeId);
@@ -131,25 +120,11 @@ export async function updateChanges(
       mutate(found.change);
       if (!touched.includes(found.item)) touched.push(found.item);
     }
-    return touched;
-  };
-
-  const loaded = await loadBoard(boardPath);
-  let board = loaded.board;
-  let touched = applyAll(board);
-
-  const current = await revisionOf(boardPath);
-  if (current !== loaded.rev) {
-    const reloaded = await loadBoard(boardPath);
-    board = reloaded.board;
-    touched = applyAll(board);
-  }
-
-  for (const item of touched) {
-    const index = board.items.indexOf(item);
-    if (index >= 0) board.items[index] = canonicalItem(item);
-  }
-  await saveBoard(boardPath, board);
+    for (const item of touched) {
+      const index = board.items.indexOf(item);
+      if (index >= 0) board.items[index] = canonicalItem(item);
+    }
+  });
 }
 
 /**
