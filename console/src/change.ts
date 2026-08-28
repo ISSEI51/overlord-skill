@@ -1434,6 +1434,11 @@ export async function resolveDeliveryBase(
  *     really is `head -> base`. A failure at any step therefore leaves
  *     `board.yaml` exactly as it was and the command can be run again.
  *
+ * A base that has moved on while the card was in flight is reported as a
+ * warning and nothing more: the delivery is not stopped and the base is not
+ * merged into the head, because the pull request is where the two branches
+ * meet and merging on the agent's behalf would rewrite work nobody reviewed.
+ *
  * Idempotent: an open pull request for the same head and base is edited rather
  * than a second one created, and its title is left alone because a person may
  * have renamed it. A head that is already identical to the base is reported as
@@ -1560,6 +1565,10 @@ export async function deliverCard(
     };
   }
 
+  // 6. Report what the base holds that the head does not. This never changes
+  //    the outcome: the pull request is where the two branches meet.
+  warnings.push(...(await baseGapWarnings(root, diffBase, head, timeoutMs)));
+
   const push = await pushBranch(root, head, timeoutMs);
   if (!push.ok) {
     return {
@@ -1569,7 +1578,7 @@ export async function deliverCard(
     };
   }
 
-  // 6. Reuse the pull request already open for this head and base.
+  // 7. Reuse the pull request already open for this head and base.
   const listed = await gh(
     [
       "pr",
@@ -1676,7 +1685,7 @@ export async function deliverCard(
     ref = head;
   }
 
-  // 7. Verify before writing: the pull request has to be this head against
+  // 8. Verify before writing: the pull request has to be this head against
   //    this base. `gh pr list --head` matches on the branch name alone, which
   //    a fork or a renamed branch can satisfy with someone else's pull request.
   const viewed = await gh(
@@ -1812,6 +1821,100 @@ async function syncCardChanges(
     });
   }
 
+  return warnings;
+}
+
+/**
+ * Report the commits `base` holds that `head` does not, and whether they
+ * conflict, as warnings.
+ *
+ * Two separate questions, answered by two commands, because the answers are
+ * not the same information:
+ *
+ *  - "has the base moved on since the head branched off?" is
+ *    `git merge-base --is-ancestor <base> <head>`. Exit 0 means the base is
+ *    contained in the head, which is the ordinary state of a branch that was
+ *    kept up to date, and produces no warning at all. Exit 1 means it is not,
+ *    and the number of commits is read separately so the warning names it;
+ *  - "would merging them conflict?" is `git merge-tree --write-tree`, which
+ *    merges the two commits in memory without touching the working tree. Exit
+ *    0 is a clean merge. A non-zero exit with the merged tree object on stdout
+ *    is a conflict, and the conflicted paths follow it, one per line, up to
+ *    the first blank line. A non-zero exit with nothing on stdout is the
+ *    command itself failing — a ref it cannot resolve exits 1 exactly as a
+ *    conflict does — so stdout, not the exit status, is what separates the two.
+ *
+ * Neither answer stops the delivery: the pull request is where the base and
+ * the head meet, and GitHub reports the same conflict on it. A base that
+ * merges cleanly needs no second warning, so only a conflict, or a merge that
+ * could not be attempted, adds one.
+ *
+ * `base` is the ref the delivery diffed against, so on the usual path this
+ * compares against the `origin/<base>` that step 4 just fetched rather than a
+ * local branch that may be older.
+ */
+async function baseGapWarnings(
+  root: string,
+  base: string,
+  head: string,
+  timeoutMs?: number,
+): Promise<string[]> {
+  const ancestor = await git(
+    ["merge-base", "--is-ancestor", base, head],
+    root,
+    timeoutMs,
+  );
+  if (ancestor.code === 0) return [];
+  if (ancestor.code !== 1) {
+    return [
+      `git merge-base --is-ancestor ${base} ${head} failed, so whether ` +
+        `${base} has commits ${head} does not is unknown: ` +
+        failureMessage(ancestor),
+    ];
+  }
+
+  const counted = await git(
+    ["rev-list", "--count", `${head}..${base}`],
+    root,
+    timeoutMs,
+  );
+  const count = counted.code === 0 ? Number(counted.stdout.trim()) : Number.NaN;
+  // A count that could not be read leaves the fact and drops the number,
+  // rather than reporting a number that contradicts the answer above.
+  const commits =
+    Number.isInteger(count) && count > 0
+      ? `${count} commit${count === 1 ? "" : "s"}`
+      : "commits";
+  const warnings = [
+    `${base} has ${commits} not in ${head}; this delivery does not merge ` +
+      `${base} into ${head}`,
+  ];
+
+  const merged = await git(
+    ["merge-tree", "--write-tree", "--name-only", base, head],
+    root,
+    timeoutMs,
+  );
+  if (merged.code === 0) return warnings;
+  if (!merged.stdout.trim()) {
+    warnings.push(
+      `git merge-tree --write-tree ${base} ${head} failed, so whether those ` +
+        `commits conflict is unknown: ${failureMessage(merged)}`,
+    );
+    return warnings;
+  }
+
+  const paths: string[] = [];
+  for (const line of merged.stdout.split("\n").slice(1)) {
+    if (!line) break;
+    paths.push(line);
+  }
+  warnings.push(
+    paths.length > 0
+      ? `merging ${base} into ${head} conflicts in ${paths.length} ` +
+          `file${paths.length === 1 ? "" : "s"}: ${paths.join(", ")}`
+      : `merging ${base} into ${head} conflicts`,
+  );
   return warnings;
 }
 

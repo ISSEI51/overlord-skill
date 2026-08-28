@@ -1835,6 +1835,27 @@ async function deliveryRepo(): Promise<{ root: string; origin: string }> {
   return { root, origin };
 }
 
+/**
+ * Commit `content` to `file` on `main` and push it, so `origin/main` really is
+ * ahead of `feature` — what the default branch looks like when something else
+ * landed on it while the card was in flight.
+ *
+ * Leaves `feature` checked out, which is where `deliveryRepo` left the
+ * repository.
+ */
+async function advanceBase(
+  root: string,
+  file: string,
+  content: string,
+): Promise<void> {
+  await gitIn(["checkout", "--quiet", "main"], root);
+  await Bun.write(join(root, file), content);
+  await gitIn(["add", "-A"], root);
+  await gitIn(["commit", "--quiet", "-m", `main moved on: ${file}`], root);
+  await gitIn(["push", "--quiet", "origin", "main"], root);
+  await gitIn(["checkout", "--quiet", "feature"], root);
+}
+
 /** US, the ASCII unit separator: what the `gh` stub joins its argv with. */
 const ARG_SEPARATOR = "\u001f";
 
@@ -2491,6 +2512,96 @@ describe("deliverCard", () => {
     expect(await Bun.file(boardPath).text()).toBe(before);
   });
 
+  test("(g) a base the head does not contain is warned about, and the delivery completes", async () => {
+    const repo = await deliveryRepo();
+    await advanceBase(repo.root, "release.txt", "shipped\n");
+    const boardPath = await writeDeliveryBoard([MERGED_CHANGE]);
+    const stub = await deliverGhStub({
+      "view-50.json": VIEW_50_UNCHANGED,
+      "pr-list.json": [],
+      "pr-create.txt": "created\n",
+      "view-feature.json": DELIVERY_VIEW,
+    });
+
+    const outcome = await withGhStub(stub, () =>
+      deliverCard({ boardPath, cardId: "OV-500", cwd: repo.root, head: "feature" }),
+    );
+
+    // The commit on main is named, and the merge is clean, so nothing is said
+    // about a conflict.
+    expect(outcome.warnings).toEqual([
+      "origin/main has 1 commit not in feature; this delivery does not merge " +
+        "origin/main into feature",
+    ]);
+    // The warning changes nothing: the pull request was created and recorded.
+    expect(outcome.status).toBe("created");
+    expect(outcome.pr!.number).toBe(99);
+    expect((await loadBoard(boardPath)).board.items[0]!.delivery!.pr!.number).toBe(
+      99,
+    );
+    // And the base was left where it was: nothing was merged into the head.
+    expect(
+      (await git(["merge-base", "--is-ancestor", "origin/main", "feature"], repo.root))
+        .code,
+    ).toBe(1);
+  });
+
+  test("(g) a base that conflicts with the head is reported as a conflict too", async () => {
+    const repo = await deliveryRepo();
+    await Bun.write(join(repo.root, "README.md"), "rewritten by the card\n");
+    await gitIn(["add", "-A"], repo.root);
+    await gitIn(["commit", "--quiet", "-m", "feature rewrites the readme"], repo.root);
+    await advanceBase(repo.root, "README.md", "rewritten on main\n");
+    const boardPath = await writeDeliveryBoard([MERGED_CHANGE]);
+    const stub = await deliverGhStub({
+      "view-50.json": VIEW_50_UNCHANGED,
+      "pr-list.json": [],
+      "pr-create.txt": "created\n",
+      "view-feature.json": DELIVERY_VIEW,
+    });
+
+    const outcome = await withGhStub(stub, () =>
+      deliverCard({ boardPath, cardId: "OV-500", cwd: repo.root, head: "feature" }),
+    );
+
+    // Two separate facts, in two lines: the base moved on, and merging it
+    // would conflict. A conflict does not block the delivery either.
+    expect(outcome.warnings).toEqual([
+      "origin/main has 1 commit not in feature; this delivery does not merge " +
+        "origin/main into feature",
+      "merging origin/main into feature conflicts in 1 file: README.md",
+    ]);
+    expect(outcome.status).toBe("created");
+    expect((await loadBoard(boardPath)).board.items[0]!.delivery!.pr!.number).toBe(
+      99,
+    );
+  });
+
+  test("(g) a base the head already contains is not warned about", async () => {
+    const repo = await deliveryRepo();
+    const boardPath = await writeDeliveryBoard([MERGED_CHANGE]);
+    const stub = await deliverGhStub({
+      "view-50.json": VIEW_50_UNCHANGED,
+      "pr-list.json": [],
+      "pr-create.txt": "created\n",
+      "view-feature.json": DELIVERY_VIEW,
+    });
+
+    // `feature` was branched off `main` and `main` has not moved since, which
+    // is the ordinary state of a branch about to be delivered.
+    expect(
+      (await git(["merge-base", "--is-ancestor", "origin/main", "feature"], repo.root))
+        .code,
+    ).toBe(0);
+
+    const outcome = await withGhStub(stub, () =>
+      deliverCard({ boardPath, cardId: "OV-500", cwd: repo.root, head: "feature" }),
+    );
+
+    expect(outcome.status).toBe("created");
+    expect(outcome.warnings).toEqual([]);
+  });
+
   test("writes nothing to stdout or stderr, on either the delivered or the blocked path", async () => {
     const repo = await deliveryRepo();
     const delivered = await writeDeliveryBoard([MERGED_CHANGE]);
@@ -2673,6 +2784,33 @@ describe("deliver", () => {
     expect(stdout).not.toContain("board updated");
     expect(stderr).toContain("not merged:       OV-500-C2  The open change");
     expect(await Bun.file(boardPath).text()).toBe(before);
+  });
+
+  test("a base the head does not contain is warned about on stderr and still exits 0", async () => {
+    const repo = await deliveryRepo();
+    await advanceBase(repo.root, "release.txt", "shipped\n");
+    const boardPath = await writeDeliveryBoard([MERGED_CHANGE]);
+    const stub = await deliverGhStub({
+      "view-50.json": VIEW_50_UNCHANGED,
+      "pr-list.json": [],
+      "pr-create.txt": "created\n",
+      "view-feature.json": DELIVERY_VIEW,
+    });
+
+    const { code, stdout, stderr } = await runDeliver(
+      ["OV-500", "--board", boardPath, "--head", "feature"],
+      repo.root,
+      stub,
+    );
+
+    // The same exit code as a delivery with nothing to warn about.
+    expect(code).toBe(0);
+    expect(stderr.trimEnd()).toBe(
+      "origin/main has 1 commit not in feature; this delivery does not merge " +
+        "origin/main into feature",
+    );
+    expect(stdout).toContain("delivery:         created");
+    expect(stdout).toContain("pull request:     #99 (open)");
   });
 
   test("a skipped run reports why and still exits 0", async () => {
