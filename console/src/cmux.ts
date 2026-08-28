@@ -46,7 +46,11 @@ async function resolveBin(): Promise<string | null> {
   const candidates = [process.env.CMUX_BIN, FALLBACK_BIN].filter(
     (value): value is string => typeof value === "string" && value.length > 0,
   );
-  const onPath = Bun.which("cmux");
+  // The PATH is read from the environment as it is now, not as it was when
+  // the process started: `Bun.which` without an explicit PATH uses the
+  // startup value, which a test that puts a stub in front of PATH cannot
+  // change.
+  const onPath = Bun.which("cmux", { PATH: process.env.PATH ?? "" });
   if (onPath) candidates.unshift(onPath);
   for (const candidate of candidates) {
     if (await Bun.file(candidate).exists()) {
@@ -397,6 +401,23 @@ export async function createWorkspace(options: {
   cwd: string;
   command?: string;
   description?: string;
+  /**
+   * Start the new workspace's terminal before returning. Default true.
+   *
+   * Starting it means `startTerminal`: select the new workspace, wait 1.2 s,
+   * select the previous one again. cmux reports `tty: null` for the terminal
+   * surface of a workspace it has just created -- including one created with
+   * `--command` -- so this runs on essentially every call, and for those
+   * ~1.2 s the user's selected workspace is the new one. The restore is
+   * best-effort, so a failure leaves the user there.
+   *
+   * Callers that only need the `--command` line to run pass false: the line
+   * runs without the workspace ever being selected, and the user's selection
+   * is not touched. Only a caller that will send input to the new terminal
+   * (`sendText`, `sendKey`) needs the terminal started up front, and even
+   * those recover through `withTerminal`.
+   */
+  startTerminal?: boolean;
 }): Promise<{ workspaceRef: string | null; raw: string }> {
   const args = ["new-workspace", "--name", options.name, "--cwd", options.cwd];
   if (options.command) args.push("--command", options.command);
@@ -404,7 +425,7 @@ export async function createWorkspace(options: {
   const stdout = await runOrThrow(args, 20_000);
   const match = stdout.match(/workspace:\d+/);
   const workspaceRef = match ? match[0] : null;
-  if (workspaceRef) {
+  if (workspaceRef && options.startTerminal !== false) {
     // Start the terminal so the workspace can receive input right away.
     const workspaces = await listWorkspaces();
     const created = workspaces.find((entry) => entry.ref === workspaceRef);

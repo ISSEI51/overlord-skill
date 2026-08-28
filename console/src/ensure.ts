@@ -7,9 +7,10 @@
  * The steps are fixed, and each one is a no-op when it is already done, so
  * running the command again produces the same result:
  *
- *   1. resolve the board path of the target project;
+ *   1. resolve the board path of the target project. The project directory
+ *      itself has to exist: `ensure` writes into it, it does not create it;
  *   2. probe the port. A console already serving this board is left running
- *      and nothing else is started;
+ *      and nothing else is started, and the run goes straight to step 5;
  *   3. create `docs/product-ops/board.yaml` when it does not exist, before
  *      the server starts. The server watches the board's *directory*, once,
  *      at startup: `watchBoard` fails with ENOENT when `docs/product-ops` is
@@ -20,14 +21,16 @@
  *   4. start the server. With cmux reachable it runs in a cmux workspace the
  *      user can see and close; otherwise it is started detached and the
  *      command that stops it is printed;
- *   5. register the calling cmux session as the commander.
+ *   5. register the calling cmux session as the commander. This happens on
+ *      the already running path too, so a second session can take an
+ *      existing console over; an unchanged commander is not written back.
  *
  * The browser is never opened by this command on its own. `--open` is passed
  * to the server exactly as `console.sh <project> --open` does.
  */
 
 import { closeSync, openSync } from "node:fs";
-import { mkdir } from "node:fs/promises";
+import { mkdir, stat } from "node:fs/promises";
 import { basename, dirname, resolve } from "node:path";
 
 import * as cmux from "./cmux.ts";
@@ -38,6 +41,7 @@ import {
   mutateBoard,
   projectRootFor,
   saveBoard,
+  type Board,
   type SessionLink,
 } from "./board.ts";
 
@@ -74,7 +78,14 @@ export function parseArgs(argv: string[]): Options {
       port = Number(argv[++index] ?? port);
     } else if (arg === "--open") {
       open = true;
-    } else if (!arg.startsWith("-")) {
+    } else if (arg === "--help" || arg === "-h") {
+      // Answered by `ensure` before it parses; accepted here so that parsing
+      // a help line on its own does not throw instead.
+    } else if (arg.startsWith("-")) {
+      // A mistyped option used to be dropped without a word, and its value
+      // was then taken as the project: `--prot 7420` served `./7420`.
+      throw new Error(`unknown option: ${arg} (see: console.sh ensure --help)`);
+    } else {
       target = arg;
     }
   }
@@ -147,16 +158,56 @@ async function waitForConsole(options: Options): Promise<boolean> {
 /* ------------------------------------------------------------------ board */
 
 /**
+ * `loadBoard`, with the board path in the message when the file cannot be
+ * read. `Bun.YAML.parse` reports only what it found (`YAML Parse error:
+ * Multiline implicit key`), which does not say which file to go and fix.
+ */
+async function readBoard(boardPath: string): Promise<{ board: Board; exists: boolean }> {
+  try {
+    return await loadBoard(boardPath);
+  } catch (error) {
+    throw new Error(`cannot read the board ${boardPath}: ${(error as Error).message}`);
+  }
+}
+
+/**
  * Create the minimal board when there is none, and report whether it was
  * created. Only the skeleton (`version`, `updated_at`, `items: []`) is
  * written; filling the board is product work, not a launcher's job. An
  * existing board is never read back out and written again, so its items keep
  * their exact bytes.
+ *
+ * A refused write is reported against the board path. `saveBoard` writes
+ * through `<board>.overlord-tmp.<pid>.<n>` and removes it again, so the
+ * system error names a file that no longer exists by the time it is read.
  */
 export async function ensureBoardFile(boardPath: string): Promise<boolean> {
-  if ((await loadBoard(boardPath)).exists) return false;
-  await saveBoard(boardPath, structuredClone(EMPTY_BOARD));
+  if ((await readBoard(boardPath)).exists) return false;
+  try {
+    await saveBoard(boardPath, structuredClone(EMPTY_BOARD));
+  } catch (error) {
+    const code = (error as { code?: string }).code;
+    if (code === "EACCES" || code === "EPERM") {
+      throw new Error(`cannot create the board ${boardPath}: permission denied`);
+    }
+    throw error;
+  }
   return true;
+}
+
+/**
+ * The project directory has to exist already.
+ *
+ * `ensure` writes `docs/product-ops/board.yaml` and `.overlord/console.log`
+ * under it, so a mistyped path would otherwise become a new project
+ * directory with a console serving it, and the command would exit 0.
+ * `console.sh <project>` never created a directory either.
+ */
+async function isDirectory(path: string): Promise<boolean> {
+  return stat(path).then(
+    (entry) => entry.isDirectory(),
+    () => false,
+  );
 }
 
 /* ----------------------------------------------------------------- server */
@@ -175,6 +226,17 @@ function serverArgs(options: Options): string[] {
   return args;
 }
 
+/**
+ * The line that stops the console on a port.
+ *
+ * `-sTCP:LISTEN` is not optional: `lsof -ti tcp:<port>` also lists every
+ * process *connected* to the port, so the plain form kills the browser that
+ * has the console open along with the server.
+ */
+function killListener(port: number): string {
+  return `kill $(lsof -ti tcp:${port} -sTCP:LISTEN)`;
+}
+
 /** Quote one argument for the shell line cmux types into the workspace. */
 export function shellQuote(value: string): string {
   return /^[A-Za-z0-9_@%+=:,./-]+$/.test(value)
@@ -185,10 +247,17 @@ export function shellQuote(value: string): string {
 /**
  * Start the console in a cmux workspace.
  *
- * `cmux new-workspace --command` starts the workspace terminal and runs the
- * line in it without selecting the workspace, so the user's current workspace
- * stays where it is and the console is one visible workspace they can close
- * themselves.
+ * `cmux new-workspace --command` runs the line without selecting the
+ * workspace, so the user's current workspace stays where it is and the
+ * console is one visible workspace they can close themselves.
+ *
+ * `startTerminal: false` is what keeps that true. cmux reports `tty: null`
+ * for a workspace it has just created, and `createWorkspace` would take that
+ * as a terminal to start, which selects the new workspace for ~1.2 s and
+ * selects the previous one back afterwards -- best-effort, so a failed
+ * restore leaves the user in the console's workspace. Nothing here sends
+ * input to that terminal: the console is started by `--command` and read
+ * over HTTP.
  */
 async function startInCmux(options: Options, root: string): Promise<Started> {
   const command = [CONSOLE_SH, ...serverArgs(options)].map(shellQuote).join(" ");
@@ -197,11 +266,12 @@ async function startInCmux(options: Options, root: string): Promise<Started> {
     cwd: root,
     command,
     description: options.boardPath,
+    startTerminal: false,
   });
   const ref = created.workspaceRef ?? "the new workspace";
   return {
     mode: "cmux",
-    stop: `close the cmux workspace ${ref}, or: kill $(lsof -ti tcp:${options.port})`,
+    stop: `close the cmux workspace ${ref}, or: ${killListener(options.port)}`,
     detail: `cmux workspace ${ref}`,
   };
 }
@@ -304,12 +374,38 @@ async function registerCommander(boardPath: string): Promise<string> {
     () => process.cwd(),
   );
 
-  const { board } = await loadBoard(boardPath);
-  if (sameSession(board.commander, session)) return "unchanged";
+  const { board } = await readBoard(boardPath);
+  if (sameSession(board.commander, session)) {
+    return `unchanged, this session is already the commander (surface ${
+      session.surface_id ?? "unknown"
+    })`;
+  }
   await mutateBoard(boardPath, undefined, (current) => {
     current.commander = session;
   });
   return `registered, surface ${session.surface_id ?? "unknown"}`;
+}
+
+/**
+ * Report the commander line, on every path that gets far enough to have one.
+ *
+ * The already running path reports it too: a console that is up is a console
+ * another session can take over by running `ensure` from there, and the
+ * output has to say whether the board was written or was already the same.
+ * An unchanged commander is not written back, so the re-run stays a no-op.
+ */
+async function reportCommander(boardPath: string, cmuxUp: boolean): Promise<void> {
+  if (!cmuxUp) {
+    report("commander", "not registered, cmux is not reachable");
+    report("", "register the session from the console sidebar instead");
+    return;
+  }
+  try {
+    report("commander", await registerCommander(boardPath));
+  } catch (error) {
+    report("commander", `not registered: ${(error as Error).message}`);
+    report("", "register the session from the console sidebar instead");
+  }
 }
 
 /* -------------------------------------------------------------------- CLI */
@@ -321,7 +417,8 @@ and without opening a browser.
 
 arguments:
   <project>           project directory, or a board.yaml inside one
-                      (default: the current directory)
+                      (default: the current directory). It has to exist:
+                      this command creates the board file, not the project
 
 options:
   --port <n>          port to serve on (default: $OVERLORD_PORT, else 7377)
@@ -344,11 +441,22 @@ export async function ensure(argv: string[]): Promise<number> {
   report("board", options.boardPath);
   report("console", address);
 
+  /* 1b. the project has to exist; this command does not create one. */
+  if (!(await isDirectory(root))) {
+    process.stderr.write(
+      `project directory does not exist: ${root}\n` +
+        `create it first, or name one that exists: ` +
+        `console.sh ensure <project>\n`,
+    );
+    return 1;
+  }
+
   /* 2. a console already serving this board is left exactly as it is. */
   const running = await probeConsole(options.port);
   if (running.kind === "console" && running.boardPath === options.boardPath) {
     report("server", "already running, nothing started");
-    report("stop", `kill $(lsof -ti tcp:${options.port})`);
+    report("stop", killListener(options.port));
+    await reportCommander(options.boardPath, await cmux.available());
     if (options.open) await openInCmux(address);
     return 0;
   }
@@ -399,21 +507,18 @@ export async function ensure(argv: string[]): Promise<number> {
   }
 
   /* 5. the commander is a cmux session, so there is none to record without cmux. */
-  if (!cmuxUp) {
-    report("commander", "not registered, cmux is not reachable");
-    report("", "register the session from the console sidebar instead");
-    return 0;
-  }
-  try {
-    report("commander", await registerCommander(options.boardPath));
-  } catch (error) {
-    report("commander", `not registered: ${(error as Error).message}`);
-    report("", "register the session from the console sidebar instead");
-  }
+  await reportCommander(options.boardPath, cmuxUp);
   return 0;
 }
 
-/** `--open` on an already running console: the server cannot do it any more. */
+/**
+ * `--open` on an already running console: the server cannot do it any more.
+ *
+ * No `--workspace` is passed, so the pane may land in the default workspace
+ * of `cmux browser open` (`$CMUX_WORKSPACE_ID`, the calling session) rather
+ * than in the console's own workspace, which is where the server-side
+ * `--open` puts it. Not measured against the running app.
+ */
 async function openInCmux(address: string): Promise<void> {
   const result = await cmux.run(["browser", "open", address]);
   if (result.code !== 0) {

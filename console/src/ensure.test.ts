@@ -17,15 +17,28 @@
  * of the `/Applications/cmux.app` fallback, so a stub on PATH is what both
  * the reachable and the unreachable case are built from, and no test can
  * reach the real cmux app.
+ *
+ * That holds for the subprocess tests through `runEnsure`'s env, and for the
+ * tests that call `ensure()` in this process through `PATH_STUB` below: this
+ * process's own PATH is pointed at an unreachable stub before any test runs,
+ * because `cmux.ts` caches the binary it resolved and would otherwise reach
+ * the real cmux app the moment a control-flow change let it get that far.
  */
 
 import { afterAll, describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { loadBoard, saveBoard, type Board } from "./board.ts";
+import { loadBoard, mutateBoard, saveBoard, type Board } from "./board.ts";
+import * as cmux from "./cmux.ts";
 import {
   callerSession,
   ensure,
@@ -38,6 +51,26 @@ import {
 
 const temporaries: string[] = [];
 const startedPorts: number[] = [];
+const startedPids: number[] = [];
+
+/**
+ * PATH for this process, for the tests that run `ensure()` in-process.
+ *
+ * `cmux.ts` keeps the binary it first resolved for the life of the process
+ * and looks at PATH before `$CMUX_BIN`, so this is set once, before any test
+ * runs, and every in-process cmux call from then on lands on a stub that
+ * exits 127. Without it an in-process `ensure()` that got past its early
+ * return would create a workspace in the developer's own cmux app.
+ */
+const PATH_STUB = mkdtempSync(join(tmpdir(), "overlord-ensure-path-"));
+temporaries.push(PATH_STUB);
+writeFileSync(
+  join(PATH_STUB, "cmux"),
+  ['#!/bin/sh', 'echo "cmux: command not found" >&2', "exit 127", ""].join("\n"),
+  "utf8",
+);
+chmodSync(join(PATH_STUB, "cmux"), 0o755);
+process.env.PATH = `${PATH_STUB}:${process.env.PATH ?? ""}`;
 
 async function scratch(): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), "overlord-ensure-"));
@@ -76,18 +109,24 @@ async function listeningPids(port: number): Promise<number[]> {
     .filter((pid) => Number.isInteger(pid) && pid > 0 && pid !== process.pid);
 }
 
-async function stopConsole(port: number): Promise<void> {
-  const pids = await listeningPids(port);
-  for (const pid of pids) {
-    try {
-      process.kill(pid, "SIGTERM");
-    } catch {
-      // already gone
-    }
+function stopPid(pid: number): void {
+  try {
+    process.kill(pid, "SIGTERM");
+  } catch {
+    // already gone
   }
 }
 
+async function stopConsole(port: number): Promise<void> {
+  for (const pid of await listeningPids(port)) stopPid(pid);
+}
+
 afterAll(async () => {
+  // A pid is the exact process this file started. A port is only the process
+  // that holds it now, which after an ephemeral port is released can be an
+  // unrelated one, so it is the fallback for servers whose pid never reached
+  // this file.
+  for (const pid of startedPids) stopPid(pid);
   for (const port of startedPorts) await stopConsole(port);
   for (const dir of temporaries) await rm(dir, { recursive: true, force: true });
 });
@@ -137,9 +176,11 @@ const TREE_JSON = JSON.stringify({
                   id: "0BE47E1C-0000-4000-8000-000000000003",
                   title: "console",
                   type: "terminal",
-                  // Non-null, so `createWorkspace` never selects a workspace
-                  // to start its terminal.
-                  tty: "ttys099",
+                  // What the real cmux reports for a workspace it has just
+                  // created, `--command` or not: the terminal process has no
+                  // tty yet. `createWorkspace` must still not select the
+                  // workspace to give it one.
+                  tty: null,
                   url: null,
                   selected: true,
                   focused: false,
@@ -309,6 +350,38 @@ describe("parseArgs", () => {
     expect(() => parseArgs(["--port", "no"])).toThrow("invalid port");
     expect(() => parseArgs(["--port", "70000"])).toThrow("invalid port");
   });
+
+  test("rejects a mistyped option instead of taking its value as the project", () => {
+    // `--prot 7420` used to be dropped silently, leaving `7420` as the
+    // positional argument and `./7420` as the project.
+    expect(() => parseArgs(["--prot", "7420"])).toThrow("unknown option: --prot");
+    expect(() => parseArgs(["--opne"])).toThrow("unknown option: --opne");
+    expect(() => parseArgs(["-p", "7420"])).toThrow("unknown option: -p");
+  });
+
+  test("still parses a help line rather than throwing on it", () => {
+    expect(parseArgs(["--help"]).port).toBe(7377);
+    expect(parseArgs(["-h"]).port).toBe(7377);
+  });
+});
+
+/* --------------------------------------------------------- cmux isolation */
+
+describe("in-process cmux", () => {
+  test("resolves to the stub on PATH, never to the real cmux app", async () => {
+    expect(Bun.which("cmux", { PATH: process.env.PATH! })).toBe(join(PATH_STUB, "cmux"));
+    // The stub is what actually ran: it exits 127 with the shell's own
+    // wording, where an unresolved binary would never be spawned and
+    // `cmux.run` would answer with its own "cmux CLI not found".
+    const result = await cmux.run(["ping"]);
+    expect(result.code).toBe(127);
+    expect(result.stderr).toContain("cmux: command not found");
+    expect(result.stderr).not.toContain("cmux CLI not found");
+    // This call also fixes `cmux.ts`'s cached binary to the stub for the rest
+    // of the run, which is what keeps `ensure()` in this process away from
+    // the developer's cmux app whatever the control flow does.
+    expect(await cmux.available()).toBe(false);
+  });
 });
 
 describe("shellQuote", () => {
@@ -465,6 +538,27 @@ describe("ensure on an occupied port", () => {
   });
 });
 
+/* -------------------------------------------------- missing project root */
+
+describe("ensure on a directory that does not exist", () => {
+  test("fails without creating the project, the board or a server", async () => {
+    const missing = join(await scratch(), "typo-project");
+    const port = await freePort();
+
+    const { code, stdout, stderr } = await capture(() =>
+      ensure([missing, "--port", String(port)]),
+    );
+
+    expect(code).toBe(1);
+    expect(stderr).toContain(missing);
+    expect(stderr).toContain("does not exist");
+    // Nothing under the mistyped path, and no server on the port.
+    expect(existsSync(missing)).toBe(false);
+    expect(stdout).not.toContain("started");
+    expect(await probeConsole(port)).toEqual({ kind: "absent" });
+  });
+});
+
 /* --------------------------------------------------------------- no cmux */
 
 describe("ensure without cmux", () => {
@@ -520,7 +614,11 @@ describe("ensure without cmux", () => {
       expect(elapsed!).toBeLessThan(5_000);
 
       // Running it again starts nothing: same listener, no EADDRINUSE.
+      // From here the server is tracked by pid: the port alone would let a
+      // later cleanup kill whatever process the kernel handed the port to.
       const pid = Number(first.stdout.match(/detached process (\d+)/)![1]);
+      startedPids.push(pid);
+      startedPorts.splice(startedPorts.indexOf(port), 1);
       const second = await runEnsure([root, "--port", String(port)], stub, root);
       expect(second.code).toBe(0);
       expect(second.stderr).toBe("");
@@ -533,7 +631,7 @@ describe("ensure without cmux", () => {
       expect(await listeningPids(port)).toEqual([pid]);
       expect((await state(port)).boardPath).toBe(boardPath);
 
-      await stopConsole(port);
+      stopPid(pid);
     },
     60_000,
   );
@@ -593,6 +691,40 @@ describe("ensure with cmux", () => {
 
       // The watcher established, because the board existed before the start.
       expect(readFileSync(serverLog, "utf8")).not.toContain("board watch unavailable");
+
+      // A second run against the console that is now up starts nothing and
+      // says the commander is the one already on the board.
+      const again = await runEnsure([root, "--port", String(port)], stub, root);
+      expect(again.stderr).toBe("");
+      expect(again.code).toBe(0);
+      expect(again.stdout).toContain("server:           already running, nothing started");
+      expect(again.stdout).toContain("commander:        unchanged, this session is already");
+      expect(readFileSync(callLog, "utf8")).not.toContain("select-workspace");
+
+      // A different session running `ensure` takes an already running console
+      // over: the early return used to skip the registration entirely.
+      await mutateBoard(boardPath, undefined, (current) => {
+        current.commander = {
+          workspace_id: "0BE47E1C-0000-4000-8000-00000000000A",
+          surface_id: "0BE47E1C-0000-4000-8000-00000000000B",
+          cwd: "/tmp/elsewhere",
+        };
+      });
+      const takeover = await runEnsure([root, "--port", String(port)], stub, root);
+      expect(takeover.stderr).toBe("");
+      expect(takeover.code).toBe(0);
+      expect(takeover.stdout).toContain("server:           already running, nothing started");
+      expect(takeover.stdout).toContain(
+        "commander:        registered, surface 0BE47E1C-0000-4000-8000-000000000004",
+      );
+      expect(takeover.stdout).not.toContain("started, cmux workspace");
+      expect((await loadBoard(boardPath)).board.commander).toEqual({
+        workspace_id: "0BE47E1C-0000-4000-8000-000000000002",
+        surface_id: "0BE47E1C-0000-4000-8000-000000000004",
+        cwd: expect.any(String),
+      });
+      // Taking over did not touch the items either.
+      expect((await loadBoard(boardPath)).board.items).toEqual(itemsBefore);
 
       await stopConsole(port);
     },

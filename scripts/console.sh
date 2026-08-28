@@ -10,6 +10,8 @@ set -euo pipefail
 #   scripts/console.sh ensure [/path/to/project] [--port 7400] [--open]
 #     起動済みなら何も起動せず URL を出力する。未起動なら board.yaml を用意して
 #     サーバーを起動し、cmux が使えるときは司令塔も登録する。ブラウザは開かない。
+#     第1引数の ensure は必ずサブコマンドとして解釈される。ensure という名前の
+#     ディレクトリを対象にするときは ./ensure と書く。
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 console_dir="$(cd "$script_dir/.." && pwd)/console"
