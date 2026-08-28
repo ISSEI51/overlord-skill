@@ -128,6 +128,8 @@ docs/product-ops/board.yaml を作成してください。
 
 別のターミナルでコンソールを起動し、サイドバーの「変更」からこの Claude Code セッションを司令塔として登録します（司令塔側からは `cmux identify --json` で自分を登録することもできます）。
 
+リポジトリのマージ方式の設定については、[なぜ merge commit なのか](#なぜ-merge-commit-なのか)を参照してください。
+
 ## 日常の使い方
 
 1. **気づきを残す**: トップバーの「気づきを追加」、またはサイドバーの「気づきをカードに」
@@ -141,3 +143,30 @@ docs/product-ops/board.yaml を作成してください。
 - 1リポジトリ1 `board.yaml` が原則です。複数リポジトリはコンソールを別ポートで並行起動してください
 - コンソールはあなたが見る画面であり、AIは常に `board.yaml` を読んで作業します。書き込みは楽観ロックで保護され、AIの更新が黙って上書きされることはありません
 - 実装したAIに自分の変更を最終確認させないため、独立レビューは別のサブエージェントが行います
+- main 向けのPR（カードの配送PR）は **merge commit** でマージします。squash と rebase は使いません
+
+### なぜ merge commit なのか
+
+squash は main に新しいコミットを1つ作ります。作業ブランチ側の元のコミットは main の履歴に入らないため、内容が同じでもマージ後に merge-base が前進しません。この状態で、main の squash コミットが変更した行、またはその近傍の行を作業ブランチが再度変更すると、次の main 向けPRがその行で競合します。実際に PR #10 がこの経路で競合し、手作業で解消しました。
+
+squash を使うと**必ず**競合するわけではありません。両側の差分が同じ内容なら git は解決できます。競合するのは、squash が変更した行と重なる範囲を作業ブランチが再度書き換えた場合です。同じファイルでも変更行が十分に離れていれば git は自動で解決します。ただし `.gitignore` や `console/src/board.ts`、`docs/product-ops/board.yaml` のように繰り返し変更するファイルでは、squash を続ける限り再発します。
+
+merge commit なら配送のたびに merge-base が前進するため、この分岐そのものが起きません。
+
+PR #10 も squash でマージされたため、この分岐は現時点でまだ残っています。次の main 向けPRを merge commit でマージすると解消されます。
+
+この決まりは main 向けのPRについてのものです。変更（change）単位のPRは作業ブランチに向けたもので、ここでは対象外です。
+
+現在の設定は次で確認できます。
+
+```bash
+gh repo view --json squashMergeAllowed,mergeCommitAllowed,rebaseMergeAllowed
+```
+
+merge commit だけを許可する設定は、GitHub の Settings > General > Pull Requests でチェックボックスを操作するか、次のコマンドで行います。
+
+```bash
+gh repo edit --enable-merge-commit=true --enable-squash-merge=false --enable-rebase-merge=false
+```
+
+この設定はリポジトリごとに手動で行います。設定していない間は、マージ画面で merge commit を選ぶ運用で担保してください。Overlord を新しいリポジトリで使い始めるときも、同じ設定にしてください。
