@@ -515,3 +515,97 @@ describe("saveBoard staging file", () => {
     expect(leftovers).toEqual([]);
   });
 });
+
+/**
+ * The card-level `delivery` record (OV-105-C1).
+ *
+ * It is written by `change deliver`, so the write path has to keep it in the
+ * same canonical shape as `changes[]`: `delivery` between `changes` and
+ * `updated_at`, and its nested `pr` in the same key order a change's pull
+ * request uses.
+ */
+describe("delivery key order", () => {
+  const DELIVERED: Item = {
+    id: "OV-105",
+    // Written out of schema order on purpose: the writer must reorder.
+    updated_at: "2026-08-01T00:00:00Z",
+    delivery: {
+      attempted_at: "2026-08-02T00:00:00Z",
+      error: null,
+      pr: {
+        reviewed_sha: null,
+        head_sha: "a".repeat(40),
+        state: "open",
+        url: "https://github.com/o/r/pull/9",
+        number: 9,
+      },
+      base: "main",
+      branch: "overlord-console",
+    },
+    changes: [{ id: "OV-105-C1", title: "A change", state: "done" }],
+    title: "A delivered card",
+    state: "acceptance",
+  };
+
+  test("delivery is written between changes and updated_at", async () => {
+    await saveBoard(boardPath, {
+      ...structuredClone(EMPTY_BOARD),
+      items: [structuredClone(DELIVERED)],
+    });
+
+    const text = await Bun.file(boardPath).text();
+    const keys = [...text.matchAll(/^ {4}([a-z_]+):/gm)].map((m) => m[1]);
+    expect(keys).toEqual(["title", "state", "changes", "delivery", "updated_at"]);
+  });
+
+  test("the delivery pull request keeps the change pull request key order", async () => {
+    await saveBoard(boardPath, {
+      ...structuredClone(EMPTY_BOARD),
+      items: [structuredClone(DELIVERED)],
+    });
+
+    const text = await Bun.file(boardPath).text();
+    const block = text.slice(text.indexOf("delivery:"));
+    const keys = [...block.matchAll(/^ {6,8}([a-z_]+):/gm)].map((m) => m[1]);
+    expect(keys).toEqual([
+      "branch",
+      "base",
+      "pr",
+      "number",
+      "url",
+      "state",
+      "head_sha",
+      "reviewed_sha",
+      "error",
+      "attempted_at",
+    ]);
+  });
+
+  test("a card without a delivery is unchanged", async () => {
+    await saveBoard(boardPath, {
+      ...structuredClone(EMPTY_BOARD),
+      items: [item("OV-106")],
+    });
+
+    const text = await Bun.file(boardPath).text();
+    expect(text).not.toContain("delivery");
+    const reloaded = await loadBoard(boardPath);
+    expect(reloaded.board.items[0]!.delivery).toBeUndefined();
+  });
+
+  test("a delivery survives a load and a save unchanged", async () => {
+    await saveBoard(boardPath, {
+      ...structuredClone(EMPTY_BOARD),
+      items: [structuredClone(DELIVERED)],
+    });
+    const first = await Bun.file(boardPath).text();
+
+    const reloaded = await loadBoard(boardPath);
+    expect(reloaded.board.items[0]!.delivery).toEqual(DELIVERED.delivery!);
+    await saveBoard(boardPath, reloaded.board);
+
+    // Only `updated_at` at the top of the file is restamped by the writer.
+    const second = await Bun.file(boardPath).text();
+    expect(second.split("\n").slice(2)).toEqual(first.split("\n").slice(2));
+  });
+});

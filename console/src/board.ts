@@ -53,6 +53,8 @@ export type Item = {
   agent?: SessionLink | null;
   /** Engineering split of this card, in dependency order. */
   changes?: Change[] | null;
+  /** Last attempt to deliver the finished card to the default branch. */
+  delivery?: Delivery | null;
   [key: string]: Json | undefined;
 };
 
@@ -95,6 +97,32 @@ export type Change = {
   [key: string]: Json | undefined;
 };
 
+/**
+ * The card-level pull request that delivers a finished card.
+ *
+ * A card is delivered once every one of its changes is merged: the branch the
+ * card's work sits on (`branch`) is proposed against the repository default
+ * branch (`base`). One card is one delivery record, rewritten on every
+ * attempt, so the board says what the last attempt did rather than keeping a
+ * history.
+ *
+ * `pr` is the delivery pull request, in the same shape as a change's; its
+ * `reviewed_sha` stays null, because the review happened on the changes.
+ * `error` is reserved for a recorded failure and is null today: the delivery
+ * command writes this record only after `gh pr view` confirmed the pull
+ * request, so a failed attempt leaves board.yaml untouched instead of
+ * recording itself.
+ */
+export type Delivery = {
+  /** Head branch the delivery pull request was opened from. */
+  branch?: string | null;
+  /** Branch the delivery pull request merges into. */
+  base?: string | null;
+  pr?: PullRequest | null;
+  error?: string | null;
+  attempted_at?: string | null;
+};
+
 export type Board = {
   version: number;
   updated_at?: string | null;
@@ -119,12 +147,15 @@ const ITEM_KEY_ORDER = [
   "blocker",
   "agent",
   "changes",
+  "delivery",
   "updated_at",
 ];
 
 const CHANGE_KEY_ORDER = ["id", "title", "state", "agent", "branch", "pr"];
 
 const PR_KEY_ORDER = ["number", "url", "state", "head_sha", "reviewed_sha"];
+
+const DELIVERY_KEY_ORDER = ["branch", "base", "pr", "error", "attempted_at"];
 
 const BOARD_KEY_ORDER = [
   "version",
@@ -508,6 +539,15 @@ function orderKeys(value: Json, order: string[]): Json {
   }
   if (result.pr && typeof result.pr === "object" && !Array.isArray(result.pr)) {
     result.pr = orderKeys(result.pr, PR_KEY_ORDER);
+  }
+  // The nested call orders the delivery's own `pr` as well, through the branch
+  // above, so the delivery pull request keeps the same key order as a change's.
+  if (
+    result.delivery &&
+    typeof result.delivery === "object" &&
+    !Array.isArray(result.delivery)
+  ) {
+    result.delivery = orderKeys(result.delivery, DELIVERY_KEY_ORDER);
   }
   return result;
 }

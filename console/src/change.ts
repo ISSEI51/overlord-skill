@@ -15,6 +15,7 @@
  *   change pr       <change-id> [--board <path>] [--base <branch>] [--number <n>]
  *   change reviewed <change-id> [--board <path>] [--sha <sha>]
  *   change sync     [<card-id>] [--all] [--board <path>]
+ *   change deliver  <card-id> [--board <path>] [--base <branch>] [--head <branch>]
  */
 
 import { dirname, resolve } from "node:path";
@@ -24,9 +25,12 @@ import {
   canonicalItem,
   loadBoard,
   mutateBoard,
+  nowIso,
   type Board,
   type Change,
+  type Delivery,
   type Item,
+  type PullRequest,
   type State,
 } from "./board.ts";
 
@@ -127,6 +131,43 @@ export async function updateChanges(
   });
 }
 
+export class ItemNotFoundError extends Error {
+  constructor(readonly itemId: string) {
+    super(`unknown card id: ${itemId}`);
+    this.name = "ItemNotFoundError";
+  }
+}
+
+/** Resolve a card id on the board. Exact match on `items[].id`. */
+export function findItem(board: Board, itemId: string): Item | null {
+  return board.items.find((item) => item?.id === itemId) ?? null;
+}
+
+/**
+ * Read the board, mutate one card, write the board back.
+ *
+ * The card-level counterpart of `updateChange`, with the same concurrency
+ * properties: one `mutateBoard` call, so the same `<board>.lock`, and the same
+ * `canonicalItem` pass so the key order survives. `mutate` may be called more
+ * than once (see `mutateBoard`), so anything derived from the clock has to be
+ * computed by the caller and closed over rather than read inside it.
+ */
+export async function updateItem(
+  boardPath: string,
+  itemId: string,
+  mutate: (item: Item) => void,
+): Promise<Item> {
+  const { result } = await mutateBoard(boardPath, undefined, (board) => {
+    const index = board.items.findIndex((item) => item?.id === itemId);
+    if (index < 0) throw new ItemNotFoundError(itemId);
+    const item = board.items[index]!;
+    mutate(item);
+    board.items[index] = canonicalItem(item);
+    return board.items[index]!;
+  });
+  return result;
+}
+
 /**
  * Board file to operate on: `--board <path>`, else `$OVERLORD_BOARD`, else the
  * current directory. Directory targets get the standard board suffix appended
@@ -156,49 +197,123 @@ export class CommandError extends Error {
   }
 }
 
-async function run(command: string[], cwd?: string): Promise<RunResult> {
-  const proc = Bun.spawn(command, {
-    cwd,
-    // A copy of the current environment rather than the default: Bun resolves
-    // the executable against the PATH of the environment it is handed, and the
-    // default is the environment the process was started with, so a PATH set
-    // after startup would otherwise be ignored.
-    env: { ...process.env },
-    stdout: "pipe",
-    stderr: "pipe",
-    stdin: "ignore",
-  });
-  const [stdout, stderr] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-  ]);
-  const code = await proc.exited;
-  return { code, stdout, stderr };
+/**
+ * `code` for a command that never produced an exit status of its own: the
+ * executable could not be spawned, or the run was killed at `timeoutMs`. It is
+ * outside the 0-255 range a process can exit with, so it cannot collide with a
+ * real status, and every caller already treats "not 0" as a failure.
+ */
+export const RUN_FAILED = -1;
+
+/**
+ * Run a command and collect its output.
+ *
+ * Two failure modes are turned into a `RunResult` rather than an exception,
+ * because `deliverCard` is called from the console server, where an unhandled
+ * rejection would take down a request handler:
+ *
+ *   - `Bun.spawn` throws synchronously when the executable is not on the PATH
+ *     (no `gh` installed, for instance);
+ *   - a command that never finishes would otherwise hang the caller for ever,
+ *     so `timeoutMs` kills it and reports `RUN_FAILED`.
+ *
+ * Without a `timeoutMs` the call waits as long as the command takes, which is
+ * what the CLI subcommands want.
+ */
+export async function run(
+  command: string[],
+  cwd?: string,
+  timeoutMs?: number,
+): Promise<RunResult> {
+  let proc: ReturnType<typeof Bun.spawn>;
+  try {
+    proc = Bun.spawn(command, {
+      cwd,
+      // A copy of the current environment rather than the default: Bun resolves
+      // the executable against the PATH of the environment it is handed, and the
+      // default is the environment the process was started with, so a PATH set
+      // after startup would otherwise be ignored.
+      env: { ...process.env },
+      stdout: "pipe",
+      stderr: "pipe",
+      stdin: "ignore",
+    });
+  } catch (error) {
+    return {
+      code: RUN_FAILED,
+      stdout: "",
+      stderr: `${command.join(" ")}: ${(error as Error).message}\n`,
+    };
+  }
+
+  let timedOut = false;
+  const timer =
+    timeoutMs !== undefined && timeoutMs > 0
+      ? setTimeout(() => {
+          timedOut = true;
+          proc.kill();
+        }, timeoutMs)
+      : null;
+
+  try {
+    const [stdout, stderr] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+    ]);
+    const code = await proc.exited;
+    if (timedOut) {
+      return {
+        code: RUN_FAILED,
+        stdout,
+        stderr: `${stderr}${command.join(" ")}: timed out after ${timeoutMs}ms\n`,
+      };
+    }
+    return { code, stdout, stderr };
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+  }
 }
 
 export async function runOrThrow(
   command: string[],
   cwd?: string,
+  timeoutMs?: number,
 ): Promise<RunResult> {
-  const result = await run(command, cwd);
+  const result = await run(command, cwd, timeoutMs);
   if (result.code !== 0) throw new CommandError(command, result);
   return result;
 }
 
-export function git(args: string[], cwd?: string): Promise<RunResult> {
-  return run(["git", ...args], cwd);
+export function git(
+  args: string[],
+  cwd?: string,
+  timeoutMs?: number,
+): Promise<RunResult> {
+  return run(["git", ...args], cwd, timeoutMs);
 }
 
-export function gitOrThrow(args: string[], cwd?: string): Promise<RunResult> {
-  return runOrThrow(["git", ...args], cwd);
+export function gitOrThrow(
+  args: string[],
+  cwd?: string,
+  timeoutMs?: number,
+): Promise<RunResult> {
+  return runOrThrow(["git", ...args], cwd, timeoutMs);
 }
 
-export function gh(args: string[], cwd?: string): Promise<RunResult> {
-  return run(["gh", ...args], cwd);
+export function gh(
+  args: string[],
+  cwd?: string,
+  timeoutMs?: number,
+): Promise<RunResult> {
+  return run(["gh", ...args], cwd, timeoutMs);
 }
 
-export function ghOrThrow(args: string[], cwd?: string): Promise<RunResult> {
-  return runOrThrow(["gh", ...args], cwd);
+export function ghOrThrow(
+  args: string[],
+  cwd?: string,
+  timeoutMs?: number,
+): Promise<RunResult> {
+  return runOrThrow(["gh", ...args], cwd, timeoutMs);
 }
 
 /** Repository root containing `cwd`. */
@@ -214,10 +329,14 @@ export async function repoRoot(cwd?: string): Promise<string> {
  * `gh` all belong to the one repository, so every git and `gh` call in `pr`
  * runs here.
  */
-export async function mainRepoRoot(cwd?: string): Promise<string> {
+export async function mainRepoRoot(
+  cwd?: string,
+  timeoutMs?: number,
+): Promise<string> {
   const result = await gitOrThrow(
     ["rev-parse", "--path-format=absolute", "--git-common-dir"],
     cwd,
+    timeoutMs,
   );
   return dirname(resolve(result.stdout.trim()));
 }
@@ -461,11 +580,29 @@ function parseJson<T>(text: string): T | null {
   }
 }
 
+/** A failed command's own diagnostics, so they are never paraphrased. */
+function failureMessage(result: RunResult): string {
+  return result.stderr.trim() || result.stdout.trim();
+}
+
 /** Show a failed command's own diagnostics instead of paraphrasing them. */
 function reportFailure(result: RunResult): void {
-  const message = result.stderr.trim() || result.stdout.trim();
+  const message = failureMessage(result);
   if (message) process.stderr.write(`${message}\n`);
 }
+
+/**
+ * What `pushBranch` did. Returned rather than printed, because `deliverCard`
+ * has to stay silent on both streams: it is called from the console server,
+ * which owns its own output.
+ */
+export type PushOutcome = {
+  ok: boolean;
+  /** Progress lines the CLI prints on stdout. */
+  lines: string[];
+  /** The failing command's own diagnostics, or null when the push worked. */
+  error: string | null;
+};
 
 /**
  * Make sure `origin/<branch>` exists and carries the local commits.
@@ -475,37 +612,44 @@ function reportFailure(result: RunResult): void {
  * named explicitly, so the current HEAD of that checkout is never pushed by
  * accident.
  */
-async function pushBranch(root: string, branch: string): Promise<number> {
+async function pushBranch(
+  root: string,
+  branch: string,
+  timeoutMs?: number,
+): Promise<PushOutcome> {
   const upstream = await git(
     ["rev-parse", "--abbrev-ref", "--symbolic-full-name", `${branch}@{upstream}`],
     root,
+    timeoutMs,
   );
   if (upstream.code !== 0) {
-    process.stdout.write(`push:             git push -u origin ${branch}\n`);
-    const pushed = await git(["push", "-u", "origin", branch], root);
+    const lines = [`push:             git push -u origin ${branch}`];
+    const pushed = await git(["push", "-u", "origin", branch], root, timeoutMs);
     if (pushed.code !== 0) {
-      reportFailure(pushed);
-      return 1;
+      return { ok: false, lines, error: failureMessage(pushed) };
     }
-    return 0;
+    return { ok: true, lines, error: null };
   }
 
   const ahead = await git(
     ["rev-list", "--count", `${upstream.stdout.trim()}..${branch}`],
     root,
+    timeoutMs,
   );
   if (ahead.code === 0 && Number.parseInt(ahead.stdout.trim(), 10) > 0) {
-    process.stdout.write(`push:             git push origin ${branch}\n`);
-    const pushed = await git(["push", "origin", branch], root);
+    const lines = [`push:             git push origin ${branch}`];
+    const pushed = await git(["push", "origin", branch], root, timeoutMs);
     if (pushed.code !== 0) {
-      reportFailure(pushed);
-      return 1;
+      return { ok: false, lines, error: failureMessage(pushed) };
     }
-    return 0;
+    return { ok: true, lines, error: null };
   }
 
-  process.stdout.write(`push:             origin/${branch} is up to date\n`);
-  return 0;
+  return {
+    ok: true,
+    lines: [`push:             origin/${branch} is up to date`],
+    error: null,
+  };
 }
 
 /**
@@ -575,7 +719,11 @@ export async function pr(argv: string[]): Promise<number> {
 
   if (number === null) {
     const pushed = await pushBranch(root, branch);
-    if (pushed !== 0) return pushed;
+    for (const line of pushed.lines) process.stdout.write(`${line}\n`);
+    if (!pushed.ok) {
+      if (pushed.error) process.stderr.write(`${pushed.error}\n`);
+      return 1;
+    }
 
     const listed = await gh(
       ["pr", "list", "--head", branch, "--json", "number"],
@@ -1093,6 +1241,633 @@ export async function sync(argv: string[]): Promise<number> {
 }
 
 // ---------------------------------------------------------------------------
+// deliver
+// ---------------------------------------------------------------------------
+
+/** Title of the delivery pull request: the card title with its id appended. */
+export function deliveryTitleFor(item: Item): string {
+  return `${item.title} (${item.id})`;
+}
+
+/**
+ * The delivery pull request section for one card.
+ *
+ * It has to say what a reviewer of the default branch needs without opening
+ * the board: what the card is, what it was accepted against, and which change
+ * pull requests it is made of. A change with no pull request is listed as
+ * such rather than omitted, so a card cannot look complete because a piece of
+ * it was never pushed.
+ */
+export function deliveryBodyFor(item: Item): string {
+  const lines: string[] = [item.title, "", `Card: ${item.id}`, "", "受け入れ条件:"];
+
+  const conditions = Array.isArray(item.acceptance_conditions)
+    ? item.acceptance_conditions
+    : [];
+  if (conditions.length === 0) lines.push("- (board に記録なし)");
+  else for (const condition of conditions) lines.push(`- ${condition}`);
+
+  lines.push("", "Changes:");
+  const changes = Array.isArray(item.changes) ? item.changes : [];
+  if (changes.length === 0) {
+    lines.push("- (board に記録なし)");
+  } else {
+    for (const change of changes) {
+      const number = change.pr?.number;
+      const url = change.pr?.url;
+      const pullRequest =
+        typeof number === "number" ? `#${number}${url ? ` ${url}` : ""}` : "PR 無し";
+      lines.push(
+        `- ${change.id}  ${change.title}  (${change.state})  ${pullRequest}`,
+      );
+    }
+  }
+
+  return lines.join("\n");
+}
+
+/** Opening marker of one card's section inside a delivery pull request body. */
+export function deliveryStartMarker(cardId: string): string {
+  return `<!-- overlord:card ${cardId} -->`;
+}
+
+/** Closing marker of one card's section inside a delivery pull request body. */
+export function deliveryEndMarker(cardId: string): string {
+  return `<!-- /overlord:card ${cardId} -->`;
+}
+
+/**
+ * Put one card's section into a pull request body, replacing its previous one.
+ *
+ * A delivery pull request is opened per card, but one branch can carry several
+ * cards, and the same card is delivered again whenever its changes move. The
+ * section is therefore fenced by HTML comment markers that carry the card id:
+ * re-delivering the same card rewrites its own fenced section and leaves every
+ * other card's section, and any text a person wrote around them, exactly as it
+ * was. A body that does not carry this card's markers yet gets the section
+ * appended.
+ */
+export function mergeDeliveryBody(
+  existingBody: string | null | undefined,
+  cardId: string,
+  section: string,
+): string {
+  const start = deliveryStartMarker(cardId);
+  const end = deliveryEndMarker(cardId);
+  const block = `${start}\n${section.replace(/\s+$/, "")}\n${end}`;
+  const existing = existingBody ?? "";
+
+  const from = existing.indexOf(start);
+  const to = from < 0 ? -1 : existing.indexOf(end, from + start.length);
+  if (from >= 0 && to >= 0) {
+    return existing.slice(0, from) + block + existing.slice(to + end.length);
+  }
+
+  const head = existing.replace(/\s+$/, "");
+  return head ? `${head}\n\n${block}\n` : `${block}\n`;
+}
+
+/**
+ * The changes of a card that are not merged yet.
+ *
+ * `done` is the only change state that means the pull request is merged;
+ * `reviewing` and `blocked` both mean work is still open, and a `closed` pull
+ * request leaves the change wherever the commander put it. A card with no
+ * changes at all has nothing unmerged.
+ */
+export function unmergedChanges(item: Item): Change[] {
+  const changes = Array.isArray(item.changes) ? item.changes : [];
+  return changes.filter((change) => change && change.state !== "done");
+}
+
+/** `gh pr view` fields the delivery pull request is verified against. */
+export type DeliveryView = PullRequestView & { baseRefName: string };
+
+const DELIVERY_VIEW_FIELDS =
+  "number,url,state,headRefOid,headRefName,baseRefName";
+
+export type DeliverOptions = {
+  boardPath: string;
+  cardId: string;
+  /** Directory to resolve the repository from; the process cwd by default. */
+  cwd?: string;
+  /** Branch to merge into; resolved from the repository when not given. */
+  base?: string | null;
+  /** Branch to deliver; the current branch of the main checkout by default. */
+  head?: string | null;
+  /** Per-command timeout for every git and `gh` call. */
+  timeoutMs?: number;
+};
+
+export type DeliverOutcome = {
+  status: "created" | "updated" | "skipped" | "blocked" | "failed";
+  /** Why the run ended this way; absent when there is nothing to explain. */
+  reason?: string;
+  /** The delivery pull request, as it was written to the board. */
+  pr?: PullRequest;
+  /** `<change-id>  <title>` for every change that is not merged yet. */
+  unmerged?: string[];
+  /** Non-fatal problems: the run continued in spite of them. */
+  warnings: string[];
+};
+
+/**
+ * The branch a delivery pull request merges into.
+ *
+ * `origin/HEAD` is what the repository itself says the default branch is, so
+ * it is asked first and costs no network call. It is a local symbolic ref that
+ * only exists once something set it (`git clone` does, `git init` does not), so
+ * GitHub is asked next, and `main` is the last resort rather than an error:
+ * a wrong base is caught by the `baseRefName` check before anything is
+ * written to the board.
+ */
+export async function resolveDeliveryBase(
+  root: string,
+  timeoutMs?: number,
+): Promise<string> {
+  const symbolic = await git(
+    ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+    root,
+    timeoutMs,
+  );
+  if (symbolic.code === 0) {
+    // `origin/main` -> `main`: the remote name is a prefix of the short form.
+    const value = symbolic.stdout.trim();
+    const slash = value.indexOf("/");
+    const branch = slash >= 0 ? value.slice(slash + 1) : value;
+    if (branch) return branch;
+  }
+
+  const viewed = await gh(
+    ["repo", "view", "--json", "defaultBranchRef"],
+    root,
+    timeoutMs,
+  );
+  if (viewed.code === 0) {
+    const parsed = parseJson<{ defaultBranchRef?: { name?: unknown } }>(
+      viewed.stdout,
+    );
+    const name = parsed?.defaultBranchRef?.name;
+    if (typeof name === "string" && name.trim()) return name.trim();
+  }
+
+  return "main";
+}
+
+/**
+ * Deliver one finished card to the repository default branch.
+ *
+ * Writes nothing to stdout or stderr: everything it did is in the returned
+ * `DeliverOutcome`, so the console server can call it from a request handler
+ * and the CLI wrapper can print it.
+ *
+ * The order of the steps is the point of the command:
+ *
+ *  1. every change pull request is synchronized first, so the merge state the
+ *     block decision is made on is GitHub's, not whatever the board last
+ *     recorded. Without this, a card whose changes were merged in the web UI
+ *     would be reported as unmergeable;
+ *  2. a card with any unmerged change is refused before a pull request exists
+ *     and before the board records a delivery, so a half-finished card cannot
+ *     be proposed for the default branch by accident;
+ *  3. the pull request is only recorded after `gh pr view` confirmed that it
+ *     really is `head -> base`. A failure at any step therefore leaves
+ *     `board.yaml` exactly as it was and the command can be run again.
+ *
+ * Idempotent: an open pull request for the same head and base is edited rather
+ * than a second one created, and its title is left alone because a person may
+ * have renamed it. A head that is already identical to the base is reported as
+ * skipped instead of producing an empty pull request.
+ */
+export async function deliverCard(
+  options: DeliverOptions,
+): Promise<DeliverOutcome> {
+  const { boardPath, cardId, cwd, timeoutMs } = options;
+  const warnings: string[] = [];
+
+  const loaded = await loadBoard(boardPath);
+  if (!loaded.exists) {
+    return { status: "failed", reason: `board not found: ${boardPath}`, warnings };
+  }
+  const item = findItem(loaded.board, cardId);
+  if (!item) {
+    return {
+      status: "failed",
+      reason: `unknown card id: ${cardId} (board: ${boardPath})`,
+      warnings,
+    };
+  }
+
+  let root: string;
+  try {
+    root = await mainRepoRoot(cwd, timeoutMs);
+  } catch (error) {
+    return {
+      status: "failed",
+      reason: `could not resolve the repository root: ${(error as Error).message}`,
+      warnings,
+    };
+  }
+
+  // 1. Synchronize this card's change pull requests before deciding anything.
+  const synced = await syncCardChanges(boardPath, item, root, timeoutMs);
+  warnings.push(...synced);
+
+  // 2. Refuse a card that is not finished, before creating or writing anything.
+  const unmerged = unmergedChanges(item);
+  if (unmerged.length > 0) {
+    return {
+      status: "blocked",
+      reason:
+        `${unmerged.length} of ${item.changes?.length ?? 0} changes of ` +
+        `${cardId} are not merged`,
+      unmerged: unmerged.map((change) => `${change.id}  ${change.title}`),
+      warnings,
+    };
+  }
+
+  // 3. Head: the branch the card's work sits on.
+  let head = options.head?.trim() || null;
+  if (!head) {
+    const current = await git(
+      ["rev-parse", "--abbrev-ref", "HEAD"],
+      root,
+      timeoutMs,
+    );
+    if (current.code !== 0) {
+      return {
+        status: "failed",
+        reason: `could not read the current branch: ${failureMessage(current)}`,
+        warnings,
+      };
+    }
+    head = current.stdout.trim();
+    if (!head || head === "HEAD") {
+      return {
+        status: "failed",
+        reason:
+          `${root} has a detached HEAD, so there is no branch to deliver; ` +
+          "pass --head <branch>",
+        warnings,
+      };
+    }
+  }
+
+  const base = options.base?.trim() || (await resolveDeliveryBase(root, timeoutMs));
+
+  if (head === base) {
+    return {
+      status: "skipped",
+      reason: "same-branch",
+      warnings,
+    };
+  }
+
+  // 4. Bring `origin/<base>` up to date so the diff below is against what the
+  //    pull request would actually merge into. A failure here only makes the
+  //    comparison older, so it is a warning and the run continues.
+  const fetched = await git(["fetch", "origin", base], root, timeoutMs);
+  if (fetched.code !== 0) {
+    warnings.push(
+      `git fetch origin ${base} failed; comparing against the local ref: ` +
+        failureMessage(fetched),
+    );
+  }
+
+  // 5. Nothing to propose is not a failure: the branch is already delivered,
+  //    or the work landed some other way.
+  const remoteRef = `origin/${base}`;
+  const hasRemoteRef =
+    (
+      await git(
+        ["rev-parse", "--verify", "--quiet", `refs/remotes/${remoteRef}`],
+        root,
+        timeoutMs,
+      )
+    ).code === 0;
+  const diffBase = hasRemoteRef ? remoteRef : base;
+  const diff = await git(["diff", "--quiet", diffBase, head], root, timeoutMs);
+  if (diff.code === 0) {
+    return { status: "skipped", reason: "no-diff", warnings };
+  }
+  // `git diff --quiet` exits 1 for "there are differences" and above 1 for a
+  // real error, which must not be read as a difference.
+  if (diff.code !== 1) {
+    return {
+      status: "failed",
+      reason: `git diff ${diffBase} ${head} failed: ${failureMessage(diff)}`,
+      warnings,
+    };
+  }
+
+  const push = await pushBranch(root, head, timeoutMs);
+  if (!push.ok) {
+    return {
+      status: "failed",
+      reason: push.error || `git push origin ${head} failed`,
+      warnings,
+    };
+  }
+
+  // 6. Reuse the pull request already open for this head and base.
+  const listed = await gh(
+    [
+      "pr",
+      "list",
+      "--head",
+      head,
+      "--base",
+      base,
+      "--state",
+      "open",
+      "--json",
+      "number,url",
+    ],
+    root,
+    timeoutMs,
+  );
+  if (listed.code !== 0) {
+    return {
+      status: "failed",
+      reason: `gh pr list --head ${head} failed: ${failureMessage(listed)}`,
+      warnings,
+    };
+  }
+  const open = parseJson<{ number: number }[]>(listed.stdout.trim() || "[]");
+  if (!open || !Array.isArray(open)) {
+    return {
+      status: "failed",
+      reason: `could not read: gh pr list --head ${head} --base ${base}`,
+      warnings,
+    };
+  }
+
+  const section = deliveryBodyFor(item);
+  let status: "created" | "updated";
+  let ref: string;
+
+  if (open.length > 0 && typeof open[0]!.number === "number") {
+    const number = open[0]!.number;
+    // Read the body first: the card's section replaces its own previous one and
+    // leaves everything else in place, so it cannot be merged blind.
+    const body = await gh(
+      ["pr", "view", String(number), "--json", "body"],
+      root,
+      timeoutMs,
+    );
+    let existingBody = "";
+    if (body.code !== 0) {
+      warnings.push(
+        `gh pr view ${number} --json body failed; the body is rewritten from ` +
+          `the board alone: ${failureMessage(body)}`,
+      );
+    } else {
+      const parsed = parseJson<{ body?: unknown }>(body.stdout);
+      existingBody = typeof parsed?.body === "string" ? parsed.body : "";
+    }
+
+    // The title is deliberately not passed: a person may have renamed the
+    // pull request, and re-delivering a card must not undo that.
+    const edited = await gh(
+      [
+        "pr",
+        "edit",
+        String(number),
+        "--body",
+        mergeDeliveryBody(existingBody, cardId, section),
+      ],
+      root,
+      timeoutMs,
+    );
+    if (edited.code !== 0) {
+      return {
+        status: "failed",
+        reason: `gh pr edit ${number} failed: ${failureMessage(edited)}`,
+        warnings,
+      };
+    }
+    status = "updated";
+    ref = String(number);
+  } else {
+    const created = await gh(
+      [
+        "pr",
+        "create",
+        "--base",
+        base,
+        "--head",
+        head,
+        "--title",
+        deliveryTitleFor(item),
+        "--body",
+        mergeDeliveryBody("", cardId, section),
+      ],
+      root,
+      timeoutMs,
+    );
+    if (created.code !== 0) {
+      return {
+        status: "failed",
+        reason: `gh pr create failed: ${failureMessage(created)}`,
+        warnings,
+      };
+    }
+    status = "created";
+    ref = head;
+  }
+
+  // 7. Verify before writing: the pull request has to be this head against
+  //    this base. `gh pr list --head` matches on the branch name alone, which
+  //    a fork or a renamed branch can satisfy with someone else's pull request.
+  const viewed = await gh(
+    ["pr", "view", ref, "--json", DELIVERY_VIEW_FIELDS],
+    root,
+    timeoutMs,
+  );
+  if (viewed.code !== 0) {
+    return {
+      status: "failed",
+      reason: `gh pr view ${ref} failed: ${failureMessage(viewed)}`,
+      warnings,
+    };
+  }
+  const view = parseJson<DeliveryView>(viewed.stdout);
+  if (!view || typeof view.number !== "number") {
+    return {
+      status: "failed",
+      reason: `could not read: gh pr view ${ref}`,
+      warnings,
+    };
+  }
+  if (view.headRefName !== head || view.baseRefName !== base) {
+    return {
+      status: "failed",
+      reason:
+        `pull request #${view.number} is ` +
+        `"${view.headRefName ?? "(unknown)"}" -> ` +
+        `"${view.baseRefName ?? "(unknown)"}", not "${head}" -> "${base}". ` +
+        `Nothing was written to ${boardPath}.`,
+      warnings,
+    };
+  }
+
+  const pullRequest: PullRequest = {
+    number: view.number,
+    url: view.url ?? null,
+    state: normalizePrState(view.state),
+    head_sha: view.headRefOid ?? null,
+    // The review happened on the changes; the delivery pull request carries
+    // no review of its own.
+    reviewed_sha: null,
+  };
+  // Read once, outside the mutation: `mutateBoard` may apply it twice, and a
+  // timestamp read inside would differ between the two passes.
+  const attemptedAt = nowIso();
+  const delivery: Delivery = {
+    branch: head,
+    base,
+    pr: pullRequest,
+    error: null,
+    attempted_at: attemptedAt,
+  };
+  await updateItem(boardPath, cardId, (target) => {
+    target.delivery = delivery;
+  });
+
+  return { status, pr: pullRequest, warnings };
+}
+
+/**
+ * Synchronize the change pull requests of one card and return the warnings.
+ *
+ * The same read-and-apply `sync` performs, narrowed to one card and reporting
+ * instead of printing. `item` is mutated in place as well as written, so the
+ * caller's merge decision is made on the state just read from GitHub rather
+ * than on the board copy it loaded a moment earlier.
+ *
+ * A pull request that could not be read, or that is not on the branch recorded
+ * for the change, is a warning and leaves the change exactly as the board has
+ * it: not merged, so the card is blocked rather than delivered on a guess.
+ */
+async function syncCardChanges(
+  boardPath: string,
+  item: Item,
+  root: string,
+  timeoutMs?: number,
+): Promise<string[]> {
+  const warnings: string[] = [];
+  const targets = syncTargets([item]);
+  if (targets.length === 0) return warnings;
+
+  const views = new Map<string, PullRequestView>();
+  for (const target of targets) {
+    const number = target.change.pr!.number!;
+    const viewed = await gh(
+      ["pr", "view", String(number), "--json", PR_VIEW_FIELDS],
+      root,
+      timeoutMs,
+    );
+    if (viewed.code !== 0) {
+      warnings.push(
+        `${target.change.id}: gh pr view ${number} failed: ${failureMessage(viewed)}`,
+      );
+      continue;
+    }
+    const view = parseJson<PullRequestView>(viewed.stdout);
+    if (!view || typeof view.number !== "number") {
+      warnings.push(`${target.change.id}: could not read: gh pr view ${number}`);
+      continue;
+    }
+    const branch = target.change.branch ?? null;
+    if (!branch || view.headRefName !== branch) {
+      warnings.push(
+        `${target.change.id}: pull request #${view.number} is on branch ` +
+          `"${view.headRefName ?? "(unknown)"}", not the branch recorded for ` +
+          `the change ("${branch ?? "(none)"}"); skipped, nothing written`,
+      );
+      continue;
+    }
+    views.set(target.change.id, view);
+  }
+
+  const moved: string[] = [];
+  for (const target of targets) {
+    const view = views.get(target.change.id);
+    if (!view) continue;
+    if (applyPullRequestView(target.change, view).changed) {
+      moved.push(target.change.id);
+    }
+    const gap = reviewGapLine(
+      target.change.id,
+      target.change.pr?.head_sha,
+      target.change.pr?.reviewed_sha,
+    );
+    if (gap) warnings.push(gap);
+  }
+
+  if (moved.length > 0) {
+    await updateChanges(boardPath, moved, (change) => {
+      const view = views.get(change.id);
+      if (view) applyPullRequestView(change, view);
+    });
+  }
+
+  return warnings;
+}
+
+/**
+ * CLI wrapper around `deliverCard`: it only formats the outcome.
+ *
+ * Exit codes match the other subcommands: 0 when the card was delivered or
+ * there was nothing to deliver, 1 when the card is blocked or a git, `gh` or
+ * board step failed, 2 for a usage error.
+ */
+export async function deliver(argv: string[]): Promise<number> {
+  const { positional, options } = parseArgs(argv);
+  const cardId = positional[0];
+  if (!cardId) {
+    process.stderr.write(
+      "usage: change deliver <card-id> [--base <branch>] [--head <branch>]\n",
+    );
+    return 2;
+  }
+
+  const boardPath = resolveBoardPath(options.board);
+  const outcome = await deliverCard({
+    boardPath,
+    cardId,
+    base: options.base ?? null,
+    head: options.head ?? null,
+  });
+
+  for (const warning of outcome.warnings) process.stderr.write(`${warning}\n`);
+
+  process.stdout.write(`card:             ${cardId}\n`);
+  process.stdout.write(`delivery:         ${outcome.status}\n`);
+  if (outcome.status === "skipped" && outcome.reason) {
+    process.stdout.write(`reason:           ${outcome.reason}\n`);
+  }
+  if (outcome.pr) {
+    process.stdout.write(
+      `pull request:     #${outcome.pr.number} (${outcome.pr.state})\n`,
+    );
+    process.stdout.write(`board updated:    ${boardPath}\n`);
+  }
+  for (const line of outcome.unmerged ?? []) {
+    process.stderr.write(`not merged:       ${line}\n`);
+  }
+  if (
+    (outcome.status === "blocked" || outcome.status === "failed") &&
+    outcome.reason
+  ) {
+    process.stderr.write(`${outcome.reason}\n`);
+  }
+  if (outcome.pr?.url) process.stdout.write(`${outcome.pr.url}\n`);
+
+  return outcome.status === "blocked" || outcome.status === "failed" ? 1 : 0;
+}
+
+// ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
 
@@ -1109,11 +1884,18 @@ commands:
   sync [<card-id>]    read the pull request state of every recorded change of
                       one card, or of the whole board with --all, and write it
                       back in a single board write
+  deliver <card-id>   synchronize the card's changes, then open (or update) the
+                      pull request that merges the finished card into the
+                      repository default branch, and record it in the card's
+                      delivery
 
 options:
   --board <path>      board.yaml, or a project directory containing one
                       (default: $OVERLORD_BOARD, else the current directory)
   --base <branch>     branch to start from, and to merge the pull request into
+                      (default for start and pr: the current branch of the main
+                      checkout; for deliver: the repository default branch)
+  --head <branch>     deliver only: the branch to deliver
                       (default: the current branch of the main checkout)
   --number <n>        pr only: record the pull request with this number instead
                       of creating one, for a pull request opened by hand
@@ -1128,6 +1910,7 @@ export async function main(argv: string[]): Promise<number> {
   if (command === "pr") return pr(argv.slice(1));
   if (command === "reviewed") return reviewed(argv.slice(1));
   if (command === "sync") return sync(argv.slice(1));
+  if (command === "deliver") return deliver(argv.slice(1));
   if (command === undefined || command === "--help" || command === "-h") {
     process.stdout.write(USAGE);
     return command === undefined ? 2 : 0;

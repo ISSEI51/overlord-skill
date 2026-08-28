@@ -65,11 +65,13 @@ cmux new-workspace --name "<change-id> <title>" --cwd <出力された worktree 
 /path/to/overlord/scripts/change.sh reviewed <change-id>   # レビューした commit を change.pr.reviewed_sha に記録
 # 状態を報告する前、マージの後
 /path/to/overlord/scripts/change.sh sync <card-id>         # カードの各 change の PR 状態を board に反映
+# カードの change が全て merged になった後
+/path/to/overlord/scripts/change.sh deliver <card-id>      # カードをデフォルトブランチへ出す PR を作り item.delivery に記録
 ```
 
 Every subcommand takes `--board <path>` (a `board.yaml`, or a project directory containing one) when the board is not the one under the current directory; without it they fall back to `$OVERLORD_BOARD` and then to the current directory. `start` and `pr` also take `--base <branch>`, which defaults to the current branch of the main checkout: `start` branches from it and `pr` opens the pull request against it. A change that builds on the previous one is stacked by passing `--base overlord/<前の change-id>` to both commands, so its diff shows only its own work.
 
-Exit codes are the same for all four: 0 when the command did what it says, 1 when a git, `gh` or board step failed, and 2 for a usage or argument error. A failure leaves `board.yaml` untouched.
+Exit codes are the same for all five: 0 when the command did what it says, 1 when a git, `gh` or board step failed, and 2 for a usage or argument error. A failure leaves `board.yaml` untouched.
 
 `start` prints the worktree path on its last line — `<repo>/.overlord/worktrees/<change-id>` — and writes `changes[].branch` plus `changes[].state: implementing`. `pr` pushes the branch, opens the pull request — or reuses the one already open for that branch — and writes `changes[].pr` (`number`, `url`, `state`, `head_sha`). The change state follows the pull request: `reviewing` for an open one, `done` for one that is already merged, unchanged for a closed one. `pr --number <n>` records a pull request that was opened from the GitHub web UI instead of creating one; the number is checked against `changes[].branch` (`gh pr view --json headRefName`), and a pull request on any other branch is refused without writing the board, so a mistyped number cannot overwrite the record of the correct pull request. Both commands leave `board.yaml` untouched when the git or `gh` step fails, so they can be run again.
 
@@ -97,3 +99,48 @@ Finally the session is written into the card, with `cwd` set to the worktree `st
 ```
 
 The console shows this session read-only on the card with a `cmux で開く` button. The identifiers become stale when the workspace is closed; the console then reports the session as not found. Work that does not need its own terminal — discovery, card creation, briefs, independent review — runs as a subagent inside the commander session and never appears in `agent`.
+
+## カードを配送する
+
+`change deliver <card-id>` は、change が全て merged になったカードを 1 本の pull request にまとめてリポジトリのデフォルトブランチへ出し、その結果を `items[].delivery` に記録する。change 単位の `pr` がリポジトリ内のブランチ間の PR を作るのに対し、こちらはカード単位で 1 回だけ実行する。
+
+```bash
+cd <project-directory>
+/path/to/overlord/scripts/change.sh deliver <card-id> [--base <branch>] [--head <branch>]
+```
+
+既定値:
+
+- `--head` は main checkout の現在のブランチ。detached HEAD の場合はブランチが決まらないので、`--head <branch>` を明示しない限り失敗する。
+- `--base` は「リポジトリのデフォルトブランチ」を次の順で解決する: `git symbolic-ref --short refs/remotes/origin/HEAD` からリモート名を取り除いた名前 → `gh repo view --json defaultBranchRef` → `main`。
+
+同期が先、未マージならブロック:
+
+1. まずそのカードの change のうち `pr.number` を持つものについて `gh pr view` を読み、`sync` と同じ規則で board に書き戻す。GitHub の web UI で merge された change を「未マージ」と誤判定しないための順序である。読めなかった PR と、`changes[].branch` と一致しない PR は警告として stderr に出し、その change は board 上の状態のまま残す。
+2. 同期後に `state != done` の change が 1 つでも残っていれば `blocked` で終了する。この時点では pull request を作らず、`push` もせず、`items[].delivery` も書かない。未マージの change は `not merged:       <change-id>  <title>` の形で stderr に出る。
+
+冪等性と、同一内容のときに PR を作らないこと:
+
+- `--head` と `--base` の組で既に open な pull request があれば、`gh pr create` は呼ばれず `gh pr edit <n> --body <本文>` だけを呼ぶ。**title は渡さない**ので、人が付け直したタイトルは配送を繰り返しても戻らない。
+- 本文はカードごとに `<!-- overlord:card <card-id> -->` … `<!-- /overlord:card <card-id> -->` で囲んだ節として差し込まれる。同じカードの節があれば置換し、無ければ末尾に追記するので、人が書いた説明文と他のカードの節はそのまま残る。
+- `--head` が `--base` と同じブランチなら `skipped` (`same-branch`)。`git fetch origin <base>` の後 `git diff --quiet origin/<base> <head>` が exit 0（差分なし）なら `skipped` (`no-diff`)。どちらも pull request を作らない。`refs/remotes/origin/<base>` が無いリポジトリではローカルの `<base>` と比較する。`git fetch` の失敗は警告として stderr に出したうえで、その時点の ref と比較して続行する。
+
+書き込みの順序は `pr` と同じで、`gh pr view <ref> --json number,url,state,headRefOid,headRefName,baseRefName` が `headRefName` と `baseRefName` の両方を確認した後にだけ board を書く。どちらかが違えば `failed` で終了し、`board.yaml` は 1 バイトも変わらない。
+
+成功したときにカードへ書かれるのは `delivery` だけで、`state` や `changes` は動かない:
+
+```yaml
+    delivery:
+      branch: "overlord-console"
+      base: "main"
+      pr:
+        number: 12
+        url: "https://github.com/example/repo/pull/12"
+        state: "open"
+        head_sha: "..."
+        reviewed_sha: null
+      error: null
+      attempted_at: "2026-08-28T05:00:00Z"
+```
+
+exit code: 配送した (`created` / `updated`) と配送するものが無かった (`skipped`) は 0、`blocked` と `failed` は 1、引数エラーは 2。

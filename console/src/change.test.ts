@@ -11,7 +11,14 @@ import {
   branchNameFor,
   ChangeNotFoundError,
   changeStateForPr,
+  deliver,
+  deliverCard,
+  deliveryBodyFor,
+  deliveryTitleFor,
   findChange,
+  git,
+  ItemNotFoundError,
+  mergeDeliveryBody,
   normalizePrState,
   parseArgs,
   parsePrNumber,
@@ -23,12 +30,16 @@ import {
   resolveBoardPath,
   reviewed,
   reviewGapLine,
+  run,
+  RUN_FAILED,
   sameCommit,
   sync,
   syncLine,
   syncTargets,
+  unmergedChanges,
   updateChange,
   updateChanges,
+  updateItem,
   worktreePathFor,
   type PullRequestView,
 } from "./change.ts";
@@ -1767,4 +1778,919 @@ describe("cross-process writes from the CLI and the console", () => {
     },
     120_000,
   );
+});
+
+// ---------------------------------------------------------------------------
+// deliver (OV-105-C1)
+// ---------------------------------------------------------------------------
+
+/** Run a git command in `cwd`, with an identity and no signing. */
+function gitIn(args: string[], cwd: string): Promise<string> {
+  return shell(
+    [
+      "git",
+      "-c",
+      "user.name=Overlord Test",
+      "-c",
+      "user.email=test@example.com",
+      "-c",
+      "commit.gpgsign=false",
+      ...args,
+    ],
+    cwd,
+  );
+}
+
+/**
+ * A throwaway repository with a real `origin`, so `deliverCard` pushes, fetches
+ * and diffs against something that exists instead of a stub.
+ *
+ * Branches: `main` (the default branch, also `origin/HEAD`), `same` pointing at
+ * the same commit as `main`, and `feature`, checked out, with one commit of its
+ * own. `feature` is what a delivery proposes; `same` is what a branch that has
+ * nothing left to deliver looks like.
+ */
+async function deliveryRepo(): Promise<{ root: string; origin: string }> {
+  const origin = await scratch();
+  await gitIn(["init", "--quiet", "--bare", "--initial-branch=main", "."], origin);
+
+  const root = await scratch();
+  await gitIn(["init", "--quiet", "--initial-branch=main", "."], root);
+  await Bun.write(join(root, "README.md"), "base\n");
+  await gitIn(["add", "-A"], root);
+  await gitIn(["commit", "--quiet", "-m", "init"], root);
+  await gitIn(["remote", "add", "origin", origin], root);
+  await gitIn(["push", "--quiet", "-u", "origin", "main"], root);
+  await gitIn(
+    ["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"],
+    root,
+  );
+
+  await gitIn(["branch", "same", "main"], root);
+  await gitIn(["checkout", "--quiet", "-b", "feature"], root);
+  await Bun.write(join(root, "feature.txt"), "work\n");
+  await gitIn(["add", "-A"], root);
+  await gitIn(["commit", "--quiet", "-m", "feature work"], root);
+
+  return { root, origin };
+}
+
+/** US, the ASCII unit separator: what the `gh` stub joins its argv with. */
+const ARG_SEPARATOR = "\u001f";
+
+/**
+ * A `gh` on PATH for the delivery commands.
+ *
+ * It answers from canned files and records every argument vector, so what the
+ * command did to GitHub can be asserted exactly — including what it did *not*
+ * do, which is the point of the blocked and the idempotency tests. The vector
+ * is written base64-encoded because a pull request body contains newlines and
+ * would otherwise be indistinguishable from further calls.
+ *
+ * A subcommand with no canned file fails, so an unexpected `gh` call is a test
+ * failure rather than a silent success.
+ */
+async function deliverGhStub(
+  answers: Record<string, unknown>,
+): Promise<{ dir: string; log: string }> {
+  const dir = await scratch();
+  const log = join(dir, "gh.log");
+  const script = [
+    "#!/bin/sh",
+    `printf '%s\\037' "$@" | base64 | tr -d '\\n' >> "$GH_STUB_LOG"`,
+    `printf '\\n' >> "$GH_STUB_LOG"`,
+    'f=""',
+    'case "$1 $2" in',
+    '  "pr list") f="pr-list.json" ;;',
+    '  "pr create") f="pr-create.txt" ;;',
+    '  "pr edit") f="pr-edit.txt" ;;',
+    '  "repo view") f="repo-view.json" ;;',
+    '  "pr view")',
+    '    case "$*" in',
+    '      *"--json body"*) f="body-$3.json" ;;',
+    '      *) f="view-$3.json" ;;',
+    "    esac",
+    "    ;;",
+    "esac",
+    'if [ -n "$f" ] && [ -f "$GH_STUB_DIR/$f" ]; then',
+    '  cat "$GH_STUB_DIR/$f"',
+    "  exit 0",
+    "fi",
+    'echo "stub gh: no canned answer for: $*" >&2',
+    "exit 1",
+    "",
+  ].join("\n");
+  const executable = join(dir, "gh");
+  await Bun.write(executable, script);
+  chmodSync(executable, 0o755);
+
+  for (const [name, value] of Object.entries(answers)) {
+    await Bun.write(
+      join(dir, name),
+      typeof value === "string" ? value : JSON.stringify(value),
+    );
+  }
+  return { dir, log };
+}
+
+/** Every `gh` argument vector the stub recorded, in call order. */
+async function ghCalls(stub: { log: string }): Promise<string[][]> {
+  if (!(await Bun.file(stub.log).exists())) return [];
+  return (await Bun.file(stub.log).text())
+    .split("\n")
+    .filter(Boolean)
+    .map((line) =>
+      Buffer.from(line, "base64").toString("utf8").split(ARG_SEPARATOR).slice(0, -1),
+    );
+}
+
+/** Run `body` with the stubbed `gh` first on PATH. */
+async function withGhStub<T>(
+  stub: { dir: string; log: string },
+  body: () => Promise<T>,
+): Promise<T> {
+  const previous = {
+    path: process.env.PATH,
+    dir: process.env.GH_STUB_DIR,
+    log: process.env.GH_STUB_LOG,
+  };
+  process.env.PATH = `${stub.dir}:${previous.path ?? ""}`;
+  process.env.GH_STUB_DIR = stub.dir;
+  process.env.GH_STUB_LOG = stub.log;
+  try {
+    return await body();
+  } finally {
+    process.env.PATH = previous.path ?? "";
+    if (previous.dir === undefined) delete process.env.GH_STUB_DIR;
+    else process.env.GH_STUB_DIR = previous.dir;
+    if (previous.log === undefined) delete process.env.GH_STUB_LOG;
+    else process.env.GH_STUB_LOG = previous.log;
+  }
+}
+
+const MERGED_CHANGE: Change = {
+  id: "OV-500-C1",
+  title: "The merged change",
+  state: "done",
+  branch: "overlord/OV-500-C1",
+  pr: {
+    number: 50,
+    url: "https://github.com/o/r/pull/50",
+    state: "merged",
+    head_sha: "a".repeat(40),
+    reviewed_sha: "a".repeat(40),
+  },
+};
+
+/** The `gh pr view 50` answer that leaves MERGED_CHANGE exactly as it is. */
+const VIEW_50_UNCHANGED = {
+  number: 50,
+  url: "https://github.com/o/r/pull/50",
+  state: "MERGED",
+  headRefOid: "a".repeat(40),
+  headRefName: "overlord/OV-500-C1",
+};
+
+const OPEN_CHANGE: Change = {
+  id: "OV-500-C2",
+  title: "The open change",
+  state: "reviewing",
+  branch: "overlord/OV-500-C2",
+  pr: {
+    number: 51,
+    url: "https://github.com/o/r/pull/51",
+    state: "open",
+    head_sha: "b".repeat(40),
+    reviewed_sha: "b".repeat(40),
+  },
+};
+
+/** The `gh pr view 51` answer that leaves OPEN_CHANGE open. */
+const VIEW_51_OPEN = {
+  number: 51,
+  url: "https://github.com/o/r/pull/51",
+  state: "OPEN",
+  headRefOid: "b".repeat(40),
+  headRefName: "overlord/OV-500-C2",
+};
+
+/** The delivery pull request the stub reports for the `feature` branch. */
+const DELIVERY_VIEW = {
+  number: 99,
+  url: "https://github.com/o/r/pull/99",
+  state: "OPEN",
+  headRefOid: "c".repeat(40),
+  headRefName: "feature",
+  baseRefName: "main",
+};
+
+function deliveryBoardWith(changes: Change[]): Board {
+  return {
+    version: 1,
+    updated_at: "2026-08-01T00:00:00Z",
+    items: [
+      {
+        id: "OV-500",
+        title: "A card to deliver",
+        state: "acceptance",
+        acceptance_conditions: [
+          "The delivery pull request names the card",
+          "Nothing unmerged is delivered",
+        ],
+        next_action: "deliver",
+        changes,
+      },
+      { id: "OV-501", title: "An untouched card", state: "inbox" },
+    ],
+  };
+}
+
+async function writeDeliveryBoard(changes: Change[]): Promise<string> {
+  const boardPath = join(await scratch(), "board.yaml");
+  await saveBoard(boardPath, deliveryBoardWith(changes));
+  return boardPath;
+}
+
+describe("delivery text", () => {
+  test("the title is the card title with its id appended", () => {
+    const item = deliveryBoardWith([MERGED_CHANGE]).items[0]!;
+    expect(deliveryTitleFor(item)).toBe("A card to deliver (OV-500)");
+  });
+
+  test("the body names the card, its acceptance conditions and its changes", () => {
+    const item = deliveryBoardWith([MERGED_CHANGE]).items[0]!;
+    const body = deliveryBodyFor(item);
+
+    expect(body).toContain("A card to deliver");
+    expect(body).toContain("Card: OV-500");
+    expect(body).toContain("- The delivery pull request names the card");
+    expect(body).toContain("- Nothing unmerged is delivered");
+    expect(body).toContain(
+      "- OV-500-C1  The merged change  (done)  #50 https://github.com/o/r/pull/50",
+    );
+  });
+
+  test("a change with no pull request is listed as having none", () => {
+    const item = deliveryBoardWith([
+      { id: "OV-500-C9", title: "Never pushed", state: "done", pr: null },
+    ]).items[0]!;
+    expect(deliveryBodyFor(item)).toContain(
+      "- OV-500-C9  Never pushed  (done)  PR 無し",
+    );
+  });
+
+  test("a card with no conditions and no changes still produces a body", () => {
+    const body = deliveryBodyFor({
+      id: "OV-502",
+      title: "Bare card",
+      state: "acceptance",
+    });
+    expect(body).toContain("Card: OV-502");
+    expect(body.match(/- \(board に記録なし\)/g)?.length).toBe(2);
+  });
+});
+
+describe("mergeDeliveryBody", () => {
+  test("appends a fenced section to a body that has none", () => {
+    const merged = mergeDeliveryBody("Written by hand.", "OV-500", "the section");
+    expect(merged).toBe(
+      "Written by hand.\n\n" +
+        "<!-- overlord:card OV-500 -->\nthe section\n<!-- /overlord:card OV-500 -->\n",
+    );
+  });
+
+  test("an empty body becomes the section alone", () => {
+    expect(mergeDeliveryBody("", "OV-500", "the section")).toBe(
+      "<!-- overlord:card OV-500 -->\nthe section\n<!-- /overlord:card OV-500 -->\n",
+    );
+    expect(mergeDeliveryBody(null, "OV-500", "s")).toContain("overlord:card OV-500");
+    expect(mergeDeliveryBody(undefined, "OV-500", "s")).toContain(
+      "<!-- /overlord:card OV-500 -->",
+    );
+  });
+
+  test("replaces this card's section and leaves everything else alone", () => {
+    const existing = [
+      "Written by hand, above.",
+      "",
+      "<!-- overlord:card OV-499 -->",
+      "another card's section",
+      "<!-- /overlord:card OV-499 -->",
+      "",
+      "<!-- overlord:card OV-500 -->",
+      "the old section",
+      "<!-- /overlord:card OV-500 -->",
+      "",
+      "Written by hand, below.",
+      "",
+    ].join("\n");
+
+    const merged = mergeDeliveryBody(existing, "OV-500", "the new section");
+
+    expect(merged).toContain("Written by hand, above.");
+    expect(merged).toContain("Written by hand, below.");
+    expect(merged).toContain("another card's section");
+    expect(merged).toContain("the new section");
+    expect(merged).not.toContain("the old section");
+    // Exactly one section per card, however often the card is delivered.
+    expect(merged.match(/<!-- overlord:card OV-500 -->/g)!.length).toBe(1);
+    expect(merged.match(/<!-- overlord:card OV-499 -->/g)!.length).toBe(1);
+    expect(mergeDeliveryBody(merged, "OV-500", "the new section")).toBe(merged);
+  });
+
+  test("an opening marker with no closing marker is left in place", () => {
+    // Truncated by hand: replacing to the end of the body would delete text the
+    // person wrote after it, so the section is appended instead.
+    const existing = "<!-- overlord:card OV-500 -->\nhalf a section\nmore text";
+    const merged = mergeDeliveryBody(existing, "OV-500", "the new section");
+    expect(merged).toContain("half a section");
+    expect(merged).toContain("more text");
+    expect(merged).toContain("the new section");
+  });
+});
+
+describe("unmergedChanges", () => {
+  test("takes every change that is not done", () => {
+    const item = deliveryBoardWith([
+      MERGED_CHANGE,
+      OPEN_CHANGE,
+      { id: "OV-500-C3", title: "Blocked", state: "blocked" },
+    ]).items[0]!;
+    expect(unmergedChanges(item).map((change) => change.id)).toEqual([
+      "OV-500-C2",
+      "OV-500-C3",
+    ]);
+  });
+
+  test("a card whose changes are all done, or which has none, has nothing unmerged", () => {
+    expect(unmergedChanges(deliveryBoardWith([MERGED_CHANGE]).items[0]!)).toEqual([]);
+    expect(unmergedChanges({ id: "OV-1", title: "t", state: "inbox" })).toEqual([]);
+  });
+});
+
+describe("updateItem", () => {
+  test("writes the target card and leaves every other card alone", async () => {
+    const boardPath = await writeDeliveryBoard([MERGED_CHANGE]);
+    const before = await loadBoard(boardPath);
+
+    await updateItem(boardPath, "OV-500", (item) => {
+      item.delivery = {
+        branch: "feature",
+        base: "main",
+        pr: null,
+        error: null,
+        attempted_at: "2026-08-02T00:00:00Z",
+      };
+    });
+
+    const after = await loadBoard(boardPath);
+    expect(after.board.items[0]!.delivery).toEqual({
+      branch: "feature",
+      base: "main",
+      pr: null,
+      error: null,
+      attempted_at: "2026-08-02T00:00:00Z",
+    });
+    expect(after.board.items[0]!.next_action).toBe("deliver");
+    expect(findChange(after.board, "OV-500-C1")!.change).toEqual(
+      findChange(before.board, "OV-500-C1")!.change,
+    );
+    expect(after.board.items[1]).toEqual(before.board.items[1]!);
+  });
+
+  test("throws for an unknown card id and leaves the board byte-identical", async () => {
+    const boardPath = await writeDeliveryBoard([MERGED_CHANGE]);
+    const before = await Bun.file(boardPath).text();
+
+    let thrown: unknown = null;
+    const saves = await countSaves(async () => {
+      try {
+        await updateItem(boardPath, "OV-999", (item) => {
+          item.owner = "nobody";
+        });
+      } catch (error) {
+        thrown = error;
+      }
+    });
+
+    expect(thrown).toBeInstanceOf(ItemNotFoundError);
+    expect(saves).toBe(0);
+    expect(await Bun.file(boardPath).text()).toBe(before);
+  });
+});
+
+describe("run", () => {
+  test("a command that outruns its timeout is killed and reported, not awaited", async () => {
+    const started = Date.now();
+    const result = await run(["sleep", "10"], undefined, 150);
+
+    expect(result.code).toBe(RUN_FAILED);
+    expect(result.stderr).toContain("timed out after 150ms");
+    // The point of the timeout: the caller is not held for the full 10 s.
+    expect(Date.now() - started).toBeLessThan(5_000);
+  });
+
+  test("a missing executable is a result, not a synchronous throw", async () => {
+    const result = await run(["overlord-no-such-executable-xyz"]);
+
+    expect(result.code).toBe(RUN_FAILED);
+    expect(result.stderr).toContain("overlord-no-such-executable-xyz");
+    expect(result.stdout).toBe("");
+  });
+
+  test("a command that finishes inside its timeout is unaffected", async () => {
+    const result = await run(["echo", "delivered"], undefined, 10_000);
+    expect(result.code).toBe(0);
+    expect(result.stdout.trim()).toBe("delivered");
+  });
+});
+
+describe("deliverCard", () => {
+  test("(a) a card whose changes are all merged gets a new pull request", async () => {
+    const repo = await deliveryRepo();
+    const boardPath = await writeDeliveryBoard([MERGED_CHANGE]);
+    const stub = await deliverGhStub({
+      "view-50.json": VIEW_50_UNCHANGED,
+      "pr-list.json": [],
+      "pr-create.txt": "https://github.com/o/r/pull/99\n",
+      "view-feature.json": DELIVERY_VIEW,
+    });
+
+    const outcome = await withGhStub(stub, () =>
+      deliverCard({ boardPath, cardId: "OV-500", cwd: repo.root, head: "feature" }),
+    );
+
+    expect(outcome.warnings).toEqual([]);
+    expect(outcome.status).toBe("created");
+    expect(outcome.pr).toEqual({
+      number: 99,
+      url: "https://github.com/o/r/pull/99",
+      state: "open",
+      head_sha: "c".repeat(40),
+      reviewed_sha: null,
+    });
+
+    const calls = await ghCalls(stub);
+    expect(calls.map((call) => call.slice(0, 2).join(" "))).toEqual([
+      "pr view",
+      "pr list",
+      "pr create",
+      "pr view",
+    ]);
+    expect(calls[1]).toEqual([
+      "pr",
+      "list",
+      "--head",
+      "feature",
+      "--base",
+      "main",
+      "--state",
+      "open",
+      "--json",
+      "number,url",
+    ]);
+    // The base was resolved from origin/HEAD, so gh was never asked for it.
+    expect(calls.some((call) => call[0] === "repo")).toBe(false);
+
+    const created = calls[2]!;
+    expect(created.slice(0, 7)).toEqual([
+      "pr",
+      "create",
+      "--base",
+      "main",
+      "--head",
+      "feature",
+      "--title",
+    ]);
+    expect(created[7]).toBe("A card to deliver (OV-500)");
+    expect(created[8]).toBe("--body");
+    expect(created[9]).toContain("<!-- overlord:card OV-500 -->");
+    expect(created[9]).toContain("Card: OV-500");
+    expect(created[9]).toContain("- OV-500-C1  The merged change  (done)  #50");
+    expect(created[9]).toContain("<!-- /overlord:card OV-500 -->");
+
+    // The branch really was pushed, so the pull request has something to show.
+    expect(await shell(["git", "rev-parse", "origin/feature"], repo.root)).toBe(
+      await shell(["git", "rev-parse", "feature"], repo.root),
+    );
+
+    const after = await loadBoard(boardPath);
+    const delivery = after.board.items[0]!.delivery!;
+    expect(delivery.branch).toBe("feature");
+    expect(delivery.base).toBe("main");
+    expect(delivery.error).toBeNull();
+    expect(delivery.attempted_at).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/);
+    expect(delivery.pr).toEqual(outcome.pr!);
+    // The changes and the other card are untouched by the delivery.
+    expect(findChange(after.board, "OV-500-C1")!.change).toEqual(MERGED_CHANGE);
+    expect(after.board.items[1]!.delivery).toBeUndefined();
+  });
+
+  test("(a) the head defaults to the current branch of the main checkout", async () => {
+    const repo = await deliveryRepo();
+    const boardPath = await writeDeliveryBoard([MERGED_CHANGE]);
+    const stub = await deliverGhStub({
+      "view-50.json": VIEW_50_UNCHANGED,
+      "pr-list.json": [],
+      "pr-create.txt": "created\n",
+      "view-feature.json": DELIVERY_VIEW,
+    });
+
+    const outcome = await withGhStub(stub, () =>
+      deliverCard({ boardPath, cardId: "OV-500", cwd: repo.root }),
+    );
+
+    expect(outcome.status).toBe("created");
+    expect((await loadBoard(boardPath)).board.items[0]!.delivery!.branch).toBe(
+      "feature",
+    );
+  });
+
+  test("(b) an open pull request is edited, never created, and keeps its title", async () => {
+    const repo = await deliveryRepo();
+    const boardPath = await writeDeliveryBoard([MERGED_CHANGE]);
+    const stub = await deliverGhStub({
+      "view-50.json": VIEW_50_UNCHANGED,
+      "pr-list.json": [{ number: 99, url: "https://github.com/o/r/pull/99" }],
+      "body-99.json": {
+        body:
+          "Renamed and rewritten by a person.\n\n" +
+          "<!-- overlord:card OV-500 -->\nthe old section\n" +
+          "<!-- /overlord:card OV-500 -->\n",
+      },
+      "pr-edit.txt": "https://github.com/o/r/pull/99\n",
+      "view-99.json": DELIVERY_VIEW,
+    });
+
+    const outcome = await withGhStub(stub, () =>
+      deliverCard({ boardPath, cardId: "OV-500", cwd: repo.root, head: "feature" }),
+    );
+
+    expect(outcome.warnings).toEqual([]);
+    expect(outcome.status).toBe("updated");
+    expect(outcome.pr!.number).toBe(99);
+
+    const calls = await ghCalls(stub);
+    expect(calls.some((call) => call[1] === "create")).toBe(false);
+    const edited = calls.find((call) => call[1] === "edit")!;
+    expect(edited.slice(0, 4)).toEqual(["pr", "edit", "99", "--body"]);
+    // The title is deliberately absent: a person may have renamed the pull
+    // request, and re-delivering must not undo that.
+    expect(edited).not.toContain("--title");
+    expect(edited.length).toBe(5);
+    // The card's own section is replaced; the rest of the body survives.
+    expect(edited[4]).toContain("Renamed and rewritten by a person.");
+    expect(edited[4]).not.toContain("the old section");
+    expect(edited[4]).toContain("- OV-500-C1  The merged change  (done)  #50");
+
+    expect((await loadBoard(boardPath)).board.items[0]!.delivery!.pr!.number).toBe(
+      99,
+    );
+  });
+
+  test("(c) a card with an unmerged change is blocked, and nothing is created or written", async () => {
+    const repo = await deliveryRepo();
+    const boardPath = await writeDeliveryBoard([MERGED_CHANGE, OPEN_CHANGE]);
+    const before = await Bun.file(boardPath).text();
+    const stub = await deliverGhStub({
+      "view-50.json": VIEW_50_UNCHANGED,
+      "view-51.json": VIEW_51_OPEN,
+    });
+
+    const outcome = await withGhStub(stub, () =>
+      deliverCard({ boardPath, cardId: "OV-500", cwd: repo.root, head: "feature" }),
+    );
+
+    expect(outcome.status).toBe("blocked");
+    expect(outcome.unmerged).toEqual(["OV-500-C2  The open change"]);
+    expect(outcome.reason).toContain("1 of 2 changes of OV-500 are not merged");
+    expect(outcome.pr).toBeUndefined();
+
+    // Only the two synchronization reads: no pull request was created or
+    // edited, so a half-finished card cannot reach the default branch.
+    const calls = await ghCalls(stub);
+    expect(calls.map((call) => call.slice(0, 3).join(" "))).toEqual([
+      "pr view 50",
+      "pr view 51",
+    ]);
+    expect(calls.some((call) => call[1] === "create" || call[1] === "edit")).toBe(
+      false,
+    );
+
+    // The branch was not pushed either.
+    expect(
+      (await git(["rev-parse", "--verify", "--quiet", "origin/feature"], repo.root))
+        .code,
+    ).not.toBe(0);
+    expect(await Bun.file(boardPath).text()).toBe(before);
+  });
+
+  test("(d) a change the synchronization finds merged does not block the delivery", async () => {
+    const repo = await deliveryRepo();
+    // The board still says `reviewing`, which is what a change merged in the
+    // GitHub web UI looks like until something reads the pull request.
+    const boardPath = await writeDeliveryBoard([MERGED_CHANGE, OPEN_CHANGE]);
+    const stub = await deliverGhStub({
+      "view-50.json": VIEW_50_UNCHANGED,
+      "view-51.json": { ...VIEW_51_OPEN, state: "MERGED" },
+      "pr-list.json": [],
+      "pr-create.txt": "created\n",
+      "view-feature.json": DELIVERY_VIEW,
+    });
+
+    const outcome = await withGhStub(stub, () =>
+      deliverCard({ boardPath, cardId: "OV-500", cwd: repo.root, head: "feature" }),
+    );
+
+    expect(outcome.status).toBe("created");
+    expect(outcome.unmerged).toBeUndefined();
+
+    const after = await loadBoard(boardPath);
+    // The synchronization wrote the merge it found, before the block decision.
+    const change = findChange(after.board, "OV-500-C2")!.change;
+    expect(change.state).toBe("done");
+    expect(change.pr!.state).toBe("merged");
+    expect(after.board.items[0]!.delivery!.pr!.number).toBe(99);
+  });
+
+  test("(e) a head with nothing to propose is skipped without calling gh", async () => {
+    const repo = await deliveryRepo();
+    // No change carries a pull request, so there is nothing to synchronize.
+    const boardPath = await writeDeliveryBoard([
+      { id: "OV-500-C1", title: "Merged by hand", state: "done", pr: null },
+    ]);
+    const before = await Bun.file(boardPath).text();
+    const stub = await deliverGhStub({});
+
+    const outcome = await withGhStub(stub, () =>
+      deliverCard({ boardPath, cardId: "OV-500", cwd: repo.root, head: "same" }),
+    );
+
+    expect(outcome.status).toBe("skipped");
+    expect(outcome.reason).toBe("no-diff");
+    expect(outcome.warnings).toEqual([]);
+    expect(await ghCalls(stub)).toEqual([]);
+    expect(await Bun.file(boardPath).text()).toBe(before);
+  });
+
+  test("(e) delivering the base branch into itself is skipped", async () => {
+    const repo = await deliveryRepo();
+    const boardPath = await writeDeliveryBoard([
+      { id: "OV-500-C1", title: "Merged by hand", state: "done", pr: null },
+    ]);
+    const stub = await deliverGhStub({});
+
+    const outcome = await withGhStub(stub, () =>
+      deliverCard({ boardPath, cardId: "OV-500", cwd: repo.root, head: "main" }),
+    );
+
+    expect(outcome.status).toBe("skipped");
+    expect(outcome.reason).toBe("same-branch");
+    expect(await ghCalls(stub)).toEqual([]);
+  });
+
+  test("(f) a pull request on another head branch fails and the board is untouched", async () => {
+    const repo = await deliveryRepo();
+    const boardPath = await writeDeliveryBoard([MERGED_CHANGE]);
+    const before = await Bun.file(boardPath).text();
+    const stub = await deliverGhStub({
+      "view-50.json": VIEW_50_UNCHANGED,
+      "pr-list.json": [],
+      "pr-create.txt": "created\n",
+      "view-feature.json": { ...DELIVERY_VIEW, headRefName: "someone/else" },
+    });
+
+    const outcome = await withGhStub(stub, () =>
+      deliverCard({ boardPath, cardId: "OV-500", cwd: repo.root, head: "feature" }),
+    );
+
+    expect(outcome.status).toBe("failed");
+    expect(outcome.reason).toContain('"someone/else" -> "main"');
+    expect(outcome.reason).toContain('not "feature" -> "main"');
+    expect(outcome.pr).toBeUndefined();
+    expect(await Bun.file(boardPath).text()).toBe(before);
+  });
+
+  test("(f) a pull request against another base fails and the board is untouched", async () => {
+    const repo = await deliveryRepo();
+    const boardPath = await writeDeliveryBoard([MERGED_CHANGE]);
+    const before = await Bun.file(boardPath).text();
+    const stub = await deliverGhStub({
+      "view-50.json": VIEW_50_UNCHANGED,
+      "pr-list.json": [],
+      "pr-create.txt": "created\n",
+      "view-feature.json": { ...DELIVERY_VIEW, baseRefName: "some-release" },
+    });
+
+    const outcome = await withGhStub(stub, () =>
+      deliverCard({ boardPath, cardId: "OV-500", cwd: repo.root, head: "feature" }),
+    );
+
+    expect(outcome.status).toBe("failed");
+    expect(outcome.reason).toContain('"feature" -> "some-release"');
+    expect(await Bun.file(boardPath).text()).toBe(before);
+  });
+
+  test("writes nothing to stdout or stderr, on either the delivered or the blocked path", async () => {
+    const repo = await deliveryRepo();
+    const delivered = await writeDeliveryBoard([MERGED_CHANGE]);
+    const blocked = await writeDeliveryBoard([MERGED_CHANGE, OPEN_CHANGE]);
+    const stub = await deliverGhStub({
+      "view-50.json": VIEW_50_UNCHANGED,
+      "view-51.json": VIEW_51_OPEN,
+      "pr-list.json": [],
+      "pr-create.txt": "created\n",
+      "view-feature.json": DELIVERY_VIEW,
+    });
+
+    const statuses: string[] = [];
+    const { stdout, stderr } = await withGhStub(stub, () =>
+      capture(async () => {
+        for (const boardPath of [delivered, blocked]) {
+          const outcome = await deliverCard({
+            boardPath,
+            cardId: "OV-500",
+            cwd: repo.root,
+            head: "feature",
+          });
+          statuses.push(outcome.status);
+        }
+        return 0;
+      }),
+    );
+
+    expect(statuses).toEqual(["created", "blocked"]);
+    expect(stdout).toBe("");
+    expect(stderr).toBe("");
+  });
+
+  test("a pull request that could not be read is a warning, and the card stays blocked", async () => {
+    const repo = await deliveryRepo();
+    const boardPath = await writeDeliveryBoard([MERGED_CHANGE, OPEN_CHANGE]);
+    const before = await Bun.file(boardPath).text();
+    // No canned answer for 51, so its state cannot be confirmed.
+    const stub = await deliverGhStub({ "view-50.json": VIEW_50_UNCHANGED });
+
+    const outcome = await withGhStub(stub, () =>
+      deliverCard({ boardPath, cardId: "OV-500", cwd: repo.root, head: "feature" }),
+    );
+
+    expect(outcome.status).toBe("blocked");
+    expect(outcome.warnings.join("\n")).toContain(
+      "OV-500-C2: gh pr view 51 failed",
+    );
+    expect(outcome.unmerged).toEqual(["OV-500-C2  The open change"]);
+    expect(await Bun.file(boardPath).text()).toBe(before);
+  });
+
+  test("a detached HEAD fails before anything is pushed or written", async () => {
+    const repo = await deliveryRepo();
+    await shell(["git", "checkout", "--quiet", "--detach"], repo.root);
+    const boardPath = await writeDeliveryBoard([
+      { id: "OV-500-C1", title: "Merged by hand", state: "done", pr: null },
+    ]);
+    const before = await Bun.file(boardPath).text();
+    const stub = await deliverGhStub({});
+
+    const outcome = await withGhStub(stub, () =>
+      deliverCard({ boardPath, cardId: "OV-500", cwd: repo.root }),
+    );
+
+    expect(outcome.status).toBe("failed");
+    expect(outcome.reason).toContain("detached HEAD");
+    expect(await ghCalls(stub)).toEqual([]);
+    expect(await Bun.file(boardPath).text()).toBe(before);
+  });
+
+  test("an unknown card id fails without touching the repository", async () => {
+    const repo = await deliveryRepo();
+    const boardPath = await writeDeliveryBoard([MERGED_CHANGE]);
+    const before = await Bun.file(boardPath).text();
+    const stub = await deliverGhStub({});
+
+    const outcome = await withGhStub(stub, () =>
+      deliverCard({ boardPath, cardId: "OV-999", cwd: repo.root, head: "feature" }),
+    );
+
+    expect(outcome.status).toBe("failed");
+    expect(outcome.reason).toContain("unknown card id: OV-999");
+    expect(await ghCalls(stub)).toEqual([]);
+    expect(await Bun.file(boardPath).text()).toBe(before);
+  });
+
+  test("the base falls back to the GitHub default branch when origin/HEAD is unset", async () => {
+    const repo = await deliveryRepo();
+    await shell(
+      ["git", "symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
+      repo.root,
+    );
+    const boardPath = await writeDeliveryBoard([MERGED_CHANGE]);
+    const stub = await deliverGhStub({
+      "repo-view.json": { defaultBranchRef: { name: "main" } },
+      "view-50.json": VIEW_50_UNCHANGED,
+      "pr-list.json": [],
+      "pr-create.txt": "created\n",
+      "view-feature.json": DELIVERY_VIEW,
+    });
+
+    const outcome = await withGhStub(stub, () =>
+      deliverCard({ boardPath, cardId: "OV-500", cwd: repo.root, head: "feature" }),
+    );
+
+    expect(outcome.status).toBe("created");
+    const calls = await ghCalls(stub);
+    expect(calls[1]).toEqual(["repo", "view", "--json", "defaultBranchRef"]);
+    expect((await loadBoard(boardPath)).board.items[0]!.delivery!.base).toBe("main");
+  });
+});
+
+describe("deliver", () => {
+  /** Run `deliver` from inside `cwd`, which is the directory it resolves. */
+  async function runDeliver(
+    argv: string[],
+    cwd: string,
+    stub: { dir: string; log: string },
+  ): Promise<{ code: number; stdout: string; stderr: string }> {
+    const previous = process.cwd();
+    process.chdir(cwd);
+    try {
+      return await withGhStub(stub, () => capture(() => deliver(argv)));
+    } finally {
+      process.chdir(previous);
+    }
+  }
+
+  test("without a card id it prints the usage and exits 2", async () => {
+    const { code, stderr } = await captureStderr(() => deliver([]));
+    expect(code).toBe(2);
+    expect(stderr).toContain("usage: change deliver <card-id>");
+  });
+
+  test("a delivered card is reported and exits 0", async () => {
+    const repo = await deliveryRepo();
+    const boardPath = await writeDeliveryBoard([MERGED_CHANGE]);
+    const stub = await deliverGhStub({
+      "view-50.json": VIEW_50_UNCHANGED,
+      "pr-list.json": [],
+      "pr-create.txt": "created\n",
+      "view-feature.json": DELIVERY_VIEW,
+    });
+
+    const { code, stdout, stderr } = await runDeliver(
+      ["OV-500", "--board", boardPath, "--head", "feature"],
+      repo.root,
+      stub,
+    );
+
+    expect(stderr).toBe("");
+    expect(code).toBe(0);
+    expect(stdout).toContain("card:             OV-500");
+    expect(stdout).toContain("delivery:         created");
+    expect(stdout).toContain("pull request:     #99 (open)");
+    expect(stdout).toContain(`board updated:    ${boardPath}`);
+    expect(stdout.trimEnd().split("\n").at(-1)).toBe(
+      "https://github.com/o/r/pull/99",
+    );
+  });
+
+  test("a blocked card names the unmerged changes and exits 1", async () => {
+    const repo = await deliveryRepo();
+    const boardPath = await writeDeliveryBoard([MERGED_CHANGE, OPEN_CHANGE]);
+    const before = await Bun.file(boardPath).text();
+    const stub = await deliverGhStub({
+      "view-50.json": VIEW_50_UNCHANGED,
+      "view-51.json": VIEW_51_OPEN,
+    });
+
+    const { code, stdout, stderr } = await runDeliver(
+      ["OV-500", "--board", boardPath, "--head", "feature"],
+      repo.root,
+      stub,
+    );
+
+    expect(code).toBe(1);
+    expect(stdout).toContain("delivery:         blocked");
+    expect(stdout).not.toContain("board updated");
+    expect(stderr).toContain("not merged:       OV-500-C2  The open change");
+    expect(await Bun.file(boardPath).text()).toBe(before);
+  });
+
+  test("a skipped run reports why and still exits 0", async () => {
+    const repo = await deliveryRepo();
+    const boardPath = await writeDeliveryBoard([
+      { id: "OV-500-C1", title: "Merged by hand", state: "done", pr: null },
+    ]);
+    const stub = await deliverGhStub({});
+
+    const { code, stdout, stderr } = await runDeliver(
+      ["OV-500", "--board", boardPath, "--head", "same"],
+      repo.root,
+      stub,
+    );
+
+    expect(stderr).toBe("");
+    expect(code).toBe(0);
+    expect(stdout).toContain("delivery:         skipped");
+    expect(stdout).toContain("reason:           no-diff");
+  });
 });
