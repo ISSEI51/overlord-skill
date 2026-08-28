@@ -47,11 +47,11 @@ board は3階層で構成され、**あなたが管理するのは一番上の�
 
 | Skill | 用途 |
 | --- | --- |
-| `product-ops` | 何を先に進めるかと、AIの作業状況を整理する |
-| `product-improvement-card` | 気づきや問い合わせを、実行できる「やることカード」にする |
-| `product-ux-audit` | 実際の操作の流れをたどり、使いにくい所を見つける |
-| `product-implementation-brief` | 実装前に、何をどこまで変えるかを小さく整理する |
-| `product-change-review` | 実装したAIとは別のAIが、目的どおり動くかを確認する |
+| `overlord-ops` | 何を先に進めるかと、AIの作業状況を整理する |
+| `overlord-improvement-card` | 気づきや問い合わせを、実行できる「やることカード」にする |
+| `overlord-ux-audit` | 実際の操作の流れをたどり、使いにくい所を見つける |
+| `overlord-implementation-brief` | 実装前に、何をどこまで変えるかを小さく整理する |
+| `overlord-change-review` | 実装したAIとは別のAIが、目的どおり動くかを確認する |
 
 ## Overlord Console
 
@@ -99,6 +99,32 @@ cd overlord
 
 Codex 向けは `./scripts/install.sh codex` です。同名スキルがある場合、インストーラーは安全のため停止します。
 
+### 旧スキル（`product-*`）の削除
+
+スキル名を `product-*` から `overlord-*` に変更したため、旧名でインストール済みのスキルは手動で削除してください。削除しないと、`~/.claude/skills` にはリンク切れの symlink 5本が残り、`~/.codex/skills` には旧内容の実体コピー5件が残り続けます。
+
+```bash
+# 削除対象を先に確認する
+ls -l ~/.claude/skills | grep product-
+ls -l ~/.codex/skills | grep product-
+
+# Claude Code: symlink 5本（改名でリンク切れになる）
+rm -rf ~/.claude/skills/product-ops \
+       ~/.claude/skills/product-improvement-card \
+       ~/.claude/skills/product-ux-audit \
+       ~/.claude/skills/product-implementation-brief \
+       ~/.claude/skills/product-change-review
+
+# Codex: 実体コピー5件（旧内容が残り続ける）
+rm -rf ~/.codex/skills/product-ops \
+       ~/.codex/skills/product-improvement-card \
+       ~/.codex/skills/product-ux-audit \
+       ~/.codex/skills/product-implementation-brief \
+       ~/.codex/skills/product-change-review
+```
+
+`rm -rf` は symlink に対してはリンク自体だけを削除し、リンク先には影響しません。プロジェクト単位でインストールしている場合は、対象リポジトリの `.claude/skills/product-*` も同じ手順で削除してください。
+
 ### コンソール
 
 [Bun](https://bun.sh) が必要です。ビルド済みのフロントエンドを同梱しているため、そのまま起動できます。
@@ -119,7 +145,7 @@ brew install oven-sh/bun/bun     # まだ入っていない場合
 対象リポジトリのルートで Claude Code を起動し、次を実行します。
 
 ```text
-/product-ops
+/overlord-ops
 このプロジェクトの作業管理を始めてください。
 コード、今ある説明、プロジェクトの決まりを確認し、
 docs/product-ops/board.yaml を作成してください。

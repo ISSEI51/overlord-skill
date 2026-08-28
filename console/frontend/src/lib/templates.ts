@@ -40,7 +40,7 @@ export function dockTemplates(): DockTemplate[] {
     {
       label: "今日の状況",
       text:
-        "/product-ops 今日の作業状況を整理してください。" +
+        "/overlord-ops 今日の作業状況を整理してください。" +
         "私が決めることは最大3件、実際に試して確認する操作は最大3本に絞ってください。" +
         "各案件は次の一手を1つだけ示してください。",
     },
@@ -53,7 +53,7 @@ export function dockTemplates(): DockTemplate[] {
     },
     {
       label: "気づきをカードに",
-      prefix: "/product-improvement-card ",
+      prefix: "/overlord-improvement-card ",
       inline: true,
     },
     {
@@ -64,5 +64,5 @@ export function dockTemplates(): DockTemplate[] {
 }
 
 export const COMMANDER_BOOTSTRAP =
-  "/product-ops この会話を Overlord の司令塔にしてください。" +
+  "/overlord-ops この会話を Overlord の司令塔にしてください。" +
   "docs/product-ops/board.yaml を読み、今日の状況を整理してください。";

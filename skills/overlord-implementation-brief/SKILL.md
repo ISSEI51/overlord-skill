@@ -1,5 +1,5 @@
 ---
-name: product-implementation-brief
+name: overlord-implementation-brief
 description: Convert an accepted improvement card into a bounded, testable implementation brief with a small change surface. Use immediately before coding or delegating a worktree; do not perform the implementation itself.
 ---
 
@@ -34,6 +34,6 @@ The brief is ready for implementation only when every acceptance condition has a
 
 Update the matching card in `docs/product-ops/board.yaml`: add the chosen approach, worktree boundary, verification plan, and risk; set the state to `specified` only when the brief is ready.
 
-When the work is split, write the pieces to the card's `changes` list in dependency order and keep the card itself moving forward. Do not send the card back to `discovery`, and do not add top-level cards for the pieces. Give each change an id derived from the card (`RC-UX-001-C1`), a title, and the state `specified`; leave `agent`, `branch`, and `pr` null until the change starts. See [the board schema](../product-ops/references/board-schema.md).
+When the work is split, write the pieces to the card's `changes` list in dependency order and keep the card itself moving forward. Do not send the card back to `discovery`, and do not add top-level cards for the pieces. Give each change an id derived from the card (`RC-UX-001-C1`), a title, and the state `specified`; leave `agent`, `branch`, and `pr` null until the change starts. See [the board schema](../overlord-ops/references/board-schema.md).
 
 Overlord Console renders the file, so no separate board update is needed. If the file cannot be written, return a `BOARD_UPDATE_REQUIRED` block and do not claim that the board is current.

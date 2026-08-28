@@ -47,11 +47,11 @@ A new card is created only when the piece is a separate product outcome: somethi
 
 | Skill | Purpose |
 | --- | --- |
-| `product-ops` | Prioritize work and keep the AI's status organized |
-| `product-improvement-card` | Turn rough observations into actionable work cards |
-| `product-ux-audit` | Walk real user flows and find friction |
-| `product-implementation-brief` | Scope a change tightly before any code is written |
-| `product-change-review` | Have a different AI verify the change against its goal |
+| `overlord-ops` | Prioritize work and keep the AI's status organized |
+| `overlord-improvement-card` | Turn rough observations into actionable work cards |
+| `overlord-ux-audit` | Walk real user flows and find friction |
+| `overlord-implementation-brief` | Scope a change tightly before any code is written |
+| `overlord-change-review` | Have a different AI verify the change against its goal |
 
 ## Overlord Console
 
@@ -99,6 +99,32 @@ cd overlord
 
 For Codex use `./scripts/install.sh codex`. The installer refuses to overwrite existing skills with the same name.
 
+### Removing the old `product-*` install
+
+The skills were renamed from `product-*` to `overlord-*`, so any install made under the old names has to be removed by hand. Otherwise `~/.claude/skills` keeps five broken symlinks and `~/.codex/skills` keeps five real copies of the old content.
+
+```bash
+# check what will be removed first
+ls -l ~/.claude/skills | grep product-
+ls -l ~/.codex/skills | grep product-
+
+# Claude Code: five symlinks, broken by the rename
+rm -rf ~/.claude/skills/product-ops \
+       ~/.claude/skills/product-improvement-card \
+       ~/.claude/skills/product-ux-audit \
+       ~/.claude/skills/product-implementation-brief \
+       ~/.claude/skills/product-change-review
+
+# Codex: five real copies that keep the old content
+rm -rf ~/.codex/skills/product-ops \
+       ~/.codex/skills/product-improvement-card \
+       ~/.codex/skills/product-ux-audit \
+       ~/.codex/skills/product-implementation-brief \
+       ~/.codex/skills/product-change-review
+```
+
+On a symlink, `rm -rf` removes the link itself and leaves its target untouched. If you installed per project, remove `.claude/skills/product-*` from that repository the same way.
+
 ### Console
 
 Requires [Bun](https://bun.sh). A prebuilt frontend is included, so it runs as is.
@@ -119,7 +145,7 @@ The server listens on `127.0.0.1` only and rejects requests whose `Host` / `Orig
 Start Claude Code at the root of the target repository and run:
 
 ```text
-/product-ops
+/overlord-ops
 Start managing this project's work.
 Review the code, existing docs, and project conventions,
 then create docs/product-ops/board.yaml.
