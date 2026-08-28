@@ -9,7 +9,7 @@ import {
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
 import { useConsole } from "@/console-context";
-import { decisionId, decisionIds, decisionText, scoreOf } from "@/lib/board";
+import { changeProgress, decisionId, decisionIds, decisionText, hasSession, scoreOf } from "@/lib/board";
 import { STATES, type Item, type StateKey } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -145,6 +145,10 @@ function BoardCard({
 }) {
   const [dragging, setDragging] = useState(false);
   const score = scoreOf(item);
+  const session = hasSession(item);
+  // Read-only progress of the card's engineering split; changes never
+  // become cards of their own.
+  const progress = changeProgress(item);
   const card = (
     <article
       draggable
@@ -172,12 +176,15 @@ function BoardCard({
       {item.next_action && (
         <div className="mt-1 text-[11px] text-dim">→ {item.next_action}</div>
       )}
-      {(item.project || item.owner || item.agent?.surface_id || item.blocker) && (
+      {(item.project || item.owner || session || progress || item.blocker) && (
         <div className="mt-1.5 flex flex-wrap gap-1">
           {item.project && <CardTag>{item.project}</CardTag>}
           {item.owner && <CardTag>{item.owner}</CardTag>}
-          {item.agent?.surface_id && (
-            <CardTag className="border-primary/40 text-primary">担当あり</CardTag>
+          {session && <CardTag className="border-primary/40 text-primary">担当あり</CardTag>}
+          {progress && (
+            <CardTag>
+              変更 {progress.done}/{progress.total}
+            </CardTag>
           )}
           {item.blocker && (
             <CardTag className="border-destructive/40 text-destructive">停止中</CardTag>

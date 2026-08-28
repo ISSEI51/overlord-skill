@@ -27,6 +27,22 @@ observation -> work card -> prioritize -> implementation brief -> implement -> i
 | Overlord Console | A browser dashboard that renders and edits the board file |
 | Commander | The one cmux session you talk to; it dispatches each card's work to subagents |
 
+### Cards, changes, and tasks
+
+The board has three levels, and **you only manage the top one**.
+
+| Level | Meaning | Where you see it |
+| --- | --- | --- |
+| **Card** | One product outcome; the human decision unit | A card on the kanban |
+| **Change** | One delivery unit: 1 change = 1 worktree = 1 branch = 1 PR = 1 agent execution unit | Read-only inside the card modal |
+| **Task** | A step inside an agent's run | Never shown |
+
+A change moves one pull request at a time: `start` creates its worktree and branch, `pr` pushes it and opens the pull request, `reviewed` records the commit the independent review read, and `sync` writes the pull request state back after the merge. `scripts/change.sh` runs each step and records it on the board, so nobody edits the board by hand. A change whose reviewed commit is not the pull request head does not go to acceptance.
+
+Large work is split into **changes**. Many files, a backend/frontend divide, a migration, a desire for smaller pull requests — all of these become changes, and **the card count stays the same**.
+
+A new card is created only when the piece is a separate product outcome: something you could prioritize, ship, or cancel on its own, with its own acceptance conditions.
+
 ## Included skills
 
 | Skill | Purpose |

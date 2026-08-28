@@ -20,9 +20,16 @@ import {
 import { Textarea } from "@/components/ui/textarea";
 import { useConsole } from "@/console-context";
 import { errorMessage } from "@/lib/api";
-import { formatValue, surfaceLabel, terminalSurfaces } from "@/lib/board";
+import {
+  activeSession,
+  changesOf,
+  formatValue,
+  stateLabel,
+  surfaceLabel,
+  terminalSurfaces,
+} from "@/lib/board";
 import { cardInstructions } from "@/lib/templates";
-import { STATES, type Item } from "@/lib/types";
+import { STATES, type Change, type Item } from "@/lib/types";
 
 /**
  * Card detail as a centered modal dialog. Closing (outside click or
@@ -74,6 +81,7 @@ export function DetailPanel() {
             <EditableField key={`${item.id}:owner`} item={item} field="owner" label="担当" />
             <EditableField key={`${item.id}:blocker`} item={item} field="blocker" label="止まっている理由" />
             <WorkerField item={item} />
+            <ChangesField item={item} />
             <ReadonlyField label="困っていることと根拠" value={item.evidence} />
             <ConditionsField item={item} />
             <ReadonlyField label="今回はやらないこと" value={item.out_of_scope} />
@@ -304,13 +312,15 @@ function EditableField({
 /** Read-only view of the worker session the commander assigned to this card. */
 function WorkerField({ item }: { item: Item }) {
   const { data, focusSurface } = useConsole();
-  const surfaceId = item.agent?.surface_id ?? null;
+  // A change owns its agent; the card-level agent is the fallback.
+  const session = activeSession(item);
+  const surfaceId = session?.agent.surface_id ?? null;
   const link = surfaceId
     ? (terminalSurfaces(data).find((entry) => entry.surface.id === surfaceId) ?? null)
     : null;
 
   return (
-    <Field label="担当セッション">
+    <Field label={session?.changeId ? `担当セッション（${session.changeId}）` : "担当セッション"}>
       {!surfaceId ? (
         <div className="text-[12.5px] text-faint">未割り当て（司令塔が起動します）</div>
       ) : (
@@ -333,12 +343,65 @@ function WorkerField({ item }: { item: Item }) {
               </Button>
             )}
           </div>
-          {item.agent?.cwd && (
-            <div className="mt-1 text-[11px] text-faint">{item.agent.cwd}</div>
+          {session?.agent.cwd && (
+            <div className="mt-1 text-[11px] text-faint">{session.agent.cwd}</div>
           )}
         </>
       )}
     </Field>
+  );
+}
+
+/**
+ * Read-only engineering split of the card. Changes are not a human decision
+ * unit, so nothing here is editable: the board stays one card per outcome.
+ */
+function ChangesField({ item }: { item: Item }) {
+  const changes = changesOf(item);
+  if (changes.length === 0) return null;
+  return (
+    <Field label="変更（PR単位）">
+      <ul className="flex flex-col gap-1.5">
+        {changes.map((change) => (
+          <li key={change.id} className="rounded-md border bg-sunken px-2 py-1.5">
+            <div className="flex items-baseline justify-between gap-2">
+              <span className="font-mono text-[10px] text-faint">{change.id}</span>
+              <span className="text-[10px] text-dim">{stateLabel(change.state)}</span>
+            </div>
+            <div className="text-[12.5px] leading-snug">{change.title ?? ""}</div>
+            <ChangeLinks change={change} />
+          </li>
+        ))}
+      </ul>
+    </Field>
+  );
+}
+
+function ChangeLinks({ change }: { change: Change }) {
+  const url = change.pr?.url ?? null;
+  // Only render an anchor for a real https URL; the file is agent-written.
+  const safeUrl = url && url.startsWith("https://") ? url : null;
+  const label = change.pr?.number ? `PR #${change.pr.number}` : url ? "PR" : null;
+  const prState = change.pr?.state ?? null;
+  if (!change.branch && !label) return null;
+  return (
+    <div className="mt-0.5 flex flex-wrap items-center gap-x-2 font-mono text-[10px] text-faint">
+      {change.branch && <span>{change.branch}</span>}
+      {label &&
+        (safeUrl ? (
+          <a
+            href={safeUrl}
+            target="_blank"
+            rel="noreferrer"
+            className="text-primary hover:underline"
+          >
+            {label}
+          </a>
+        ) : (
+          <span>{label}</span>
+        ))}
+      {prState && <span>({prState})</span>}
+    </div>
   );
 }
 

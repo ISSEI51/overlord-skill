@@ -7,6 +7,8 @@ description: Convert a rough product observation, voice memo, feedback item, or 
 
 Turn incomplete input into a decision-ready card without making unsupported claims. Inspect the relevant application, code, logs, or supplied evidence when available, but do not modify code.
 
+Return one card per product outcome. Split an observation into several cards only when each piece can be prioritized, approved, shipped, or cancelled on its own; technical size, layer boundaries, and review convenience are handled later as changes under one card, not as extra cards.
+
 Distinguish observed facts from hypotheses. If a detail cannot be confirmed, label it as unknown rather than asking the user for routine information. Propose at most three solution options, then recommend one only when the evidence supports a choice.
 
 Return this exact structure:

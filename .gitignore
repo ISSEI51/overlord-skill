@@ -1,3 +1,9 @@
 .DS_Store
 console/node_modules/
 console/frontend/node_modules/
+.overlord/
+
+# board.yaml write path: the cross-process lock and the atomic-rename staging
+# files, neither of which ever outlives a write.
+*.lock
+*.overlord-tmp.*

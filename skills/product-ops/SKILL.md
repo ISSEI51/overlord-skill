@@ -13,7 +13,7 @@ Operate as the human's product-development control plane. The goal is to minimiz
 - The remaining capacity is for discovery, specification, independent review, validation, or release follow-up.
 - The user should need to make at most three decisions per daily briefing; one is preferred.
 - Do not send an unstructured idea directly to implementation. First create an improvement card.
-- Use one isolated worktree per implementation item when worktrees are available. Do not assign overlapping edits to multiple agents.
+- Use one isolated worktree per change when worktrees are available. Do not assign overlapping edits to multiple agents.
 - Treat all scores as decision support, not as a replacement for explicit business constraints.
 
 ## Console Board
@@ -27,15 +27,32 @@ The user's visual control surface is Overlord Console, a localhost dashboard tha
 
 Keep the chat response limited to the next decision or result.
 
+## Cards, Changes, and Tasks
+
+The board carries three levels, and only the first one is the user's to manage.
+
+| Level | Meaning | Where it lives |
+| --- | --- | --- |
+| Card | One product outcome; the human decision unit | A top-level item on the kanban |
+| Change | One engineering delivery unit: 1 worktree = 1 branch = 1 pull request = 1 agent execution unit | The card's `changes` list, read-only in the console |
+| Task | One step inside an agent's run | Inside the agent; never on the board |
+
+Keep the number of cards equal to the number of decisions the user has to make. Split work into changes freely; split it into cards almost never.
+
+Add a top-level card only when the piece is a product outcome that can be prioritized, approved, shipped, or cancelled on its own, has its own acceptance conditions, or belongs to a different release or owner. Do not add a card because there are many files, because the work spans backend and frontend, API, database, or UI, because it needs a new dependency or a migration, because agents could run in parallel, or because a pull request would be smaller or easier to review. Those call for another change under the same card.
+
+A card keeps moving forward while its changes run: it enters `implementing` when the first change starts and stays there until every change is done. Never send a card back to `discovery` because it was split. The active-work limits count cards, not changes. Each change records its own `agent`, `branch`, and `pr`; the card-level `agent` remains only for cards written before changes existed.
+
 ## Commander and Subagents
 
 The console has one fixed session, the commander, and the user talks only to it. Every card's work is dispatched by the commander, never chosen by the user.
 
 - When this session is the commander, keep the top-level `commander` pointer in `docs/product-ops/board.yaml` current. Read your own session with `cmux identify --json --id-format both` and store `workspace_id` and `surface_id`.
 - Never ask the user to pick, open, or switch a cmux session. If work needs a session, create it.
-- For an `implementing` card, start one cmux workspace per card on its own worktree and record it in the card's `agent` field, so the console can show which session owns the card. See [the console reference](references/console.md) for the exact commands.
+- For an `implementing` card, start one cmux workspace per change on its own worktree and record it in that change's `agent` field, so the console can show which session owns the work. A card without a `changes` list is a single change; record the session on the card's `agent` as before. See [the console reference](references/console.md) for the exact commands.
 - For discovery, card creation, implementation briefs, and independent review, run a subagent inside this session instead of a new workspace, then write the result to the board.
-- Run the independent review with a different subagent from the one that implemented the change. Do not let an implementing subagent accept its own work.
+- Run the independent review with a different subagent from the one that implemented the change. Do not let an implementing subagent accept its own work. The reviewer records the commit it read with `change.sh reviewed <change-id>`; a change whose `reviewed_sha` is not its `head_sha` is not ready for acceptance.
+- Before reporting status or deciding whether a card is complete, refresh each change's pull request state on the board: from the project directory, run `/path/to/overlord/scripts/change.sh sync <card-id>` with the absolute path of the Overlord checkout, as in [the console reference](references/console.md).
 - Report back in the commander session only: the decision needed, or the result. Do not tell the user which subagent produced it unless they ask.
 
 ## AI-Readable Board
