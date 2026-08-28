@@ -1,13 +1,65 @@
 version: 1
-updated_at: "2026-08-28T05:34:22Z"
+updated_at: "2026-08-28T06:26:21Z"
 commander:
   workspace_id: "C06728B8-B8BA-4D83-A69D-9ADE254532CB"
   surface_id: "93EF686E-FAF3-4474-850A-0DEAC3C5BD8D"
   cwd: "/Users/kunimasa/dev/overlord"
-decisions_required:
-  - id: "OV-103"
-    question: "PR lifecycle（4 changes・PR #3/#4/#6）を確認して受け入れるか"
+decisions_required: []
 items:
+  - id: "OV-105"
+    project: "Overlord"
+    title: "受け入れ完了でカードの成果を main へ提案する"
+    state: "implementing"
+    priority:
+      impact: 4
+      urgency: 4
+      confidence: 4
+      ease: 3
+      override: "ユーザー指示"
+    evidence: |-
+      ユーザー報告: OV-103 を受け入れ完了にしたが GitHub に PR が見当たらない。
+      事実確認: change 単位の PR（#3/#4/#6）は作成・マージ済みだが、いずれも base が作業ブランチ overlord-console。change.sh pr の base 既定が「メインチェックアウトの現在ブランチ」であるため、カード完了時に main へ提案する経路が仕組みに存在しない。結果として overlord-console が main より 9 コミット先行したまま PR 無しの状態になり、PR #8 を手作業で作る必要があった。
+      採用案: カードの受け入れ完了（state=done への遷移）を契機に、そのカードの changes がマージ済みであることを確認したうえで、作業ブランチから main へ向けた PR を作成または更新する。
+    acceptance_conditions:
+      - "カードを acceptance から done にすると、作業ブランチから main への PR が作成される"
+      - "未マージの change が残るカードは配送をブロックし、どの change が未マージかを利用者に示す"
+      - "ブロック判定の前に PR 状態を同期し、ボードが古いだけの誤検知を起こさない"
+      - "対象ブランチに main 向け PR が既にある場合は二重作成せず、既存 PR を更新（または再利用）する"
+      - "PR 本文にそのカードの成果（タイトル・受け入れ条件・含まれる change と PR 番号）が入る"
+      - "作業ブランチが main と同一内容のときは PR を作らない"
+      - "PR 作成に失敗してもカードの done への遷移は成立し、失敗が利用者に伝わる"
+    out_of_scope: "自動マージ、レビュアー割り当て、GitHub 以外のホスティング、change 単位 PR の base 変更"
+    owner: "claude"
+    next_action: "OV-105-C1 の実装結果を検証する"
+    blocker: null
+    changes:
+      - id: "OV-105-C1"
+        title: "card 単位の PR 作成コマンド（deliver）とボードの delivery 記録"
+        state: "implementing"
+        agent: null
+        branch: "overlord/OV-105-C1"
+        pr: null
+      - id: "OV-105-C2"
+        title: "サーバーの done 遷移検知と配送結果の SSE 配信"
+        state: "specified"
+        agent: null
+        branch: null
+        pr: null
+      - id: "OV-105-C3"
+        title: "ボタンのフィードバックと成果PRの表示、文書の更新"
+        state: "specified"
+        agent: null
+        branch: null
+        pr: null
+    updated_at: "2026-08-28T07:40:00Z"
+    brief: |-
+      【ユーザー決定】未マージ change が残る場合は配送をブロックする（案A）。ただしブロック判定の直前に sync を実行して PR 状態を最新化し、ボードが古いだけの誤検知を防ぐ。
+      規則上カードは全 change が done になってから acceptance へ上がるため、ブロックは通常発火しない例外の安全網。発火経路は (1) 司令塔の誤り (2) 中止された change (3) Kanban のドラッグで acceptance を飛ばした場合 (4) sync 未実行でボードが古い場合。(4) は同期先行で解消する。
+      方針: ロジックは change.ts の deliverCard()（標準出力に書かない関数）に置き、change.sh deliver とサーバーの done 検知の両方から呼ぶ。案(a)主経路+案(b)実装形。案(c)は司令塔が SSE を購読する常駐機構が必要で却下。
+      サーバーは mutateBoard の応答後にバックグラウンドで配送し、結果を SSE の delivery イベントで配信する。コールバック内で呼ぶとロック再入で BoardLockError になるため禁止（コメントとテストで固定）。
+      同一内容の判定は git diff --quiet（コミット数では判定しない）。実測で origin/main..origin/overlord-console は10コミット先行だが diff は空（squash マージのため）。
+      既存 PR がある場合はタイトルを変えず、<!-- overlord:card ID --> マーカーで囲んだカード単位セクションを本文に追加・置換する。
+      base は refs/remotes/origin/HEAD → gh repo view → main の3段フォールバック。作成後に headRefName/baseRefName を検証し不一致ならボードを書かず失敗。
   - id: "OV-104"
     project: "Overlord"
     title: "ボードの同時書き込みで更新が消えないようにする"
@@ -23,6 +75,7 @@ items:
       追加で判明した欠陥2件: (1) createItem(248-271) には rev 比較自体が無く常に後勝ちで全体を上書きする。(2) フロントの PATCH 呼び出しは await されていないため、同一プロセス内で重なった2本の PATCH でも先の変更が消える。
       revisionOf は round(mtimeMs):size で、stat がナノ秒精度を返せるのに 1ms に丸めている。同一ミリ秒・同一サイズの書き込みは 409 判定と SSE 通知の両方で取りこぼす。
       CLI 側（change.ts の updateChange）だけが保存直前の revision 再取得を持つ。守られていないのはサーバー側。
+      追記: PR #7 は 36db539 の時点でマージされ、その後に push したレビュー修正 08a44af が取り込まれないまま残った。指摘された3件（.gitignore の *.lock が bun.lock を巻き込む・デッドラインが実時間・ロックの pid を読まない）は main に未反映。OV-104-C3 で回収する。
     acceptance_conditions:
       - "コンソールの PATCH と CLI の書き込みを100回競合させて、CLI の書き込みが消えるケースが0件（競合時は 409 になる）"
       - "同じ rev の PATCH を2本同時発行したとき、片方が 200・片方が 409 になり、消失が起きない"
@@ -31,7 +84,7 @@ items:
       - "rev 形式変更後も typecheck と既存の change.test.ts が通る"
     out_of_scope: "board.yaml のスキーマ変更（rev カウンタ導入を含む）、CLI のコマンド体系や updateChange の再設計、HTTP API の形の変更、複数サーバーインスタンスの排他、競合時の UI 改善"
     owner: "claude"
-    next_action: "OV-104-C2 を実装する（条件1 は C2 で初めて達成される）"
+    next_action: "OV-104-C3 で取り残された修正を回収する"
     blocker: null
     changes:
       - id: "OV-104-C1"
@@ -47,26 +100,36 @@ items:
           reviewed_sha: "aeaafd1"
       - id: "OV-104-C2"
         title: "ロックファイルによるプロセス間の直列化と一時ファイル名の分離"
-        state: "reviewing"
+        state: "done"
         agent: null
         branch: "overlord/OV-104-C2"
         pr:
           number: 7
           url: "https://github.com/ISSEI51/overlord-skill/pull/7"
-          state: "open"
+          state: "merged"
           head_sha: "36db539d7d1bd2761417845333d0b2070052df5b"
+          reviewed_sha: "36db539"
+      - id: "OV-104-C3"
+        title: "取り残したレビュー修正の回収（.gitignore / 単調時計 / pid 生存確認）"
+        state: "done"
+        agent: null
+        branch: "overlord/OV-104-C3"
+        pr:
+          number: 9
+          url: "https://github.com/ISSEI51/overlord-skill/pull/9"
+          state: "merged"
+          head_sha: "46d5b106027e50d9364ac50aec128a3c5b80476b"
           reviewed_sha: null
-    updated_at: "2026-08-27T23:20:00Z"
+    updated_at: "2026-08-28T08:20:00Z"
     brief: |-
       採用案: board.ts に共通の書き込み口を作り、(i) プロセス内直列化 (ii) ロック内で loadBoard (iii) expectedRev 突き合わせ (iv) saveBoard を通す。あわせて revisionOf を mtimeNs:size に変更する（rev は不透明文字列として扱われており非互換なし — フロント・CLI とも等値比較のみであることを確認済み）。
       保存直前の再確認だけでは窓が 0.4〜2ms → 0.2〜1ms に縮むだけで「必ず 409」を保証できないため、ロックファイル（O_EXCL + 失効時間）まで入れて board.ts 経由の書き込みを直列化する。
       server.ts はモジュール読み込み時に引数解析と Bun.serve を実行する構造でテストの継ぎ目が無い。ロックがあれば「テストがロックを保持した状態で PATCH が 409 を返す」決定的なテストが書ける。
     review: |-
-      OV-104-C1 独立レビュー（実測中心・PR #5 マージ済み）:
-      条件1（プロセス間競合で CLI の書き込みが消えない／409）は FAIL。750ラウンドで 409 は0件、CLI 書き込み消失 2〜3%、コンソール書き込みの巻き戻しは 17〜49%（ボードが大きいほど窓が広がる）。C1 は同一プロセス内のみを守る。
-      条件2〜5 は PASS。同一プロセス内は明確な改善（base は同条件で1ラウンド目に board.yaml を破損させ以降50/50が500、head は 200/409 で消失0）。revision 粒度は 2627ペアすべてで衝突0。
-      追加で判明した重大事項: saveBoard の一時ファイル名が固定（<path>.overlord-tmp）のため、2プロセス同時書き込みの 92〜97% で片方が rename ENOENT で失敗し、board.yaml 全体の破損（NUL埋め・パース不能）を実際に1件再現。破損後はサーバーの全書き込みが 500 になり手で直すまで復旧しない。
-      レビュー後の追加コミット 63e71f4 は、レビュー担当が指摘した誤ったコメント（プロセス間も expectedRev で捕捉される、という記述）の修正のみ。マージゲートが警告を出したうえで司令塔が差分を確認して判断した。
+      C1（PR #5）/ C2（PR #7）ともマージ済み。独立レビューが実測で欠陥を確定させ、修正後の効果も再現した。
+      2プロセス同時書き込み 50ラウンド: rename ENOENT 49/50→0/50、両プロセス正常終了 1/50→50/50、書き込み消失 49/50→0、board 破損 1/50→0（レビュー担当の計測）。
+      C2 のレビュー指摘3件を修正: .gitignore の *.lock が追跡中の bun.lock を巻き込む（止めるべき問題）、取得デッドラインが実時間でスリープ中に経過し偽の競合になる、ロックの pid を書きながら読まず生存中のロックを壊す。
+      テスト 95 pass / 0 fail。修正の差分（08a44af）は独立レビューを経ていないが、いずれもレビュー担当が実装方法まで指定した内容で、新規テストと競合再測で確認した。
   - id: "OV-103"
     project: "Overlord"
     title: "変更をPR単位でレビュー・マージできるようにする"
