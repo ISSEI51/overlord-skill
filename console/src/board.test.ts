@@ -407,7 +407,8 @@ describe("board lock", () => {
   test("reports a conflict instead of writing when the lock is held", async () => {
     const rev = await seed([item("A-1")]);
     const lockPath = lockPathFor(boardPath);
-    await writeFile(lockPath, "99999\n", "utf8");
+    // A live holder: this process. A dead pid is reclaimed at once instead.
+    await writeFile(lockPath, `${process.pid}\n`, "utf8");
     boardLock.acquireTimeoutMs = 150;
 
     const failure = await mutateBoard(boardPath, undefined, (board) => {
@@ -421,6 +422,24 @@ describe("board lock", () => {
     // Nothing was written and the live lock was left alone.
     expect(await revisionOf(boardPath)).toBe(rev);
     expect(existsSync(lockPath)).toBe(true);
+  });
+
+  test("a lock left by a dead process is reclaimed without waiting", async () => {
+    await seed([item("A-1")]);
+    const lockPath = lockPathFor(boardPath);
+    // Fresh mtime, so the staleness window has not passed: only the pid tells
+    // us the holder crashed. Without that check this waited the full timeout.
+    await writeFile(lockPath, "99999\n", "utf8");
+    boardLock.acquireTimeoutMs = 5_000;
+
+    const started = performance.now();
+    const { board } = await mutateBoard(boardPath, undefined, (current) => {
+      current.items.push(item("A-2"));
+    });
+
+    expect(board.items).toHaveLength(2);
+    expect(performance.now() - started).toBeLessThan(1_000);
+    expect(existsSync(lockPath)).toBe(false);
   });
 
   test("releases the lock when the mutation throws", async () => {
