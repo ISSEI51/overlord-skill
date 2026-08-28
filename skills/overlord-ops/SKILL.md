@@ -1,5 +1,5 @@
 ---
-name: product-ops
+name: overlord-ops
 description: Orchestrate AI-assisted product development across multiple projects. Use to triage improvements, set weekly priorities, dispatch parallel work, or create a daily product-development briefing. Do not use for a single code change that already has a complete specification.
 ---
 
@@ -67,10 +67,10 @@ Maintain `docs/product-ops/board.yaml` in the repository as the sole machine-rea
 
 ## Route the Request
 
-- For rough observations, feedback, or feature ideas, use `product-improvement-card`.
-- For interaction quality, workflow friction, UI regression, or usability checks, use `product-ux-audit`.
-- For a selected idea that must become a bounded engineering task, use `product-implementation-brief`.
-- For an existing change or pull request that needs independent checking, use `product-change-review`.
+- For rough observations, feedback, or feature ideas, use `overlord-improvement-card`.
+- For interaction quality, workflow friction, UI regression, or usability checks, use `overlord-ux-audit`.
+- For a selected idea that must become a bounded engineering task, use `overlord-implementation-brief`.
+- For an existing change or pull request that needs independent checking, use `overlord-change-review`.
 - For cross-project priorities, active-work limits, weekly selection, or an operating status, perform the orchestration below.
 
 ## Orchestration

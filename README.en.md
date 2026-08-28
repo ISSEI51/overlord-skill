@@ -1,12 +1,53 @@
 # Overlord
 
-[日本語](README.md) | [English](README.en.md)
+[日本語](README.md) | [English](README.en.md) · [MIT License](LICENSE)
 
-A toolkit for running product development with AI across multiple projects: find problems, decide on fixes, implement them, and verify the results.
+## You are the Overlord. You make the decisions that matter.
 
-You decide what to work on first, whether a fix is right, and whether the work is done. The AI handles triaging observations, investigating code, scoping the work, implementing, reviewing, and keeping progress up to date.
+Let AI agents investigate, plan, implement, review, and track the work — while you focus on priorities, direction, and final decisions.
+
+Overlord is a control layer that runs your Claude Code and Codex agents as a development team instead of as a single coder. Every change is one worktree, one branch, one pull request, one agent run, so several pieces of work can move in parallel while the only thing left in your hands is deciding.
 
 ![Overlord Console](docs/images/console-board.jpg)
+
+## Highlights
+
+- **Only decisions reach you** — the "decisions today" bar holds at most three items. A cyan border means a card is waiting on you; a yellow border means an AI is working on it. Those two signals are the whole dashboard
+- **Agents work as a team** — you talk to exactly one session, the commander. It dispatches each card's discovery, brief, implementation, and review to subagents
+- **Parallel work, one pull request at a time** — 1 change = 1 worktree = 1 branch = 1 pull request = 1 agent run. Large work is split into changes, not into more cards
+- **No AI signs off on its own change** — the independent review runs in a different subagent, and a change whose reviewed commit is not the pull request head never reaches acceptance
+- **One file holds the state** — agents read and write only `docs/product-ops/board.yaml`; you see it as a kanban in the browser. Writes are guarded by optimistic locking
+- **Local only** — the console listens on `127.0.0.1` and rejects any request whose `Host` or `Origin` is not loopback
+
+## Quick start
+
+You need:
+
+- [Claude Code](https://claude.com/claude-code) (or Codex)
+- [Bun](https://bun.sh) — required to run Overlord Console
+- cmux — required for the commander sidebar and the card instruction buttons. Without cmux you can still browse and edit the kanban and add observations
+
+1. **Install the skills**
+
+   ```bash
+   git clone https://github.com/ISSEI51/overlord-skill.git
+   cd overlord-skill
+   ./scripts/install.sh claude          # for Codex: ./scripts/install.sh codex
+   ```
+
+2. **Start the console against the project you want to run**
+
+   ```bash
+   ./scripts/console.sh ~/dev/your-project
+   ```
+
+   It prints the address it listens on (`http://127.0.0.1:7377` by default). Open it in a browser.
+
+3. **Set up the commander** — in the right sidebar (open on first launch; the top-bar icon or **⌘B** toggles it), press "司令塔を新しく起動" (start a new commander), enter the project directory, and press start. The console creates a cmux workspace running Claude Code, records it as the commander, and pre-fills the composer with the first instruction. Press send: the commander reads `docs/product-ops/board.yaml` (creating it if it does not exist) and reports today's status.
+
+4. **Try one item** — press "気づきを追加" (add an observation) in the top bar and write one line; a card appears in the inbox. Open the card and press "進める" (advance), and the commander assigns the step that card's state calls for to a subagent.
+
+From then on, you only look at the cyan-bordered cards and the decisions bar, and decide what to approve and accept.
 
 ## Architecture
 
@@ -47,15 +88,15 @@ A new card is created only when the piece is a separate product outcome: somethi
 
 | Skill | Purpose |
 | --- | --- |
-| `product-ops` | Prioritize work and keep the AI's status organized |
-| `product-improvement-card` | Turn rough observations into actionable work cards |
-| `product-ux-audit` | Walk real user flows and find friction |
-| `product-implementation-brief` | Scope a change tightly before any code is written |
-| `product-change-review` | Have a different AI verify the change against its goal |
+| `overlord-ops` | Prioritize work and keep the AI's status organized |
+| `overlord-improvement-card` | Turn rough observations into actionable work cards |
+| `overlord-ux-audit` | Walk real user flows and find friction |
+| `overlord-implementation-brief` | Scope a change tightly before any code is written |
+| `overlord-change-review` | Have a different AI verify the change against its goal |
 
 ## Overlord Console
 
-A local dashboard built with React + shadcn/ui. Changes to `board.yaml` appear on screen automatically.
+A local dashboard built with React + shadcn/ui. Changes to `board.yaml` appear on screen automatically. The interface is in Japanese.
 
 ### Board
 
@@ -91,13 +132,43 @@ The right-hand sidebar is the commander — the one cmux session you talk to.
 ### Skills (Claude Code)
 
 ```bash
-git clone <YOUR_REPOSITORY_URL>
-cd overlord
+git clone https://github.com/ISSEI51/overlord-skill.git
+cd overlord-skill
 ./scripts/install.sh claude      # personal (~/.claude/skills)
 # per-project: run /path/to/overlord/scripts/install.sh project inside the target repo
 ```
 
 For Codex use `./scripts/install.sh codex`. The installer refuses to overwrite existing skills with the same name.
+
+### Removing the old `product-*` install
+
+The skills were renamed from `product-*` to `overlord-*`, so any install made under the old names has to be removed by hand. Otherwise the old skills stay installed: `scripts/install.sh` copies with `cp -R`, so an installer-made install leaves five real copies; a hand-made symlink install leaves five broken symlinks.
+
+Real copies keep working with their old content, so `/product-ops` and the other four still run. Their descriptions are nearly identical to the new ones, so until you remove them the wrong skill can be picked.
+
+```bash
+# check what will be removed first
+ls -l ~/.claude/skills | grep product-
+ls -l ~/.codex/skills | grep product-
+
+# Claude Code
+rm -rf ~/.claude/skills/product-ops \
+       ~/.claude/skills/product-improvement-card \
+       ~/.claude/skills/product-ux-audit \
+       ~/.claude/skills/product-implementation-brief \
+       ~/.claude/skills/product-change-review
+
+# Codex
+rm -rf ~/.codex/skills/product-ops \
+       ~/.codex/skills/product-improvement-card \
+       ~/.codex/skills/product-ux-audit \
+       ~/.codex/skills/product-implementation-brief \
+       ~/.codex/skills/product-change-review
+```
+
+On a symlink, `rm -rf` removes the link itself and leaves its target untouched. If you installed per project, remove `.claude/skills/product-*` from that repository the same way.
+
+Skills are read when a session starts, so restart Claude Code / Codex after removing them.
 
 ### Console
 
@@ -110,23 +181,23 @@ brew install oven-sh/bun/bun     # if not installed yet
 
 Opens at `http://127.0.0.1:7377`. Use `--port 7400` to change the port, `--open` to open it in a cmux browser pane.
 
-After changing the frontend, regenerate `console/public` with `cd console && bun install && bun run build`.
+After changing the frontend, install its dependencies with `cd console/frontend && bun install`, then regenerate `console/public` with `cd console && bun run build`.
 
 The server listens on `127.0.0.1` only and rejects requests whose `Host` / `Origin` is not loopback.
 
-## Getting started
+## Getting started by hand
 
-Start Claude Code at the root of the target repository and run:
+Instead of letting the sidebar start the commander, you can promote a Claude Code session you started yourself. Start Claude Code at the root of the target repository and run:
 
 ```text
-/product-ops
+/overlord-ops
 Start managing this project's work.
 Review the code, existing docs, and project conventions,
 then create docs/product-ops/board.yaml.
 Give me at most three decisions to make first.
 ```
 
-Start the console in another terminal and register that Claude Code session as the commander from the sidebar's "change" button (or let the session register itself via `cmux identify --json`).
+Start the console in another terminal and register that session as the commander from the sidebar's "変更" (change) button. A session can also write its own IDs to the board's `commander` field after reading them with `cmux identify --json --id-format both`.
 
 For the repository's merge-method setting, see [Why merge commits](#why-merge-commits).
 

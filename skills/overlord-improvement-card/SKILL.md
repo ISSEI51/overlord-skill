@@ -1,5 +1,5 @@
 ---
-name: product-improvement-card
+name: overlord-improvement-card
 description: Convert a rough product observation, voice memo, feedback item, or bug report into a compact evidence-based improvement card. Use before prioritization or implementation; do not implement the change.
 ---
 
