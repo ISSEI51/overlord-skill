@@ -1,12 +1,53 @@
 # Overlord
 
-[日本語](README.md) | [English](README.en.md)
+[日本語](README.md) | [English](README.en.md) · [MIT License](LICENSE)
 
-複数のプロジェクトで、問題を見つけ、直し方を決め、実装し、確認する流れをAIと進めるための道具集です。
+## あなたは Overlord だ。重要な判断は、あなたが下す。
 
-あなたは「何を先にやるか」「この直し方でよいか」「完成としてよいか」を決めます。AIは、気づきの整理、コードの調査、作業内容の整理、実装、確認、進み具合の更新を担当します。
+調査、実装前整理、実装、レビュー、進捗管理は AI に任せる。あなたは優先順位、方向性、最終判断に思考を使う。
+
+Overlord は、Claude Code や Codex のコーディングエージェントを1人のコーダーではなく「開発チーム」として動かすための管理レイヤーです。1変更 = 1 worktree = 1 branch = 1 PR = 1 エージェント実行にそろえ、複数の作業を並行して進めながら、あなたの手元に残る操作を「決めること」だけにします。
 
 ![Overlord Console](docs/images/console-board.jpg)
+
+## 主な特徴
+
+- **決めることだけが残る** — 「今日の判断」バーには最大3件しか出ません。水色枠はあなたの操作待ち、黄色枠は AI が作業中。見る場所はこの2つだけです
+- **AI をチームとして動かす** — あなたが会話するのは司令塔セッション1つだけ。カードごとの調査・実装前整理・実装・レビューは、司令塔がサブエージェントを起動して進めます
+- **PR 単位で並行して進む** — 1変更 = 1 worktree = 1 branch = 1 PR = 1 エージェント実行。大きな仕事はカードを増やさずに変更へ分割します
+- **実装した AI に自分の変更を承認させない** — 独立レビューは実装とは別のサブエージェントが担当します。レビュー済みの commit が PR の先頭と食い違う変更は、完成確認待ちに上がりません
+- **状態は1ファイルに集約** — AI は `docs/product-ops/board.yaml` だけを読み書きし、あなたはブラウザのカンバンで見ます。書き込みは楽観ロックで保護されます
+- **ローカルで完結** — コンソールは `127.0.0.1` だけで待ち受け、loopback 以外の `Host` / `Origin` を拒否します
+
+## Quick Start
+
+必要なもの:
+
+- [Claude Code](https://claude.com/claude-code)（または Codex）
+- [Bun](https://bun.sh) — Overlord Console の実行に必要です
+- cmux — 司令塔サイドバーとカードの指示ボタンに必要です。cmux が無くても、カンバンの閲覧・編集と「気づきを追加」は動きます
+
+1. **スキルをインストールする**
+
+   ```bash
+   git clone https://github.com/ISSEI51/overlord-skill.git
+   cd overlord-skill
+   ./scripts/install.sh claude          # Codex 向けは ./scripts/install.sh codex
+   ```
+
+2. **管理したいプロジェクトを指定してコンソールを起動する**
+
+   ```bash
+   ./scripts/console.sh ~/dev/your-project
+   ```
+
+   起動すると待ち受けアドレス（既定は `http://127.0.0.1:7377`）が表示されます。ブラウザで開いてください。
+
+3. **司令塔を用意する** — 画面右のサイドバー（初回は開いています。閉じているときはトップバーのアイコンまたは **⌘B** で開きます）で「司令塔を新しく起動」を押し、対象プロジェクトのディレクトリを入力して「起動」。Claude Code が動く cmux ワークスペースが作られ、司令塔として登録され、入力欄に最初の指示が入ります。そのまま「送信」を押すと、司令塔が `docs/product-ops/board.yaml` を読み（無ければ作り）、今日の状況を返します。
+
+4. **1件試す** — トップバーの「気づきを追加」で気づきを1行書くと、受信箱にカードができます。カードを開いて「進める」を押すと、司令塔がそのカードの状態に必要な作業をサブエージェントに割り当てます。
+
+以降は、水色枠のカードと「今日の判断」だけを見て、承認と受け入れを決めます。
 
 ## 構成
 
@@ -91,8 +132,8 @@ React + shadcn/ui 製のローカルダッシュボードです。`board.yaml` �
 ### スキル（Claude Code）
 
 ```bash
-git clone <YOUR_REPOSITORY_URL>
-cd overlord
+git clone https://github.com/ISSEI51/overlord-skill.git
+cd overlord-skill
 ./scripts/install.sh claude      # 個人用 (~/.claude/skills)
 # プロジェクト単位なら対象リポジトリで: /path/to/overlord/scripts/install.sh project
 ```
@@ -140,13 +181,13 @@ brew install oven-sh/bun/bun     # まだ入っていない場合
 
 `http://127.0.0.1:7377` で開きます。ポートは `--port 7400`、cmux のブラウザペインで開くなら `--open` を付けます。
 
-フロントエンドを変更した場合は `cd console && bun install && bun run build` で `console/public` を再生成します。
+フロントエンドを変更した場合は `cd console/frontend && bun install` で依存を入れたうえで、`cd console && bun run build` を実行し `console/public` を再生成します。
 
 サーバーは `127.0.0.1` だけで待ち受け、`Host` / `Origin` が loopback でない要求は拒否します。
 
 ## 初期化
 
-対象リポジトリのルートで Claude Code を起動し、次を実行します。
+サイドバーの「司令塔を新しく起動」を使わず、自分で起動した Claude Code を司令塔にすることもできます。対象リポジトリのルートで Claude Code を起動し、次を実行します。
 
 ```text
 /overlord-ops
@@ -156,7 +197,7 @@ docs/product-ops/board.yaml を作成してください。
 最初に私が決めることは最大3件にしてください。
 ```
 
-別のターミナルでコンソールを起動し、サイドバーの「変更」からこの Claude Code セッションを司令塔として登録します（司令塔側からは `cmux identify --json` で自分を登録することもできます）。
+別のターミナルでコンソールを起動し、サイドバーの「変更」からこの Claude Code セッションを司令塔として登録します（司令塔側から `cmux identify --json --id-format both` で自分の ID を読み、board の `commander` に書き込む方法もあります）。
 
 ## 日常の使い方
 
