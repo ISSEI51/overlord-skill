@@ -5,5 +5,5 @@ console/frontend/node_modules/
 
 # board.yaml write path: the cross-process lock and the atomic-rename staging
 # files, neither of which ever outlives a write.
-*.lock
+board.yaml.lock
 *.overlord-tmp.*

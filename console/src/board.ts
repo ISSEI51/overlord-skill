@@ -6,7 +6,7 @@
  * concurrent writes by an agent through a revision token.
  */
 
-import { mkdir, open, rename, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, resolve, sep } from "node:path";
 
 export const STATES = [
@@ -316,9 +316,30 @@ function sleep(ms: number): Promise<void> {
  * and the other observes the change and retries instead of deleting a lock
  * that is now held.
  */
+/** True when no process holds this pid, so its lock can be reclaimed. */
+async function holderIsGone(lockPath: string): Promise<boolean> {
+  const text = await readFile(lockPath, "utf8").catch(() => null);
+  const pid = Number((text ?? "").trim());
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (error) {
+    // EPERM means the process exists but belongs to someone else.
+    return (error as NodeJS.ErrnoException).code !== "EPERM";
+  }
+}
+
 async function breakStaleLock(lockPath: string): Promise<boolean> {
   const first = await lockMtimeNs(lockPath);
   if (first === null) return true;
+  // The mtime test alone breaks a live holder's lock when the machine sleeps
+  // or the clock steps, and makes a crashed holder's fresh lock wedge the
+  // board for the full staleness window. The pid settles both.
+  if (await holderIsGone(lockPath)) {
+    await rm(lockPath, { force: true }).catch(noop);
+    return true;
+  }
   if (!isStale(first)) return false;
 
   await sleep(10 + Math.random() * 50);
@@ -326,6 +347,7 @@ async function breakStaleLock(lockPath: string): Promise<boolean> {
   if (second === null) return true;
   if (second !== first) return true;
   if (!isStale(second)) return false;
+  if (!(await holderIsGone(lockPath))) return false;
 
   await rm(lockPath, { force: true }).catch(noop);
   return true;
@@ -353,7 +375,10 @@ function isStale(mtimeNs: bigint): boolean {
  */
 async function acquireBoardLock(boardPath: string): Promise<() => Promise<void>> {
   const lockPath = lockPathFor(boardPath);
-  const deadline = Date.now() + boardLock.acquireTimeoutMs;
+  // performance.now() is monotonic on Darwin and does not advance while the
+  // machine sleeps, so a sleep cannot expire the wait and report a false
+  // conflict the moment the machine wakes.
+  const deadline = performance.now() + boardLock.acquireTimeoutMs;
   let delay = LOCK_RETRY_MIN_MS;
   await mkdir(dirname(boardPath), { recursive: true });
 
@@ -374,7 +399,7 @@ async function acquireBoardLock(boardPath: string): Promise<() => Promise<void>>
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
       if (await breakStaleLock(lockPath)) continue;
-      if (Date.now() >= deadline) {
+      if (performance.now() >= deadline) {
         throw new BoardLockError(await revisionOf(boardPath), lockPath);
       }
       await sleep(delay * (0.5 + Math.random()));
