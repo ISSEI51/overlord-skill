@@ -11,6 +11,7 @@ import { watch, type FSWatcher } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import * as cmux from "./cmux.ts";
 import * as cmuxSocket from "./cmux-socket.ts";
+import { deliverCard, git, type DeliverOutcome } from "./change.ts";
 import {
   BoardConflictError,
   boardPathFor,
@@ -27,12 +28,24 @@ import {
   type State,
 } from "./board.ts";
 
-type Options = { boardPath: string; port: number; open: boolean };
+type Options = {
+  boardPath: string;
+  port: number;
+  open: boolean;
+  /** Deliver a card when it reaches `done`; see the delivery section. */
+  deliver: boolean;
+};
+
+/** `OVERLORD_DELIVER` values that turn the delivery of a done card off. */
+const DELIVER_OFF = new Set(["0", "false", "off", "no"]);
 
 function parseArgs(argv: string[]): Options {
   let target = process.cwd();
   let port = Number(process.env.OVERLORD_PORT ?? 7377);
   let open = false;
+  let deliver = !DELIVER_OFF.has(
+    (process.env.OVERLORD_DELIVER ?? "").trim().toLowerCase(),
+  );
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index]!;
     if (arg === "--board" || arg === "--project") {
@@ -41,6 +54,8 @@ function parseArgs(argv: string[]): Options {
       port = Number(argv[++index] ?? port);
     } else if (arg === "--open") {
       open = true;
+    } else if (arg === "--no-deliver") {
+      deliver = false;
     } else if (!arg.startsWith("-")) {
       target = arg;
     }
@@ -48,7 +63,7 @@ function parseArgs(argv: string[]): Options {
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     throw new Error(`invalid port: ${port}`);
   }
-  return { boardPath: boardPathFor(target), port, open };
+  return { boardPath: boardPathFor(target), port, open, deliver };
 }
 
 const options = parseArgs(process.argv.slice(2));
@@ -214,6 +229,155 @@ function boardFailure(error: unknown): Response {
   throw error;
 }
 
+/* ---------------------------------------------------------------- deliver */
+
+/**
+ * A card that reaches `done` is delivered: `deliverCard` synchronizes the
+ * card's change pull requests, opens (or updates) the pull request that merges
+ * the card into the repository default branch, and records it in the card's
+ * `delivery`.
+ *
+ * Three properties are what this hook is for:
+ *
+ *   - the PATCH that moved the card does not wait for it. One delivery runs
+ *     `git fetch`, `git push` and several `gh` calls, which take seconds, so
+ *     the request answers as soon as the board is written and the delivery
+ *     reports itself over the event stream instead;
+ *   - only the transition into `done` starts one. PATCHing a card that is
+ *     already `done` (a second click, a second browser tab) writes the board
+ *     again but delivers nothing;
+ *   - a delivery that fails changes nothing on the board. `deliverCard`
+ *     writes only after `gh pr view` confirmed the pull request, so the card
+ *     stays `done` and the failure is reported over the event stream alone.
+ */
+
+/** Per git and `gh` call inside one delivery. */
+const DELIVERY_TIMEOUT_MS = 120_000;
+
+/** Ids of the cards whose delivery is running right now. */
+const delivering = new Set<string>();
+
+/**
+ * What the frontend is told about a delivery.
+ *
+ * `{status:"running"}` is sent when the run starts and carries nothing else.
+ * Every other frame is one `DeliverOutcome` spread into it, so the fields are
+ * the ones the CLI prints:
+ *
+ *   status    "created" | "updated"  the delivery pull request is open;
+ *                                    `pr` carries it (number, url, state,
+ *                                    head_sha, reviewed_sha)
+ *             "skipped"              nothing to deliver; `reason` is
+ *                                    "no-diff", "same-branch", "no-remote" or
+ *                                    "no-repository"
+ *             "blocked"              the card still has unmerged changes,
+ *                                    listed in `unmerged` as
+ *                                    "<change-id>  <title>"; the user has to
+ *                                    act on it
+ *             "failed"               a git, `gh` or board step failed;
+ *                                    `reason` is the diagnostic
+ *   warnings  non-fatal problems of a run that continued; always an array on
+ *             an outcome frame, absent on the running frame
+ */
+type DeliveryEvent = {
+  type: "delivery";
+  card: string;
+} & ({ status: "running" } | DeliverOutcome);
+
+function sendDelivery(event: DeliveryEvent): void {
+  broadcast(event);
+}
+
+/**
+ * Start the delivery of one card unless one is already running for it.
+ *
+ * The running frame is broadcast either way, so a second acceptance click and
+ * a browser tab that asked for the same delivery are both told that it is in
+ * progress rather than left without an answer.
+ */
+function startDelivery(cardId: string): void {
+  if (!options.deliver) return;
+  sendDelivery({ type: "delivery", card: cardId, status: "running" });
+  if (delivering.has(cardId)) return;
+  delivering.add(cardId);
+  void runDelivery(cardId);
+}
+
+/**
+ * Run one delivery to completion and report it.
+ *
+ * Never rejects: it is started without an `await`, so an unhandled rejection
+ * would reach the process instead of a request handler.
+ */
+async function runDelivery(cardId: string): Promise<void> {
+  try {
+    const root = await deliverableRoot(cardId);
+    if (root !== null) {
+      const outcome = await deliverCard({
+        boardPath: options.boardPath,
+        cardId,
+        cwd: root,
+        timeoutMs: DELIVERY_TIMEOUT_MS,
+      });
+      sendDelivery({ type: "delivery", card: cardId, ...outcome });
+    }
+  } catch (error) {
+    sendDelivery({
+      type: "delivery",
+      card: cardId,
+      status: "failed",
+      reason: errorMessage(error),
+      warnings: [],
+    });
+  } finally {
+    delivering.delete(cardId);
+    // `deliverCard` writes `delivery` through its own `mutateBoard` call, so
+    // the revision every client holds is stale as soon as one was recorded.
+    await announceCurrentRevision();
+  }
+}
+
+/**
+ * The directory to deliver from, or null when this project cannot be
+ * delivered and the frame was already sent.
+ *
+ * A project that is not a git repository, or one with no remote, has no
+ * pull request to open. Reporting that as a failed delivery on every accepted
+ * card would be wrong: nothing failed, there is nowhere to deliver to. Both
+ * are therefore reported as `skipped`, which is what `deliverCard` already
+ * says for a head that has nothing to propose.
+ */
+async function deliverableRoot(cardId: string): Promise<string | null> {
+  const root = projectRootFor(options.boardPath);
+  const remotes = await git(["remote"], root, DELIVERY_TIMEOUT_MS);
+  const reason =
+    remotes.code !== 0
+      ? "no-repository"
+      : remotes.stdout.trim() === ""
+        ? "no-remote"
+        : null;
+  if (reason === null) return root;
+  sendDelivery({
+    type: "delivery",
+    card: cardId,
+    status: "skipped",
+    reason,
+    warnings: [],
+  });
+  return null;
+}
+
+/**
+ * Tell the clients the revision on disk when it is not the one they were last
+ * told about. The board watcher reports writes made by anything else, but it
+ * is not guaranteed to be running: `watchBoard` warns and continues when
+ * `watch` is unavailable.
+ */
+async function announceCurrentRevision(): Promise<void> {
+  const rev = await revisionOf(options.boardPath);
+  if (rev !== lastRev) announce(rev);
+}
+
 /* ------------------------------------------------------------- board API */
 
 const PATCHABLE = new Set([
@@ -236,6 +400,10 @@ async function patchItem(request: Request, id: string): Promise<Response> {
     request,
   );
   const patch = payload.patch ?? {};
+  // The state the board held before this write, read inside the mutation so
+  // that it is the state actually overwritten. `mutateBoard` may apply the
+  // mutation twice, and the second pass sees the board as it is on disk.
+  let previousState: State | undefined;
   try {
     const { rev, result } = await mutateBoard(
       options.boardPath,
@@ -243,6 +411,7 @@ async function patchItem(request: Request, id: string): Promise<Response> {
       (board) => {
         const item = board.items.find((entry) => entry.id === id);
         if (!item) throw new RequestError(`unknown item: ${id}`, 404);
+        previousState = item.state;
         for (const [key, value] of Object.entries(patch)) {
           if (!PATCHABLE.has(key)) {
             throw new RequestError(`field not editable: ${key}`);
@@ -259,6 +428,9 @@ async function patchItem(request: Request, id: string): Promise<Response> {
       },
     );
     announce(rev);
+    // Not awaited: the delivery takes seconds and the user who pressed the
+    // acceptance button must not wait for it.
+    if (patch.state === "done" && previousState !== "done") startDelivery(id);
     return json({ item: result, rev });
   } catch (error) {
     return boardFailure(error);
@@ -584,6 +756,7 @@ const address = `http://127.0.0.1:${server.port}`;
 console.log(`Overlord Console  ${address}`);
 console.log(`board             ${options.boardPath}`);
 console.log(`cmux              ${(await cmux.available()) ? "connected" : "not reachable"}`);
+console.log(`deliver on done   ${options.deliver ? "on" : "off"}`);
 
 if (options.open) {
   const result = await cmux.run(["browser", "open", address]);
