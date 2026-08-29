@@ -8,9 +8,10 @@
  *     `OVER-111` on a board whose other cards were all `OV-`;
  *   - `project` itself was whatever the dialog's optional field held.
  *
- * `PATCH /api/items/:id` covers what OV-105-C2 adds: a card that moves into
- * `done` is delivered in the background and the run reports itself over
- * `/api/events`.
+ * `PATCH /api/items/:id` and `POST /api/items/:id/deliver` cover what OV-105-C2
+ * adds: a card accepted into `done` is delivered in the background, the run
+ * reports itself over `/api/events`, a failure is left on the card so it
+ * survives a closed browser, and the delivery can be run again on demand.
  *
  * The server is a script that starts listening on import, so every case runs
  * it as a real process against a throwaway board and speaks HTTP to it.
@@ -290,12 +291,29 @@ async function deliveryProject(): Promise<Project> {
  * can count what the delivery actually ran. `pr create` optionally waits, to
  * hold one delivery open while the next request is made, and optionally
  * fails, to produce a delivery that changes nothing.
+ *
+ * `failCreateOnce` fails only while the file named by $GH_FAIL_MARKER exists,
+ * and removes it as it fails: the first delivery of a case fails and the next
+ * one succeeds, which is how a retry is told apart from a repeat.
  */
-function ghStub(setup: { sleepSeconds?: number; failCreate?: boolean } = {}): string {
+function ghStub(
+  setup: {
+    sleepSeconds?: number;
+    failCreate?: boolean;
+    failCreateOnce?: boolean;
+  } = {},
+): string {
   const wait = setup.sleepSeconds ? `    sleep ${setup.sleepSeconds}\n` : "";
+  const failOnce = setup.failCreateOnce
+    ? '    if [ -f "$GH_FAIL_MARKER" ]; then\n' +
+      '      rm -f "$GH_FAIL_MARKER"\n' +
+      '      echo "gh: pull request refused" >&2\n' +
+      "      exit 1\n" +
+      "    fi\n"
+    : "";
   const fail = setup.failCreate
     ? '    echo "gh: pull request refused" >&2\n    exit 1\n'
-    : "";
+    : failOnce;
   const view =
     '{"number":41,"url":"https://example.invalid/pull/41","state":"OPEN",' +
     '"headRefOid":"1111111111111111111111111111111111111111",' +
@@ -519,6 +537,177 @@ describe("PATCH /api/items/:id delivery", () => {
     }
   });
 
+  test("delivers nothing for a card dragged into done from another state", async () => {
+    const project = await deliveryProject();
+    const logPath = join(project.root, "gh.log");
+    // Every state a card can be dragged into the done column from. Only the
+    // acceptance button ("acceptance" -> "done") is a delivery.
+    const dragged: Item["state"][] = [
+      "inbox",
+      "discovery",
+      "specified",
+      "implementing",
+      "reviewing",
+      "blocked",
+    ];
+    const server = await startServer(
+      dragged.map((state, index) => ({
+        id: `OV-${index + 1}`,
+        project: "Overlord",
+        title: `dragged from ${state}`,
+        state,
+      })),
+      {
+        boardPath: project.boardPath,
+        stubs: { gh: ghStub() },
+        env: { GH_LOG: logPath },
+      },
+    );
+    const events = await openEvents(server.base);
+    try {
+      for (let index = 0; index < dragged.length; index += 1) {
+        const response = await patchCard(server.base, `OV-${index + 1}`, {
+          state: "done",
+        });
+        expect(response.status).toBe(200);
+      }
+      await Bun.sleep(750);
+
+      expect(events.deliveries()).toEqual([]);
+      expect(await ghCalls(logPath)).toEqual([]);
+
+      // The cards did move; only the delivery was withheld.
+      const { board } = await loadBoard(project.boardPath);
+      expect(board.items.map((entry) => entry.state)).toEqual(
+        dragged.map(() => "done"),
+      );
+    } finally {
+      events.close();
+      await server.stop();
+    }
+  });
+
+  test("delivers two cards accepted at once one after the other", async () => {
+    const project = await deliveryProject();
+    const logPath = join(project.root, "gh.log");
+    const server = await startServer(
+      [
+        { id: "OV-1", project: "Overlord", title: "first", state: "acceptance" },
+        { id: "OV-2", project: "Overlord", title: "second", state: "acceptance" },
+      ],
+      {
+        boardPath: project.boardPath,
+        // `pr create` holds each delivery open for a second, so two deliveries
+        // that were allowed to overlap would interleave their `gh` calls.
+        stubs: { gh: ghStub({ sleepSeconds: 1 }) },
+        env: { GH_LOG: logPath },
+      },
+    );
+    const events = await openEvents(server.base);
+    try {
+      const [first, second] = await Promise.all([
+        patchCard(server.base, "OV-1", { state: "done" }),
+        patchCard(server.base, "OV-2", { state: "done" }),
+      ]);
+      expect(first.status).toBe(200);
+      expect(second.status).toBe(200);
+
+      // Neither card is dropped: both are delivered.
+      const outcomes = await Promise.all([
+        events.waitForDelivery(
+          (frame) => frame.card === "OV-1" && frame.status !== "running",
+        ),
+        events.waitForDelivery(
+          (frame) => frame.card === "OV-2" && frame.status !== "running",
+        ),
+      ]);
+      expect(outcomes.map((frame) => frame.status)).toEqual([
+        "created",
+        "created",
+      ]);
+
+      // One delivery ran at a time: the second card's `gh` calls all come
+      // after the first card's. Overlapping runs pushed the same branch at the
+      // same time, and the loser reported
+      // "cannot lock ref 'refs/heads/work': reference already exists".
+      expect(await ghCalls(logPath)).toEqual([
+        "pr list",
+        "pr create",
+        "pr view",
+        "pr list",
+        "pr create",
+        "pr view",
+      ]);
+
+      const { board } = await loadBoard(project.boardPath);
+      for (const entry of board.items) {
+        expect(entry.delivery).toMatchObject({
+          branch: "work",
+          base: "main",
+          pr: { number: 41 },
+          error: null,
+        });
+      }
+    } finally {
+      events.close();
+      await server.stop();
+    }
+  });
+
+  test("reports a git that cannot run as a failure, not as no-repository", async () => {
+    const server = await startServer([card("acceptance")], {
+      stubs: {
+        git:
+          "#!/bin/sh\n" +
+          'echo "fatal: detected dubious ownership in repository" >&2\n' +
+          "exit 128\n",
+        gh: ghStub(),
+      },
+    });
+    const events = await openEvents(server.base);
+    try {
+      expect((await patchCard(server.base, "OV-1", { state: "done" })).status).toBe(200);
+      const outcome = await events.waitForDelivery(
+        (frame) => frame.status !== "running",
+      );
+      expect(outcome.status).toBe("failed");
+      expect(outcome.reason ?? "").toContain("git remote failed");
+      expect(outcome.reason ?? "").toContain("dubious ownership");
+
+      const { board } = await loadBoard(server.boardPath);
+      expect(board.items[0]!.delivery!.error ?? "").toContain(
+        "dubious ownership",
+      );
+    } finally {
+      events.close();
+      await server.stop();
+    }
+  });
+
+  test("delivers nothing at all with OVERLORD_DELIVER=0", async () => {
+    const project = await deliveryProject();
+    const logPath = join(project.root, "gh.log");
+    const server = await startServer([card("acceptance")], {
+      boardPath: project.boardPath,
+      stubs: { gh: ghStub() },
+      env: { GH_LOG: logPath, OVERLORD_DELIVER: "0" },
+    });
+    const events = await openEvents(server.base);
+    try {
+      expect((await patchCard(server.base, "OV-1", { state: "done" })).status).toBe(200);
+      await Bun.sleep(750);
+      expect(events.deliveries()).toEqual([]);
+      expect(await ghCalls(logPath)).toEqual([]);
+
+      const { board } = await loadBoard(project.boardPath);
+      expect(board.items[0]!.state).toBe("done");
+      expect(board.items[0]!.delivery ?? null).toBe(null);
+    } finally {
+      events.close();
+      await server.stop();
+    }
+  });
+
   test("keeps the card done and reports the failure when the delivery fails", async () => {
     const project = await deliveryProject();
     const logPath = join(project.root, "gh.log");
@@ -536,9 +725,16 @@ describe("PATCH /api/items/:id delivery", () => {
       expect(outcome.status).toBe("failed");
       expect(outcome.reason ?? "").toContain("gh pr create failed");
 
+      // The failure outlives the event stream: a user whose browser was closed
+      // still finds out that no pull request was opened, and why.
       const { board } = await loadBoard(project.boardPath);
       expect(board.items[0]!.state).toBe("done");
-      expect(board.items[0]!.delivery ?? null).toBe(null);
+      const delivery = board.items[0]!.delivery!;
+      expect(delivery.branch).toBe("work");
+      expect(delivery.base).toBe("main");
+      expect(delivery.pr ?? null).toBe(null);
+      expect(delivery.error ?? "").toContain("gh pr create failed");
+      expect(typeof delivery.attempted_at).toBe("string");
     } finally {
       events.close();
       await server.stop();
@@ -629,6 +825,133 @@ describe("PATCH /api/items/:id delivery", () => {
       expect(await ghCalls(logPath)).toEqual([]);
     } finally {
       events.close();
+      await server.stop();
+    }
+  });
+});
+
+/**
+ * The way back from a failed delivery.
+ *
+ * A card is already `done` when its delivery fails, and the automatic hook
+ * only fires on `acceptance` -> `done`, so re-accepting it delivers nothing.
+ * This endpoint runs the same delivery again without moving the card.
+ */
+describe("POST /api/items/:id/deliver", () => {
+  function deliverRequest(base: string, id: string): Promise<Response> {
+    return fetch(`${base}/api/items/${encodeURIComponent(id)}/deliver`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  test("re-runs a delivery that failed, and clears the recorded failure", async () => {
+    const project = await deliveryProject();
+    const logPath = join(project.root, "gh.log");
+    const marker = join(project.root, "fail-once");
+    await writeFile(marker, "", "utf8");
+    const server = await startServer([card("acceptance")], {
+      boardPath: project.boardPath,
+      stubs: { gh: ghStub({ failCreateOnce: true }) },
+      env: { GH_LOG: logPath, GH_FAIL_MARKER: marker },
+    });
+    const events = await openEvents(server.base);
+    try {
+      // The acceptance button: the first delivery fails and is recorded.
+      expect((await patchCard(server.base, "OV-1", { state: "done" })).status).toBe(200);
+      const first = await events.waitForDelivery(
+        (frame) => frame.status !== "running",
+      );
+      expect(first.status).toBe("failed");
+      const failedBoard = await loadBoard(project.boardPath);
+      expect(failedBoard.board.items[0]!.delivery!.error ?? "").toContain(
+        "gh pr create failed",
+      );
+
+      // The retry: no column change, the same delivery.
+      const response = await deliverRequest(server.base, "OV-1");
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({
+        ok: true,
+        card: "OV-1",
+        started: true,
+      });
+
+      const second = await events.waitForDelivery(
+        (frame) => frame.status === "created",
+      );
+      expect(second.pr?.number).toBe(41);
+
+      const { board } = await loadBoard(project.boardPath);
+      expect(board.items[0]!.state).toBe("done");
+      expect(board.items[0]!.delivery).toMatchObject({
+        branch: "work",
+        base: "main",
+        pr: { number: 41 },
+        error: null,
+      });
+      expect((await ghCalls(logPath)).filter((c) => c === "pr create")).toHaveLength(2);
+    } finally {
+      events.close();
+      await server.stop();
+    }
+  });
+
+  test("answers started:false while a delivery for the card is running", async () => {
+    const project = await deliveryProject();
+    const logPath = join(project.root, "gh.log");
+    const server = await startServer([card("acceptance")], {
+      boardPath: project.boardPath,
+      stubs: { gh: ghStub({ sleepSeconds: 2 }) },
+      env: { GH_LOG: logPath },
+    });
+    const events = await openEvents(server.base);
+    try {
+      expect((await deliverRequest(server.base, "OV-1")).status).toBe(200);
+      const again = await deliverRequest(server.base, "OV-1");
+      expect(again.status).toBe(200);
+      expect(await again.json()).toEqual({
+        ok: true,
+        card: "OV-1",
+        started: false,
+      });
+
+      await events.waitForDelivery((frame) => frame.status === "created");
+      expect((await ghCalls(logPath)).filter((c) => c === "pr create")).toHaveLength(1);
+    } finally {
+      events.close();
+      await server.stop();
+    }
+  });
+
+  test("is 404 for a card that is not on the board", async () => {
+    const server = await startServer([card("done")]);
+    try {
+      const response = await deliverRequest(server.base, "OV-404");
+      expect(response.status).toBe(404);
+      expect(await response.json()).toEqual({ error: "unknown item: OV-404" });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  test("is 409 when delivery is turned off", async () => {
+    const project = await deliveryProject();
+    const logPath = join(project.root, "gh.log");
+    const server = await startServer([card("done")], {
+      boardPath: project.boardPath,
+      args: ["--no-deliver"],
+      stubs: { gh: ghStub() },
+      env: { GH_LOG: logPath },
+    });
+    try {
+      const response = await deliverRequest(server.base, "OV-1");
+      expect(response.status).toBe(409);
+      expect(((await response.json()) as { error: string }).error).toContain(
+        "--no-deliver",
+      );
+      expect(await ghCalls(logPath)).toEqual([]);
+    } finally {
       await server.stop();
     }
   });

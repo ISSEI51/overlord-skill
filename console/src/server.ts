@@ -23,6 +23,7 @@ import {
   revisionOf,
   STATES,
   type Board,
+  type Delivery,
   type Item,
   type SessionLink,
   type State,
@@ -232,23 +233,33 @@ function boardFailure(error: unknown): Response {
 /* ---------------------------------------------------------------- deliver */
 
 /**
- * A card that reaches `done` is delivered: `deliverCard` synchronizes the
+ * A card accepted into `done` is delivered: `deliverCard` synchronizes the
  * card's change pull requests, opens (or updates) the pull request that merges
  * the card into the repository default branch, and records it in the card's
  * `delivery`.
  *
- * Three properties are what this hook is for:
+ * Four properties are what this hook is for:
  *
  *   - the PATCH that moved the card does not wait for it. One delivery runs
  *     `git fetch`, `git push` and several `gh` calls, which take seconds, so
  *     the request answers as soon as the board is written and the delivery
  *     reports itself over the event stream instead;
- *   - only the transition into `done` starts one. PATCHing a card that is
- *     already `done` (a second click, a second browser tab) writes the board
- *     again but delivers nothing;
- *   - a delivery that fails changes nothing on the board. `deliverCard`
- *     writes only after `gh pr view` confirmed the pull request, so the card
- *     stays `done` and the failure is reported over the event stream alone.
+ *   - only `acceptance` -> `done` starts one, which is exactly what the
+ *     acceptance button does: it is only offered on a card in `acceptance`.
+ *     Dragging a card into the done column from anywhere else, and PATCHing a
+ *     card that is already `done` (a second click, a second browser tab),
+ *     write the board and deliver nothing. The first version fired on every
+ *     transition into `done` and a card dragged from `implementing` opened a
+ *     pull request nobody asked for;
+ *   - the card is never moved back. A delivery that fails leaves it `done` and
+ *     records the failure in `delivery.error`;
+ *   - the outcome outlives the browser. The event stream reports it, and a
+ *     failure is also written to the board (`recordDeliveryFailure`), because
+ *     a closed tab or a dropped stream would otherwise leave no trace at all
+ *     of a pull request that was never opened.
+ *
+ * `POST /api/items/:id/deliver` runs the same delivery on demand, which is how
+ * a recorded failure is retried without moving the card between columns.
  */
 
 /** Per git and `gh` call inside one delivery. */
@@ -275,7 +286,9 @@ const delivering = new Set<string>();
  *                                    "<change-id>  <title>"; the user has to
  *                                    act on it
  *             "failed"               a git, `gh` or board step failed;
- *                                    `reason` is the diagnostic
+ *                                    `reason` is the diagnostic, and the same
+ *                                    text is left in the card's
+ *                                    `delivery.error`
  *   warnings  non-fatal problems of a run that continued; always an array on
  *             an outcome frame, absent on the running frame
  */
@@ -294,42 +307,48 @@ function sendDelivery(event: DeliveryEvent): void {
  * The running frame is broadcast either way, so a second acceptance click and
  * a browser tab that asked for the same delivery are both told that it is in
  * progress rather than left without an answer.
+ *
+ * Returns whether this call is the one that started a run, which is what
+ * `POST /api/items/:id/deliver` answers with.
  */
-function startDelivery(cardId: string): void {
-  if (!options.deliver) return;
+function startDelivery(cardId: string): boolean {
+  if (!options.deliver) return false;
   sendDelivery({ type: "delivery", card: cardId, status: "running" });
-  if (delivering.has(cardId)) return;
+  if (delivering.has(cardId)) return false;
   delivering.add(cardId);
   void runDelivery(cardId);
+  return true;
 }
 
 /**
- * Run one delivery to completion and report it.
+ * Run one delivery to completion, record a failure and report the outcome.
  *
  * Never rejects: it is started without an `await`, so an unhandled rejection
  * would reach the process instead of a request handler.
+ *
+ * The board is written before the frame is sent, so a client that reloads the
+ * board when it sees the frame sees the record that goes with it.
  */
 async function runDelivery(cardId: string): Promise<void> {
+  let outcome: DeliverOutcome;
   try {
-    const root = await deliverableRoot(cardId);
-    if (root !== null) {
-      const outcome = await deliverCard({
-        boardPath: options.boardPath,
-        cardId,
-        cwd: root,
-        timeoutMs: DELIVERY_TIMEOUT_MS,
-      });
-      sendDelivery({ type: "delivery", card: cardId, ...outcome });
-    }
+    const resolved = await deliverableRoot();
+    outcome =
+      "outcome" in resolved
+        ? resolved.outcome
+        : await deliverCard({
+            boardPath: options.boardPath,
+            cardId,
+            cwd: resolved.root,
+            timeoutMs: DELIVERY_TIMEOUT_MS,
+          });
   } catch (error) {
-    sendDelivery({
-      type: "delivery",
-      card: cardId,
-      status: "failed",
-      reason: errorMessage(error),
-      warnings: [],
-    });
+    outcome = { status: "failed", reason: errorMessage(error), warnings: [] };
+  }
+  try {
+    if (outcome.status === "failed") await recordDeliveryFailure(cardId, outcome);
   } finally {
+    sendDelivery({ type: "delivery", card: cardId, ...outcome });
     delivering.delete(cardId);
     // `deliverCard` writes `delivery` through its own `mutateBoard` call, so
     // the revision every client holds is stale as soon as one was recorded.
@@ -338,33 +357,86 @@ async function runDelivery(cardId: string): Promise<void> {
 }
 
 /**
- * The directory to deliver from, or null when this project cannot be
- * delivered and the frame was already sent.
+ * Leave a failed delivery on the card, in the same `delivery` record a
+ * successful one writes.
+ *
+ * The event stream alone was not enough: a failure was one frame, so a user
+ * whose browser was closed, or whose stream had dropped, was left with a card
+ * in `done` and no pull request and nothing anywhere saying why. What is known
+ * of the attempt is kept - the branches it resolved, and the pull request when
+ * one exists - and whatever the last attempt recorded fills the rest in, so a
+ * failure never erases the pull request an earlier delivery recorded.
+ *
+ * Best effort: a board that cannot be written is logged and the outcome is
+ * reported over the stream regardless.
+ */
+async function recordDeliveryFailure(
+  cardId: string,
+  outcome: DeliverOutcome,
+): Promise<void> {
+  // Read once, outside the mutation: `mutateBoard` may apply it twice.
+  const attemptedAt = nowIso();
+  try {
+    const { rev } = await mutateBoard(options.boardPath, undefined, (board) => {
+      const item = board.items.find((entry) => entry.id === cardId);
+      if (!item) throw new RequestError(`unknown item: ${cardId}`, 404);
+      const previous = (item.delivery ?? null) as Delivery | null;
+      item.delivery = {
+        branch: outcome.head ?? previous?.branch ?? null,
+        base: outcome.base ?? previous?.base ?? null,
+        pr: outcome.pr ?? previous?.pr ?? null,
+        error: outcome.reason ?? "the delivery failed",
+        attempted_at: attemptedAt,
+      };
+      const index = board.items.indexOf(item);
+      board.items[index] = canonicalItem(item);
+    });
+    announce(rev);
+  } catch (error) {
+    console.warn(
+      `${cardId}: the delivery failed and the failure could not be recorded ` +
+        `in ${options.boardPath}: ${errorMessage(error)}`,
+    );
+  }
+}
+
+/**
+ * The directory to deliver from, or the outcome to report instead.
  *
  * A project that is not a git repository, or one with no remote, has no
  * pull request to open. Reporting that as a failed delivery on every accepted
  * card would be wrong: nothing failed, there is nowhere to deliver to. Both
  * are therefore reported as `skipped`, which is what `deliverCard` already
  * says for a head that has nothing to propose.
+ *
+ * Any other `git remote` failure is a real one and is reported as such: `git`
+ * missing from the PATH, or a checkout `safe.directory` refuses to open, used
+ * to be reported as `no-repository` as well, which sent the reader looking for
+ * a repository that is right there.
  */
-async function deliverableRoot(cardId: string): Promise<string | null> {
+async function deliverableRoot(): Promise<
+  { root: string } | { outcome: DeliverOutcome }
+> {
   const root = projectRootFor(options.boardPath);
   const remotes = await git(["remote"], root, DELIVERY_TIMEOUT_MS);
-  const reason =
-    remotes.code !== 0
-      ? "no-repository"
-      : remotes.stdout.trim() === ""
-        ? "no-remote"
-        : null;
-  if (reason === null) return root;
-  sendDelivery({
-    type: "delivery",
-    card: cardId,
-    status: "skipped",
-    reason,
-    warnings: [],
-  });
-  return null;
+  if (remotes.code === 0 && remotes.stdout.trim() !== "") return { root };
+
+  const diagnostic = remotes.stderr.trim() || remotes.stdout.trim();
+  if (remotes.code === 0) {
+    return { outcome: { status: "skipped", reason: "no-remote", warnings: [] } };
+  }
+  if (/not a git repository/i.test(diagnostic)) {
+    return {
+      outcome: { status: "skipped", reason: "no-repository", warnings: [] },
+    };
+  }
+  return {
+    outcome: {
+      status: "failed",
+      reason: `git remote failed in ${root}: ${diagnostic || `exit ${remotes.code}`}`,
+      warnings: [],
+    },
+  };
 }
 
 /**
@@ -430,11 +502,52 @@ async function patchItem(request: Request, id: string): Promise<Response> {
     announce(rev);
     // Not awaited: the delivery takes seconds and the user who pressed the
     // acceptance button must not wait for it.
-    if (patch.state === "done" && previousState !== "done") startDelivery(id);
+    // Only the acceptance button: it is the one control that moves a card from
+    // `acceptance` to `done`. Dragging a card into the done column from any
+    // other state writes the board and delivers nothing.
+    if (patch.state === "done" && previousState === "acceptance") {
+      startDelivery(id);
+    }
     return json({ item: result, rev });
   } catch (error) {
     return boardFailure(error);
   }
+}
+
+/**
+ * Deliver one card on demand.
+ *
+ * The way back from a failed delivery. The automatic hook only fires on
+ * `acceptance` -> `done`, so a card that is already `done` cannot be delivered
+ * again by moving it: the user would have to drag it to another column and
+ * back. This endpoint runs exactly the same delivery, and reports it the same
+ * way, over `/api/events`.
+ *
+ * No state check: it is a deliberate request, and it matches what
+ * `change deliver <card-id>` does from a terminal. `deliverCard` still refuses
+ * a card whose changes are not all merged (`blocked`).
+ *
+ * The response says only that the run was accepted; the outcome arrives as a
+ * `delivery` frame on the event stream, and a failure is recorded in the
+ * card's `delivery.error`.
+ */
+async function deliverItem(id: string): Promise<Response> {
+  const { board, exists } = await loadBoard(options.boardPath);
+  if (!exists) return fail(`board not found: ${options.boardPath}`, 404);
+  if (!board.items.some((entry) => entry.id === id)) {
+    return fail(`unknown item: ${id}`, 404);
+  }
+  if (!options.deliver) {
+    return fail(
+      "delivery is turned off on this server (--no-deliver, or " +
+        "OVERLORD_DELIVER=0)",
+      409,
+    );
+  }
+  // `false` when a delivery for this card was already running: the request is
+  // still accepted, and the running one is the one that reports.
+  const started = startDelivery(id);
+  return json({ ok: true, card: id, started });
 }
 
 async function deleteItem(request: Request, id: string): Promise<Response> {
@@ -670,6 +783,11 @@ async function handle(request: Request): Promise<Response> {
   }
 
   if (path === "/api/items" && request.method === "POST") return createItem(request);
+
+  const deliverMatch = path.match(/^\/api\/items\/([^/]+)\/deliver$/);
+  if (deliverMatch && request.method === "POST") {
+    return deliverItem(decodeURIComponent(deliverMatch[1]!));
+  }
 
   const itemMatch = path.match(/^\/api\/items\/([^/]+)$/);
   if (itemMatch && request.method === "PATCH") {

@@ -2326,6 +2326,19 @@ describe("run", () => {
     expect(Date.now() - started).toBeLessThan(5_000);
   });
 
+  test("a command whose children hold the pipes is still cut off on time", async () => {
+    // `git push` starts `git-remote-https` or `ssh`, which inherit its pipes.
+    // Killing the command alone left `run` waiting for those pipes to close,
+    // so a 1 s timeout took 10.4 s of real time on a `sh` that had started a
+    // `sleep 10`; the console server has no user to interrupt it.
+    const started = Date.now();
+    const result = await run(["/bin/sh", "-c", "sleep 10 & wait"], undefined, 300);
+
+    expect(result.code).toBe(RUN_FAILED);
+    expect(result.stderr).toContain("timed out after 300ms");
+    expect(Date.now() - started).toBeLessThan(3_000);
+  });
+
   test("a missing executable is a result, not a synchronous throw", async () => {
     const result = await run(["overlord-no-such-executable-xyz"]);
 
