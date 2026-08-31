@@ -1,5 +1,12 @@
 import { createContext, useContext, type RefObject } from "react";
-import type { Item, SessionLink, StateData, StateKey, SurfaceLink } from "@/lib/types";
+import type {
+  DeliveryEvent,
+  Item,
+  SessionLink,
+  StateData,
+  StateKey,
+  SurfaceLink,
+} from "@/lib/types";
 
 export type ConsoleController = {
   data: StateData;
@@ -17,6 +24,16 @@ export type ConsoleController = {
   /** DELETE a done card; toasts the outcome and reloads the board. */
   deleteItem: (id: string) => Promise<void>;
   createItem: (payload: { title: string; evidence?: string }) => Promise<Item>;
+
+  /**
+   * The last delivery frame seen per card id this session. A card with no
+   * entry has had no delivery reported to this browser, which does not mean
+   * it was never delivered: `items[].delivery` is the record that outlives
+   * the session.
+   */
+  deliveries: Record<string, DeliveryEvent>;
+  /** POST /api/items/:id/deliver; throws on a refusal (409 when off). */
+  deliverItem: (id: string) => Promise<void>;
 
   setCommander: (link: SessionLink) => Promise<void>;
   startCommanderWorkspace: (cwd: string) => Promise<void>;

@@ -10,11 +10,12 @@ import {
 } from "@/components/ui/context-menu";
 import { useConsole } from "@/console-context";
 import { changeProgress, decisionId, decisionIds, decisionText, hasSession, scoreOf } from "@/lib/board";
-import { STATES, type Item, type StateKey } from "@/lib/types";
+import { deliveryTag } from "@/lib/delivery";
+import { STATES, type DeliveryEvent, type Item, type StateKey } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 export function BoardView() {
-  const { data, selectedId, select, moveItem, deleteItem } = useConsole();
+  const { data, selectedId, select, moveItem, deleteItem, deliveries } = useConsole();
   const items = data.board.items ?? [];
   const needsUserIds = useMemo(() => decisionIds(data.board), [data.board]);
   const decisions = (data.board.decisions_required ?? []).slice(0, 3);
@@ -108,6 +109,7 @@ export function BoardView() {
                       item={item}
                       needsUser={needsUser}
                       running={running}
+                      delivery={deliveries[item.id] ?? null}
                       selected={item.id === selectedId}
                       onSelect={() => select(item.id)}
                       // Only done cards get a context menu; the server also
@@ -131,6 +133,7 @@ function BoardCard({
   item,
   needsUser,
   running,
+  delivery,
   selected,
   onSelect,
   onDelete,
@@ -138,6 +141,8 @@ function BoardCard({
   item: Item;
   needsUser: boolean;
   running: boolean;
+  /** The delivery frame seen for this card this session, if any. */
+  delivery: DeliveryEvent | null;
   selected: boolean;
   onSelect: () => void;
   /** Present only on done cards; enables the right-click delete menu. */
@@ -149,6 +154,9 @@ function BoardCard({
   // Read-only progress of the card's engineering split; changes never
   // become cards of their own.
   const progress = changeProgress(item);
+  // The delivery of an accepted card, so that a run in flight and a failed
+  // one are visible without opening the card and after the toast is gone.
+  const shipping = deliveryTag(item, delivery);
   const card = (
     <article
       draggable
@@ -176,7 +184,7 @@ function BoardCard({
       {item.next_action && (
         <div className="mt-1 text-[11px] text-dim">→ {item.next_action}</div>
       )}
-      {(item.project || item.owner || session || progress || item.blocker) && (
+      {(item.project || item.owner || session || progress || shipping || item.blocker) && (
         <div className="mt-1.5 flex flex-wrap gap-1">
           {item.project && <CardTag>{item.project}</CardTag>}
           {item.owner && <CardTag>{item.owner}</CardTag>}
@@ -184,6 +192,17 @@ function BoardCard({
           {progress && (
             <CardTag>
               変更 {progress.done}/{progress.total}
+            </CardTag>
+          )}
+          {shipping && (
+            <CardTag
+              className={cn(
+                shipping.tone === "running" && "border-running/40 text-running",
+                shipping.tone === "failed" && "border-destructive/40 text-destructive",
+                shipping.tone === "pr" && "border-primary/40 text-primary",
+              )}
+            >
+              {shipping.label}
             </CardTag>
           )}
           {item.blocker && (

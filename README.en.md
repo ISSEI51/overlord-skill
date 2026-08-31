@@ -125,6 +125,7 @@ A local dashboard built with React + shadcn/ui. Changes to `board.yaml` appear o
 - **Cyan border** = a card that needs you (awaiting acceptance, owned by you, or listed in today's decisions)
 - **Yellow border** = a card the AI is actively working on
 - The "decisions today" bar shows at most three things only you can decide
+- A completed card carries the number of its delivery pull request (the one targeting `main`) as a tag; a delivery in flight and a failed one show in the same place
 - Done cards can be deleted from the right-click menu
 
 ### Card modal
@@ -135,7 +136,8 @@ Clicking a card opens a centered modal.
 
 - **Instruction buttons** under 司令塔への指示 — 状況を聞く (ask status) / 進める (advance) / 実装ブリーフ (implementation brief) / 独立レビュー (independent review) / 完了の可否 (ready to close?) — send to the commander with a single press; skill command strings never appear on screen
 - **このカードへの詳細指示** (detailed instruction): free-form text is sent to the commander prefixed with the card ID
-- **受け入れて完了** (accept & complete): shown on cards awaiting acceptance; one click marks them done
+- **受け入れて完了** (accept & complete): shown on cards awaiting acceptance; one click marks them done, and the card's work is proposed to `main` as a pull request
+- **成果の配送** (delivery): the delivery pull request's number, state, and link stay on the card. When there was nothing to deliver, when unmerged changes remain, or when the delivery failed, the reason is shown; the last two offer 配送をやり直す (deliver again)
 - State, next action, owner, and blocker are editable in place (Escape cancels)
 
 ### Commander sidebar
@@ -255,6 +257,8 @@ Separately, it also exits 1 when the server it started does not answer `/api/sta
 
 Without cmux the `commander` line reads `not registered, cmux is not reachable`, followed by a line pointing at the sidebar. The board and the server still come up, and the exit code is 0.
 
+To stop the console from delivering a card when you complete it, start it with `--no-deliver` or with `OVERLORD_DELIVER=0` in the environment. The `deliver on done` line printed at startup says which it is.
+
 After changing the frontend, install its dependencies with `cd console/frontend && bun install`, then regenerate `console/public` with `cd console && bun run build`.
 
 The server listens on `127.0.0.1` only and rejects requests whose `Host` / `Origin` is not loopback.
@@ -284,7 +288,7 @@ For the repository's merge-method setting, see [Why merge commits](#why-merge-co
 1. **Capture observations**: 気づきを追加 (add an observation) in the top bar, or 気づきをカードに (capture an observation) in the sidebar
 2. **Advance**: open a card and press 進める (advance) once; the commander runs the state-appropriate step (card → brief → implement → independent review) with subagents
 3. **Decide**: you only need to look at the 今日の判断 (decisions today) bar and the cyan-bordered cards; approving briefs and accepting work happens with the card's buttons
-4. **Accept**: check cards in 完成確認待ち (awaiting acceptance) and press 受け入れて完了 (accept & complete); clear finished cards via right-click
+4. **Accept**: check cards in 完成確認待ち (awaiting acceptance) and press 受け入れて完了 (accept & complete); a pull request proposing the work to `main` is opened for you and its result stays on the card under 成果の配送. Merge it on GitHub, then clear finished cards via right-click
 
 ## Operating rules
 

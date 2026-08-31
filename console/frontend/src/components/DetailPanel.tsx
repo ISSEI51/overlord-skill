@@ -28,8 +28,16 @@ import {
   surfaceLabel,
   terminalSurfaces,
 } from "@/lib/board";
+import {
+  deliveryStatusText,
+  deliveryView,
+  prLabel,
+  safePrUrl,
+  skippedReasonText,
+} from "@/lib/delivery";
 import { cardInstructions } from "@/lib/templates";
 import { STATES, type Change, type Item } from "@/lib/types";
+import { cn } from "@/lib/utils";
 
 /**
  * Card detail as a centered modal dialog. Closing (outside click or
@@ -82,6 +90,7 @@ export function DetailPanel() {
             <EditableField key={`${item.id}:blocker`} item={item} field="blocker" label="止まっている理由" />
             <WorkerField item={item} />
             <ChangesField item={item} />
+            <DeliveryField key={`${item.id}:delivery`} item={item} />
             <ReadonlyField label="困っていることと根拠" value={item.evidence} />
             <ConditionsField item={item} />
             <ReadonlyField label="今回はやらないこと" value={item.out_of_scope} />
@@ -402,6 +411,150 @@ function ChangeLinks({ change }: { change: Change }) {
         ))}
       {prState && <span>({prState})</span>}
     </div>
+  );
+}
+
+/**
+ * Where this card's finished work was proposed, and what the last attempt to
+ * propose it did.
+ *
+ * Two sources, shown separately because they are not the same thing:
+ *
+ *   - the run this browser watched (`deliveries`), which is the only place a
+ *     `running`, `skipped` or `blocked` outcome is kept: none of the three
+ *     writes a delivery record;
+ *   - `items[].delivery`, the record that outlives the session and the toast.
+ *     It holds the delivery pull request and, after a failure, its reason.
+ *
+ * The card is rendered without either only when neither exists, which is
+ * every card that was never delivered.
+ */
+function DeliveryField({ item }: { item: Item }) {
+  const { deliveries, deliverItem } = useConsole();
+  const [retrying, setRetrying] = useState(false);
+  /** A refusal of the request itself, e.g. a server started --no-deliver. */
+  const [refused, setRefused] = useState<string | null>(null);
+  const view = deliveryView(item, deliveries[item.id]);
+  if (!view) return null;
+
+  const live = view.live;
+  const url = safePrUrl(view.pr);
+  const number = prLabel(view.pr);
+  const prText = number ? `成果PR ${number}` : "成果PR";
+  const prState = view.pr?.state ?? null;
+  // The server writes the reason of a failed run to `delivery.error`, so the
+  // watched failure and the recorded one are the same sentence twice.
+  const recordedError =
+    live?.status === "failed" && live.reason === view.error ? null : view.error;
+
+  const retry = async () => {
+    if (retrying) return;
+    setRetrying(true);
+    setRefused(null);
+    try {
+      await deliverItem(item.id);
+    } catch (error) {
+      // Never swallowed: a 409 here means this server does not deliver at
+      // all, and the user would otherwise wait for a frame that never comes.
+      const message = errorMessage(error);
+      setRefused(message);
+      toast.error(`配送を実行できません: ${message}`);
+    } finally {
+      setRetrying(false);
+    }
+  };
+
+  return (
+    <Field label="成果の配送">
+      {live && (
+        <div className="mb-1.5 text-[12.5px]">
+          <span
+            className={cn(
+              live.status === "failed" && "text-destructive",
+              live.status === "blocked" && "text-warn",
+            )}
+          >
+            {deliveryStatusText(live.status)}
+            {live.status === "skipped" && `（${skippedReasonText(live.reason)}）`}
+            {live.status === "failed" && live.reason && `: ${live.reason}`}
+          </span>
+          {live.status === "blocked" && (live.unmerged?.length ?? 0) > 0 && (
+            <ul className="mt-1 font-mono text-[11px] text-dim">
+              {live.unmerged?.map((entry) => (
+                <li key={entry}>{entry}</li>
+              ))}
+            </ul>
+          )}
+          {(live.warnings?.length ?? 0) > 0 && (
+            <ul className="mt-1 text-[11px] text-warn">
+              {live.warnings?.map((warning) => (
+                <li key={warning}>警告: {warning}</li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+
+      {view.pr ? (
+        <div className="text-[12.5px]">
+          {url ? (
+            <a
+              href={url}
+              target="_blank"
+              rel="noreferrer"
+              className="text-primary hover:underline"
+            >
+              {prText}
+            </a>
+          ) : (
+            <span>{prText}</span>
+          )}
+          {prState && <span className="ml-1.5 text-[11px] text-dim">({prState})</span>}
+        </div>
+      ) : (
+        !live && <div className="text-[12.5px] text-faint">成果PRはまだありません</div>
+      )}
+
+      {(view.branch || view.base) && (
+        <div className="mt-0.5 font-mono text-[10px] text-faint">
+          {[view.branch, view.base].filter(Boolean).join(" → ")}
+        </div>
+      )}
+
+      {recordedError && (
+        <div className="mt-1 text-[12.5px] text-destructive">
+          記録された失敗: {recordedError}
+        </div>
+      )}
+
+      {view.attemptedAt && (
+        <div className="mt-0.5 text-[11px] text-faint">最終試行 {view.attemptedAt}</div>
+      )}
+
+      {view.needsRetry && (
+        <div className="mt-1.5 flex flex-wrap items-center gap-2">
+          <Button
+            variant="outline"
+            size="xs"
+            disabled={retrying || view.running}
+            onClick={() => void retry()}
+          >
+            配送をやり直す
+          </Button>
+          <div className="text-[11px] text-faint">
+            {live?.status === "blocked"
+              ? "未マージの変更を merge してから実行してください。"
+              : "同じ配送をもう一度実行します。"}
+          </div>
+        </div>
+      )}
+
+      {refused && (
+        <div className="mt-1 text-[12.5px] text-destructive">
+          配送を実行できません: {refused}
+        </div>
+      )}
+    </Field>
   );
 }
 

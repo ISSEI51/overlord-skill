@@ -11,6 +11,7 @@ import { Toaster } from "@/components/ui/sonner";
 import { ConsoleContext, type ConsoleController } from "@/console-context";
 import { api, errorMessage } from "@/lib/api";
 import { commanderLink } from "@/lib/board";
+import { describeDelivery, deliveryToastDuration } from "@/lib/delivery";
 import { refreshScreenSoon, screenRefresh } from "@/lib/screen";
 import {
   DOCK_OPEN_KEY,
@@ -22,6 +23,7 @@ import {
 } from "@/lib/storage";
 import { COMMANDER_BOOTSTRAP } from "@/lib/templates";
 import type {
+  DeliveryEvent,
   Item,
   SessionLink,
   StateData,
@@ -41,6 +43,16 @@ export default function App() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [dialogOpen, setDialogOpen] = useState(false);
   const dialogOpenRef = useRef(false);
+
+  /*
+   * The last delivery frame seen per card, for the whole session.
+   *
+   * The board's `delivery` records only a run that reached a pull request or
+   * failed, so `skipped` and `blocked` outcomes are recorded nowhere else, and
+   * `running` is never written at all. Keeping them here is what lets the card
+   * show the run from the moment 受け入れて完了 starts it.
+   */
+  const [deliveries, setDeliveries] = useState<Record<string, DeliveryEvent>>({});
 
   /* Persisted dock choices; localStorage keys are shared with the old UI. */
   const [dockOpen, setDockOpen] = useState(() => readStorage(DOCK_OPEN_KEY) !== "0");
@@ -146,6 +158,27 @@ export default function App() {
     },
     [],
   );
+
+  /**
+   * Run the delivery of one card again.
+   *
+   * The way back from a `failed` or `blocked` delivery: the server delivers
+   * automatically only on 完成確認待ち -> 完了, so redelivering a card that is
+   * already 完了 would otherwise mean moving it back to 完成確認待ち and
+   * completing it a second time. The response says only that the run was
+   * accepted; the outcome arrives as a `delivery` frame.
+   *
+   * Throws on a refusal, so the caller can show it: a server started with
+   * `--no-deliver` (or `OVERLORD_DELIVER=0`) answers 409 here, and a user who
+   * pressed 配送をやり直す must be told that this server does not deliver at
+   * all rather than left watching for a frame that never comes.
+   */
+  const deliverItem = useCallback(async (id: string) => {
+    await api<{ ok: boolean; card: string; started: boolean }>(
+      `/api/items/${encodeURIComponent(id)}/deliver`,
+      { method: "POST" },
+    );
+  }, []);
 
   const setCommander = useCallback(
     async (link: SessionLink) => {
@@ -306,9 +339,36 @@ export default function App() {
     void load();
   }, [load]);
 
+  /**
+   * Record one delivery frame and say what it means.
+   *
+   * One toast per card, reused across the run: the `running` frame opens it
+   * with a spinner and the outcome frame replaces it in place, so accepting a
+   * card shows one line that turns into its result instead of two unrelated
+   * toasts. Each status gets its own wording and flavor - `skipped` is not a
+   * failure, `blocked` is the user's turn, only `failed` is an error - and the
+   * frame is kept so the card detail can show it after the toast is gone.
+   */
+  const applyDelivery = useCallback((event: DeliveryEvent) => {
+    setDeliveries((previous) => ({ ...previous, [event.card]: event }));
+    const { title, description, tone } = describeDelivery(event);
+    const options = {
+      id: `delivery:${event.card}`,
+      description: description === null ? undefined : (
+        <div className="whitespace-pre-wrap">{description}</div>
+      ),
+      duration: deliveryToastDuration(event.status),
+    };
+    if (tone === "loading") toast.loading(title, options);
+    else if (tone === "success") toast.success(title, options);
+    else if (tone === "warning") toast.warning(title, options);
+    else if (tone === "error") toast.error(title, options);
+    else toast.info(title, options);
+  }, []);
+
   /*
-   * SSE: reload on board events, nudge the screen mirror on cmux activity;
-   * reconnect two seconds after a drop.
+   * SSE: reload on board events, report deliveries, nudge the screen mirror
+   * on cmux activity; reconnect two seconds after a drop.
    */
   const lastActivityNudge = useRef(0);
   useEffect(() => {
@@ -324,9 +384,17 @@ export default function App() {
             rev?: string;
             surface_id?: string | null;
             workspace_id?: string | null;
-          };
+          } & Partial<Omit<DeliveryEvent, "type">>;
           if (payload.type === "board" && payload.rev !== dataRef.current?.rev) {
             void load();
+          }
+          if (payload.type === "delivery" && payload.card && payload.status) {
+            applyDelivery({
+              ...payload,
+              type: "delivery",
+              card: payload.card,
+              status: payload.status,
+            });
           }
           if (payload.type === "activity") {
             const link = commanderLink(dataRef.current);
@@ -363,7 +431,7 @@ export default function App() {
       source?.close();
       if (timer !== null) window.clearTimeout(timer);
     };
-  }, [load]);
+  }, [load, applyDelivery]);
 
   /* Poll every 15 seconds while the tab is visible. */
   useEffect(() => {
@@ -427,6 +495,8 @@ export default function App() {
     moveItem,
     deleteItem,
     createItem,
+    deliveries,
+    deliverItem,
     setCommander,
     startCommanderWorkspace,
     focusSurface,
