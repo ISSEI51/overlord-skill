@@ -1,0 +1,47 @@
+# PR と main / overlord-console への push で自動実行される CI。
+#
+# 構成（各ジョブは独立に並列実行）:
+#   console  : bun test console/src/ （165 tests）
+#              macos-latest で実行する。console/src/ensure.test.ts は lsof を使い、
+#              console/src/board.test.ts はファイルシステムの mtime 解像度に依存する。
+#              Overlord が前提とする cmux も macOS アプリであり、開発環境と一致させる。
+#              console/package.json は依存を持たないため bun install は不要。
+#   frontend : tsc --noEmit。プラットフォーム非依存なので ubuntu-latest で回す。
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main, overlord-console]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  console:
+    name: console (bun test)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.0"
+      - name: Run tests
+        run: bun test console/src/
+
+  frontend:
+    name: frontend (tsc)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: console/frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.0"
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Type check
+        run: bun run typecheck

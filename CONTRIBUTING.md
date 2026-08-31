@@ -22,6 +22,21 @@ Open an issue first and describe the problem you hit. Overlord deliberately keep
 
 ## Running things locally
 
+A [`justfile`](justfile) collects the commands below behind short names. Run `just`
+for the list. `brew install just` if you do not have it; the raw commands still work
+without it.
+
+```bash
+just test                       # server-side tests (board read/write, change.ts)
+just test-one console/src/board.test.ts
+just typecheck                  # frontend type check
+just ci                         # both of the above, in parallel — same jobs as CI
+just console /path/to/project 7400
+just build                      # regenerates console/public
+```
+
+The same commands without `just`:
+
 ```bash
 # server-side tests (board read/write, change.ts)
 cd console && bun test
@@ -39,6 +54,9 @@ If you touch anything under `console/frontend/`, run `bun run build` and commit 
 
 ## Pull requests
 
+- CI runs on every pull request: `bun test console/src/` on macOS (the tests use `lsof`
+  and depend on filesystem timestamp resolution, and cmux is a macOS app) and
+  `tsc --noEmit` on Linux. `just ci` runs both locally.
 - One change per pull request; keep the diff small enough to read in one sitting.
 - Add or update a test in `console/src/*.test.ts` for behavior changes on the server side.
 - `README.md` (Japanese) and `README.en.md` (English) are the same document in two languages. If you change one, change the other.
