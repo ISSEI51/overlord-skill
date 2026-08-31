@@ -57,15 +57,22 @@ typecheck:
 ci:
     #!/usr/bin/env bash
     set -uo pipefail
-    tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
-    just test      >"$tmp/test.log"      2>&1 & p1=$!
-    just typecheck >"$tmp/typecheck.log" 2>&1 & p2=$!
+    # CI の frontend ジョブと同じく install から始める。クリーンなクローンでも通るようにする。
+    bun install --frozen-lockfile --cwd console/frontend >/dev/null || {
+      echo "FAIL frontend (bun install --frozen-lockfile)"; exit 1; }
+    tmp=$(mktemp -d)
+    just test  >"$tmp/console.log"  2>&1 & p1=$!
+    just build >"$tmp/frontend.log" 2>&1 & p2=$!
+    st_console=ok;  wait $p1 || st_console=fail
+    st_frontend=ok; wait $p2 || st_frontend=fail
     fail=0
-    wait $p1 || { echo "FAIL console (bun test)"; fail=1; }
-    wait $p2 || { echo "FAIL frontend (tsc)";     fail=1; }
-    for n in test typecheck; do
-      echo "──────── $n ────────"; tail -20 "$tmp/$n.log"
+    for n in console frontend; do
+      eval "st=\$st_$n"
+      echo "──────── $n ($st) ────────"
+      # 失敗したジョブは切り詰めない。原因が tail に入らないことがあるため。
+      if [ "$st" = fail ]; then cat "$tmp/$n.log"; fail=1; else tail -6 "$tmp/$n.log"; fi
     done
+    if [ "$fail" -eq 0 ]; then rm -rf "$tmp"; else echo; echo "ログ: $tmp"; fi
     exit $fail
 
 # ── 参照 ──────────────────────────────────────────────────────────
@@ -79,10 +86,19 @@ board:
     #!/usr/bin/env bash
     set -euo pipefail
     path="${OVERLORD_BOARD:-docs/product-ops/board.yaml}"
+    # console/src/board.ts の boardPathFor と同じ正規化。.yaml/.yml でなければ
+    # ディレクトリとみなして既定のボードパスを足す。
+    case "$path" in
+      *.yaml|*.yml) ;;
+      *) path="$path/docs/product-ops/board.yaml" ;;
+    esac
     if [ ! -f "$path" ]; then
       echo "board が見つかりません: $path"
       echo "テンプレート: docs/product-ops/board.example.yaml"
       exit 1
     fi
+    # items: 配下だけを数える。decisions_required: の要素も同じ字下げのため、
+    # 素朴な grep では両方に一致してしまう。
+    cards=$(awk '/^items:/{i=1;next} /^[a-zA-Z_]+:/{i=0} i&&/^  - id:/{n++} END{print n+0}' "$path")
     echo "board: $path"
-    echo "cards: $(grep -c '^  - id:' "$path" || echo 0)"
+    echo "cards: $cards"

@@ -27,12 +27,13 @@ for the list. `brew install just` if you do not have it; the raw commands still 
 without it.
 
 ```bash
+just install                    # frontend deps, once per clone
 just test                       # server-side tests (board read/write, change.ts)
 just test-one console/src/board.test.ts
 just typecheck                  # frontend type check
-just ci                         # both of the above, in parallel — same jobs as CI
-just console /path/to/project 7400
 just build                      # regenerates console/public
+just ci                         # the two CI jobs, in parallel (installs deps first)
+just console /path/to/project 7400
 ```
 
 The same commands without `just`:
@@ -55,8 +56,10 @@ If you touch anything under `console/frontend/`, run `bun run build` and commit 
 ## Pull requests
 
 - CI runs on every pull request: `bun test console/src/` on macOS (the tests use `lsof`
-  and depend on filesystem timestamp resolution, and cmux is a macOS app) and
-  `tsc --noEmit` on Linux. `just ci` runs both locally.
+  and depend on filesystem timestamp resolution, and cmux is a macOS app), and
+  `bun run build` on Linux followed by `git diff --exit-code -- console/public`, which
+  fails a frontend change that did not commit the rebuilt bundle. `just ci` runs both
+  locally.
 - One change per pull request; keep the diff small enough to read in one sitting.
 - Add or update a test in `console/src/*.test.ts` for behavior changes on the server side.
 - `README.md` (Japanese) and `README.en.md` (English) are the same document in two languages. If you change one, change the other.

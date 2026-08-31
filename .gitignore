@@ -1,4 +1,8 @@
 .DS_Store
+
+# justfile が dotenv として読む。ローカルの絶対パスやトークンが入りうる。
+.env
+.env.local
 console/node_modules/
 console/frontend/node_modules/
 .overlord/
