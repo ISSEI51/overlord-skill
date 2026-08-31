@@ -11,6 +11,8 @@ import {
   branchNameFor,
   ChangeNotFoundError,
   changeStateForPr,
+  checkOutcome,
+  checkRollup,
   deliver,
   deliverCard,
   deliveryBodyFor,
@@ -18,7 +20,11 @@ import {
   findChange,
   git,
   ItemNotFoundError,
+  main,
+  merge,
+  mergeChange,
   mergeDeliveryBody,
+  mergeRefusal,
   normalizePrState,
   parseArgs,
   parsePrNumber,
@@ -41,6 +47,7 @@ import {
   updateChanges,
   updateItem,
   worktreePathFor,
+  type MergeView,
   type PullRequestView,
 } from "./change.ts";
 
@@ -3085,5 +3092,905 @@ describe("deliver", () => {
     expect(code).toBe(0);
     expect(stdout).toContain("delivery:         skipped");
     expect(stdout).toContain("reason:           no-diff");
+  }, 20_000);
+});
+
+// ---------------------------------------------------------------------------
+// merge
+// ---------------------------------------------------------------------------
+
+/** The commit both the pull request head and the review point at. */
+const MERGE_SHA = "d".repeat(40);
+
+/** One green GitHub Actions check, as `gh pr view` reports it. */
+function checkRun(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    __typename: "CheckRun",
+    name: "console",
+    status: "COMPLETED",
+    conclusion: "SUCCESS",
+    workflowName: "ci",
+    ...overrides,
+  };
+}
+
+/**
+ * The `gh pr view` answer for the change pull request under test.
+ *
+ * Everything is set so that every gate passes; each test overrides the one
+ * field its gate reads, so a refusal can only come from the gate it is about.
+ */
+function mergeView(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    number: 60,
+    url: "https://github.com/o/r/pull/60",
+    state: "OPEN",
+    headRefOid: MERGE_SHA,
+    headRefName: "overlord/OV-600-C1",
+    baseRefName: "overlord-console",
+    statusCheckRollup: [checkRun()],
+    ...overrides,
+  };
+}
+
+/** The same pull request after the merge, as the board read-back sees it. */
+function mergedView(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    number: 60,
+    url: "https://github.com/o/r/pull/60",
+    state: "MERGED",
+    headRefOid: MERGE_SHA,
+    headRefName: "overlord/OV-600-C1",
+    ...overrides,
+  };
+}
+
+/** A board with one reviewed, still open change to merge. */
+function mergeBoardWith(overrides: Partial<Change> = {}): Board {
+  return {
+    version: 1,
+    updated_at: "2026-08-01T00:00:00Z",
+    items: [
+      {
+        id: "OV-600",
+        title: "A card being built",
+        state: "implementing",
+        next_action: "merge the reviewed change",
+        changes: [
+          {
+            id: "OV-600-C1",
+            title: "The reviewed change",
+            state: "reviewing",
+            branch: "overlord/OV-600-C1",
+            pr: {
+              number: 60,
+              url: "https://github.com/o/r/pull/60",
+              state: "open",
+              head_sha: MERGE_SHA,
+              reviewed_sha: MERGE_SHA,
+            },
+            ...overrides,
+          },
+        ],
+      },
+    ],
+  };
+}
+
+async function writeMergeBoard(overrides: Partial<Change> = {}): Promise<string> {
+  const boardPath = join(await scratch(), "board.yaml");
+  await saveBoard(boardPath, mergeBoardWith(overrides));
+  return boardPath;
+}
+
+/**
+ * A `gh` on PATH for `change merge`.
+ *
+ * It answers the same way `deliverGhStub` does and records every argument
+ * vector, so the tests can assert that a refused run never called
+ * `gh pr merge` — which is the property every gate exists for. The two
+ * `gh pr view` calls of one merge ask for different fields, and the canned
+ * answers are keyed on that: the gate reads `statusCheckRollup`, the board
+ * read-back after the merge does not.
+ */
+async function mergeGhStub(
+  answers: Record<string, unknown>,
+): Promise<{ dir: string; log: string }> {
+  const dir = await scratch();
+  const log = join(dir, "gh.log");
+  const script = [
+    "#!/bin/sh",
+    `printf '%s\\037' "$@" | base64 | tr -d '\\n' >> "$GH_STUB_LOG"`,
+    `printf '\\n' >> "$GH_STUB_LOG"`,
+    'f=""',
+    'case "$1 $2" in',
+    '  "pr merge") f="merge-$3.txt" ;;',
+    '  "repo view") f="repo-view.json" ;;',
+    '  "pr view")',
+    '    case "$*" in',
+    '      *statusCheckRollup*) f="check-$3.json" ;;',
+    '      *) f="view-$3.json" ;;',
+    "    esac",
+    "    ;;",
+    "esac",
+    'if [ -n "$f" ] && [ -f "$GH_STUB_DIR/$f" ]; then',
+    '  cat "$GH_STUB_DIR/$f"',
+    "  exit 0",
+    "fi",
+    'echo "stub gh: no canned answer for: $*" >&2',
+    "exit 1",
+    "",
+  ].join("\n");
+  const executable = join(dir, "gh");
+  await Bun.write(executable, script);
+  chmodSync(executable, 0o755);
+
+  for (const [name, value] of Object.entries(answers)) {
+    await Bun.write(
+      join(dir, name),
+      typeof value === "string" ? value : JSON.stringify(value),
+    );
+  }
+  return { dir, log };
+}
+
+/** The canned answers of a merge that passes every gate. */
+function mergeAnswers(
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    "check-60.json": mergeView(),
+    "merge-60.txt": "Merged pull request #60\n",
+    "view-60.json": mergedView(),
+    ...overrides,
+  };
+}
+
+/** Whether the stub was asked to merge anything. */
+async function mergedPullRequests(stub: { log: string }): Promise<string[][]> {
+  return (await ghCalls(stub)).filter(
+    (call) => call[0] === "pr" && call[1] === "merge",
+  );
+}
+
+describe("checkRollup", () => {
+  test("a pull request with no check at all is not verified", () => {
+    for (const rollup of [[], null, undefined, "unreadable"]) {
+      const state = checkRollup(rollup);
+      expect(state.total).toBe(0);
+      expect(state.passed).toBe(0);
+      expect(state.reason).toContain("no check has run");
+    }
+  });
+
+  test("reads the GraphQL connection shape as well as the flat array", () => {
+    expect(checkRollup({ nodes: [checkRun()] }).reason).toBeNull();
+    expect(checkRollup([checkRun()]).reason).toBeNull();
+  });
+
+  test("a green run passes and counts what passed", () => {
+    const state = checkRollup([checkRun(), checkRun({ name: "frontend" })]);
+    expect(state).toEqual({ total: 2, passed: 2, reason: null });
+  });
+
+  test("a failing check is named", () => {
+    const state = checkRollup([
+      checkRun(),
+      checkRun({ name: "frontend", conclusion: "FAILURE" }),
+    ]);
+    expect(state.passed).toBe(1);
+    expect(state.reason).toBe("1 of 2 checks did not pass: frontend");
+  });
+
+  test("every non-passing conclusion fails", () => {
+    for (const conclusion of [
+      "FAILURE",
+      "TIMED_OUT",
+      "CANCELLED",
+      "ACTION_REQUIRED",
+      "STARTUP_FAILURE",
+      "STALE",
+    ]) {
+      expect(checkRollup([checkRun({ conclusion })]).reason).toContain(
+        "did not pass",
+      );
+    }
+  });
+
+  test("an unfinished check is neither a pass nor a failure", () => {
+    for (const status of ["QUEUED", "IN_PROGRESS", "WAITING", "PENDING"]) {
+      const state = checkRollup([checkRun({ status, conclusion: null })]);
+      expect(state.passed).toBe(0);
+      expect(state.reason).toContain("have not finished");
+    }
+  });
+
+  test("a status context is read from its state", () => {
+    const context = (state: string) => ({
+      __typename: "StatusContext",
+      context: "buildkite",
+      state,
+    });
+    expect(checkRollup([context("SUCCESS")]).reason).toBeNull();
+    expect(checkRollup([context("PENDING")]).reason).toContain(
+      "have not finished",
+    );
+    expect(checkRollup([context("FAILURE")]).reason).toContain("did not pass");
+    expect(checkRollup([context("ERROR")]).reason).toContain("did not pass");
+  });
+
+  test("a run where everything was skipped verified nothing", () => {
+    const state = checkRollup([
+      checkRun({ conclusion: "SKIPPED" }),
+      checkRun({ name: "frontend", conclusion: "NEUTRAL" }),
+    ]);
+    expect(state.total).toBe(2);
+    expect(state.passed).toBe(0);
+    expect(state.reason).toContain("none of the 2 checks concluded successfully");
+  });
+
+  test("a skipped check next to a passing one does not block the merge", () => {
+    const state = checkRollup([
+      checkRun(),
+      checkRun({ name: "frontend", conclusion: "SKIPPED" }),
+    ]);
+    expect(state).toEqual({ total: 2, passed: 1, reason: null });
+  });
+
+  test("a wide failure names five checks and counts the rest", () => {
+    const failing = Array.from({ length: 8 }, (_, index) =>
+      checkRun({ name: `job-${index + 1}`, conclusion: "FAILURE" }),
+    );
+    expect(checkRollup(failing).reason).toBe(
+      "8 of 8 checks did not pass: job-1, job-2, job-3, job-4, job-5, and 3 more",
+    );
+  });
+
+  test("checkOutcome reads an entry that is not an object as unfinished", () => {
+    expect(checkOutcome(null)).toBe("pending");
+    expect(checkOutcome("green")).toBe("pending");
+    expect(checkOutcome({})).toBe("pending");
+  });
+});
+
+describe("mergeRefusal", () => {
+  function candidate(overrides: Record<string, unknown> = {}) {
+    const view = { ...mergeView(), ...(overrides.view as object ?? {}) };
+    return {
+      changeId: "OV-600-C1",
+      branch: "overlord/OV-600-C1",
+      reviewedSha: MERGE_SHA,
+      defaultBranch: "main",
+      checks: checkRollup(view.statusCheckRollup),
+      ...overrides,
+      view: view as unknown as MergeView,
+    };
+  }
+
+  test("a pull request that passes every gate is not refused", () => {
+    expect(mergeRefusal(candidate())).toBeNull();
+  });
+
+  test("main and master are refused whatever the default branch is", () => {
+    for (const base of ["main", "Main", "MAIN", "master"]) {
+      const reason = mergeRefusal(
+        candidate({ view: { baseRefName: base }, defaultBranch: "develop" }),
+      );
+      expect(reason).toContain(`merges into "${base}"`);
+      expect(reason).toContain("user's to perform");
+    }
+  });
+
+  test("the repository default branch is refused under any name", () => {
+    const reason = mergeRefusal(
+      candidate({ view: { baseRefName: "develop" }, defaultBranch: "develop" }),
+    );
+    expect(reason).toContain("the repository default branch");
+  });
+
+  test("a default branch that could not be named refuses rather than passes", () => {
+    const reason = mergeRefusal(candidate({ defaultBranch: null }));
+    expect(reason).toContain("default branch could not be determined");
+  });
+
+  test("a pull request without a base branch is refused", () => {
+    expect(mergeRefusal(candidate({ view: { baseRefName: "" } }))).toContain(
+      "does not name a base branch",
+    );
+  });
+
+  test("the base is decided before anything else, so a delivery pull request cannot slip past another gate", () => {
+    // Everything else is wrong as well; the base is still what is reported.
+    const reason = mergeRefusal(
+      candidate({
+        view: {
+          baseRefName: "main",
+          headRefName: "feature",
+          state: "CLOSED",
+          statusCheckRollup: [],
+        },
+        reviewedSha: null,
+      }),
+    );
+    expect(reason).toContain('merges into "main"');
+  });
+
+  test("a pull request on another branch is refused", () => {
+    const reason = mergeRefusal(
+      candidate({ view: { headRefName: "overlord/OV-600-C2" } }),
+    );
+    expect(reason).toContain('is on branch "overlord/OV-600-C2"');
+  });
+
+  test("a change with no branch on the board is refused", () => {
+    expect(mergeRefusal(candidate({ branch: null }))).toContain(
+      "has no branch on the board",
+    );
+  });
+
+  test("a pull request that is not open has nothing to merge", () => {
+    for (const state of ["MERGED", "CLOSED"]) {
+      expect(mergeRefusal(candidate({ view: { state } }))).toContain(
+        "not open",
+      );
+    }
+  });
+
+  test("a change with no reviewed_sha is refused", () => {
+    for (const reviewedSha of [null, undefined, ""]) {
+      expect(mergeRefusal(candidate({ reviewedSha }))).toContain(
+        "no reviewed_sha on the board",
+      );
+    }
+  });
+
+  test("a head that is not the reviewed commit is refused", () => {
+    expect(mergeRefusal(candidate({ reviewedSha: "e".repeat(40) }))).toContain(
+      "commits were added after the review",
+    );
+  });
+
+  test("an abbreviated reviewed_sha still names the head commit", () => {
+    expect(mergeRefusal(candidate({ reviewedSha: MERGE_SHA.slice(0, 7) }))).toBeNull();
+  });
+
+  test("a CI that did not pass is refused", () => {
+    const reason = mergeRefusal(
+      candidate({ view: { statusCheckRollup: [checkRun({ conclusion: "FAILURE" })] } }),
+    );
+    expect(reason).toContain("did not pass");
+  });
+
+  test("a pull request with no check is refused", () => {
+    const reason = mergeRefusal(candidate({ view: { statusCheckRollup: [] } }));
+    expect(reason).toContain("no check has run");
+  });
+});
+
+describe("mergeChange", () => {
+  test("a reviewed, green change is merged with a merge commit and recorded", async () => {
+    const repo = await deliveryRepo();
+    const boardPath = await writeMergeBoard();
+    const stub = await mergeGhStub(mergeAnswers());
+
+    const saves = await countSaves(async () => {
+      const outcome = await withGhStub(stub, () =>
+        mergeChange({ boardPath, changeId: "OV-600-C1", cwd: repo.root }),
+      );
+      expect(outcome.status).toBe("merged");
+      expect(outcome.reason).toBeUndefined();
+      expect(outcome.changeState).toBe("done");
+      expect(outcome.pr).toEqual({
+        number: 60,
+        url: "https://github.com/o/r/pull/60",
+        state: "merged",
+        head_sha: MERGE_SHA,
+        reviewed_sha: MERGE_SHA,
+      });
+      expect(outcome.checked).toEqual({
+        number: 60,
+        state: "open",
+        head: "overlord/OV-600-C1",
+        base: "overlord-console",
+        reviewedSha: MERGE_SHA,
+        checks: { total: 1, passed: 1, reason: null },
+      });
+    });
+
+    // One board write, as every other change command performs.
+    expect(saves).toBe(1);
+
+    const { board } = await loadBoard(boardPath);
+    const change = findChange(board, "OV-600-C1")!.change;
+    expect(change.state).toBe("done");
+    expect(change.pr!.state).toBe("merged");
+    // Written by the sync path, so `reviewed_sha` is carried over untouched.
+    expect(change.pr!.reviewed_sha).toBe(MERGE_SHA);
+    // The card is the commander's to move; the merge does not move it.
+    expect(board.items[0]!.state).toBe("implementing");
+
+    // A merge commit, and nothing else: no --squash, --rebase, --admin or
+    // --delete-branch was passed.
+    expect(await mergedPullRequests(stub)).toEqual([
+      ["pr", "merge", "60", "--merge"],
+    ]);
+  }, 20_000);
+
+  test("a base of main is refused and nothing is merged or written", async () => {
+    const repo = await deliveryRepo();
+    const boardPath = await writeMergeBoard();
+    const before = await Bun.file(boardPath).text();
+    const stub = await mergeGhStub(
+      mergeAnswers({ "check-60.json": mergeView({ baseRefName: "main" }) }),
+    );
+
+    const outcome = await withGhStub(stub, () =>
+      mergeChange({ boardPath, changeId: "OV-600-C1", cwd: repo.root }),
+    );
+
+    expect(outcome.status).toBe("refused");
+    expect(outcome.reason).toContain('merges into "main"');
+    expect(outcome.reason).toContain("Nothing was merged");
+    expect(await mergedPullRequests(stub)).toEqual([]);
+    expect(await Bun.file(boardPath).text()).toBe(before);
+  }, 20_000);
+
+  test("a base of master is refused", async () => {
+    const repo = await deliveryRepo();
+    const boardPath = await writeMergeBoard();
+    const stub = await mergeGhStub(
+      mergeAnswers({ "check-60.json": mergeView({ baseRefName: "master" }) }),
+    );
+
+    const outcome = await withGhStub(stub, () =>
+      mergeChange({ boardPath, changeId: "OV-600-C1", cwd: repo.root }),
+    );
+
+    expect(outcome.status).toBe("refused");
+    expect(outcome.reason).toContain('merges into "master"');
+    expect(await mergedPullRequests(stub)).toEqual([]);
+  }, 20_000);
+
+  test("a base that is the repository default branch is refused under its own name", async () => {
+    const repo = await deliveryRepo();
+    // No origin/HEAD, so the default branch is the one GitHub names.
+    await gitIn(["symbolic-ref", "-d", "refs/remotes/origin/HEAD"], repo.root);
+    const boardPath = await writeMergeBoard();
+    const stub = await mergeGhStub(
+      mergeAnswers({
+        "check-60.json": mergeView({ baseRefName: "develop" }),
+        "repo-view.json": { defaultBranchRef: { name: "develop" } },
+      }),
+    );
+
+    const outcome = await withGhStub(stub, () =>
+      mergeChange({ boardPath, changeId: "OV-600-C1", cwd: repo.root }),
+    );
+
+    expect(outcome.status).toBe("refused");
+    expect(outcome.reason).toContain("the repository default branch");
+    expect(await mergedPullRequests(stub)).toEqual([]);
+  }, 20_000);
+
+  test("a default branch that cannot be determined refuses rather than merges", async () => {
+    const repo = await deliveryRepo();
+    await gitIn(["symbolic-ref", "-d", "refs/remotes/origin/HEAD"], repo.root);
+    const boardPath = await writeMergeBoard();
+    // No repo-view.json: `gh repo view` fails, so nothing can name the branch.
+    const stub = await mergeGhStub(mergeAnswers());
+
+    const outcome = await withGhStub(stub, () =>
+      mergeChange({ boardPath, changeId: "OV-600-C1", cwd: repo.root }),
+    );
+
+    expect(outcome.status).toBe("refused");
+    expect(outcome.reason).toContain("default branch could not be determined");
+    expect(await mergedPullRequests(stub)).toEqual([]);
+  }, 20_000);
+
+  test("the delivery pull request deliverCard opens is refused", async () => {
+    const repo = await deliveryRepo();
+    const deliveryBoard = await writeDeliveryBoard([MERGED_CHANGE]);
+    const deliverStub = await deliverGhStub({
+      "view-50.json": VIEW_50_UNCHANGED,
+      "pr-list.json": [],
+      "pr-create.txt": "created\n",
+      "view-feature.json": DELIVERY_VIEW,
+    });
+
+    const delivered = await withGhStub(deliverStub, () =>
+      deliverCard({
+        boardPath: deliveryBoard,
+        cardId: "OV-500",
+        cwd: repo.root,
+        head: "feature",
+      }),
+    );
+    expect(delivered.status).toBe("created");
+    const deliveryNumber = delivered.pr!.number!;
+
+    // The delivery pull request recorded on a change, which is what a mistyped
+    // `pr --number` leaves behind. Its head branch is the one the board would
+    // record for the change and its head commit is the reviewed one, so every
+    // gate but the base passes and the base is the only thing that can refuse.
+    const boardPath = join(await scratch(), "board.yaml");
+    await saveBoard(
+      boardPath,
+      mergeBoardWith({
+        branch: DELIVERY_VIEW.headRefName,
+        pr: {
+          number: deliveryNumber,
+          url: DELIVERY_VIEW.url,
+          state: "open",
+          head_sha: DELIVERY_VIEW.headRefOid,
+          reviewed_sha: DELIVERY_VIEW.headRefOid,
+        },
+      }),
+    );
+    const before = await Bun.file(boardPath).text();
+    const stub = await mergeGhStub({
+      [`check-${deliveryNumber}.json`]: {
+        ...DELIVERY_VIEW,
+        statusCheckRollup: [checkRun()],
+      },
+      [`merge-${deliveryNumber}.txt`]: "Merged\n",
+      [`view-${deliveryNumber}.json`]: { ...DELIVERY_VIEW, state: "MERGED" },
+    });
+
+    const outcome = await withGhStub(stub, () =>
+      mergeChange({ boardPath, changeId: "OV-600-C1", cwd: repo.root }),
+    );
+
+    expect(outcome.status).toBe("refused");
+    expect(outcome.reason).toContain(`#${deliveryNumber} merges into "main"`);
+    expect(await mergedPullRequests(stub)).toEqual([]);
+    expect(await Bun.file(boardPath).text()).toBe(before);
+  }, 30_000);
+
+  test("a head that is not the reviewed commit is refused", async () => {
+    const repo = await deliveryRepo();
+    const boardPath = await writeMergeBoard({
+      pr: {
+        number: 60,
+        url: "https://github.com/o/r/pull/60",
+        state: "open",
+        head_sha: MERGE_SHA,
+        reviewed_sha: "e".repeat(40),
+      },
+    });
+    const before = await Bun.file(boardPath).text();
+    const stub = await mergeGhStub(mergeAnswers());
+
+    const outcome = await withGhStub(stub, () =>
+      mergeChange({ boardPath, changeId: "OV-600-C1", cwd: repo.root }),
+    );
+
+    expect(outcome.status).toBe("refused");
+    expect(outcome.reason).toContain("commits were added after the review");
+    expect(await mergedPullRequests(stub)).toEqual([]);
+    expect(await Bun.file(boardPath).text()).toBe(before);
+  }, 20_000);
+
+  test("a change that was never reviewed is refused", async () => {
+    const repo = await deliveryRepo();
+    const boardPath = await writeMergeBoard({
+      pr: {
+        number: 60,
+        url: "https://github.com/o/r/pull/60",
+        state: "open",
+        head_sha: MERGE_SHA,
+        reviewed_sha: null,
+      },
+    });
+    const stub = await mergeGhStub(mergeAnswers());
+
+    const outcome = await withGhStub(stub, () =>
+      mergeChange({ boardPath, changeId: "OV-600-C1", cwd: repo.root }),
+    );
+
+    expect(outcome.status).toBe("refused");
+    expect(outcome.reason).toContain("no reviewed_sha on the board");
+    expect(await mergedPullRequests(stub)).toEqual([]);
+  }, 20_000);
+
+  test("a failing CI is refused", async () => {
+    const repo = await deliveryRepo();
+    const boardPath = await writeMergeBoard();
+    const before = await Bun.file(boardPath).text();
+    const stub = await mergeGhStub(
+      mergeAnswers({
+        "check-60.json": mergeView({
+          statusCheckRollup: [checkRun({ conclusion: "FAILURE" })],
+        }),
+      }),
+    );
+
+    const outcome = await withGhStub(stub, () =>
+      mergeChange({ boardPath, changeId: "OV-600-C1", cwd: repo.root }),
+    );
+
+    expect(outcome.status).toBe("refused");
+    expect(outcome.reason).toContain("did not pass");
+    expect(await mergedPullRequests(stub)).toEqual([]);
+    expect(await Bun.file(boardPath).text()).toBe(before);
+  }, 20_000);
+
+  test("a pull request with no check at all is refused", async () => {
+    const repo = await deliveryRepo();
+    const boardPath = await writeMergeBoard();
+    const stub = await mergeGhStub(
+      mergeAnswers({ "check-60.json": mergeView({ statusCheckRollup: [] }) }),
+    );
+
+    const outcome = await withGhStub(stub, () =>
+      mergeChange({ boardPath, changeId: "OV-600-C1", cwd: repo.root }),
+    );
+
+    expect(outcome.status).toBe("refused");
+    expect(outcome.reason).toContain("no check has run");
+    expect(outcome.checked!.checks.total).toBe(0);
+    expect(await mergedPullRequests(stub)).toEqual([]);
+  }, 20_000);
+
+  test("a pull request that is still running its checks is refused", async () => {
+    const repo = await deliveryRepo();
+    const boardPath = await writeMergeBoard();
+    const stub = await mergeGhStub(
+      mergeAnswers({
+        "check-60.json": mergeView({
+          statusCheckRollup: [
+            checkRun(),
+            checkRun({ name: "frontend", status: "IN_PROGRESS", conclusion: null }),
+          ],
+        }),
+      }),
+    );
+
+    const outcome = await withGhStub(stub, () =>
+      mergeChange({ boardPath, changeId: "OV-600-C1", cwd: repo.root }),
+    );
+
+    expect(outcome.status).toBe("refused");
+    expect(outcome.reason).toContain("have not finished");
+    expect(await mergedPullRequests(stub)).toEqual([]);
+  }, 20_000);
+
+  test("a pull request on another branch is refused", async () => {
+    const repo = await deliveryRepo();
+    const boardPath = await writeMergeBoard();
+    const stub = await mergeGhStub(
+      mergeAnswers({
+        "check-60.json": mergeView({ headRefName: "overlord/OV-600-C2" }),
+      }),
+    );
+
+    const outcome = await withGhStub(stub, () =>
+      mergeChange({ boardPath, changeId: "OV-600-C1", cwd: repo.root }),
+    );
+
+    expect(outcome.status).toBe("refused");
+    expect(outcome.reason).toContain('is on branch "overlord/OV-600-C2"');
+    expect(await mergedPullRequests(stub)).toEqual([]);
+  }, 20_000);
+
+  test("a pull request that is already merged is refused", async () => {
+    const repo = await deliveryRepo();
+    const boardPath = await writeMergeBoard();
+    const stub = await mergeGhStub(
+      mergeAnswers({ "check-60.json": mergeView({ state: "MERGED" }) }),
+    );
+
+    const outcome = await withGhStub(stub, () =>
+      mergeChange({ boardPath, changeId: "OV-600-C1", cwd: repo.root }),
+    );
+
+    expect(outcome.status).toBe("refused");
+    expect(outcome.reason).toContain("not open");
+    expect(await mergedPullRequests(stub)).toEqual([]);
+  }, 20_000);
+
+  test("no environment variable turns a refusal into a merge", async () => {
+    const repo = await deliveryRepo();
+    const boardPath = await writeMergeBoard();
+    const stub = await mergeGhStub(
+      mergeAnswers({ "check-60.json": mergeView({ baseRefName: "main" }) }),
+    );
+    // Names a bypass would plausibly use. None of them exists, and this test
+    // is what keeps it that way.
+    const names = [
+      "OVERLORD_FORCE",
+      "OVERLORD_ALLOW_MAIN",
+      "OVERLORD_MERGE_FORCE",
+      "OVERLORD_SKIP_CI",
+      "OVERLORD_SKIP_REVIEW",
+      "OVERLORD_MERGE_BASE",
+      "FORCE",
+    ];
+    for (const name of names) process.env[name] = "1";
+    try {
+      const outcome = await withGhStub(stub, () =>
+        mergeChange({ boardPath, changeId: "OV-600-C1", cwd: repo.root }),
+      );
+      expect(outcome.status).toBe("refused");
+      expect(await mergedPullRequests(stub)).toEqual([]);
+    } finally {
+      for (const name of names) delete process.env[name];
+    }
+  }, 20_000);
+
+  test("a change with no pull request on the board fails before any gh call", async () => {
+    const repo = await deliveryRepo();
+    const boardPath = await writeMergeBoard({ pr: null });
+    const stub = await mergeGhStub(mergeAnswers());
+
+    const outcome = await withGhStub(stub, () =>
+      mergeChange({ boardPath, changeId: "OV-600-C1", cwd: repo.root }),
+    );
+
+    expect(outcome.status).toBe("failed");
+    expect(outcome.reason).toContain("has no pull request on the board");
+    expect(await ghCalls(stub)).toEqual([]);
+  }, 20_000);
+
+  test("an unknown change id is reported and nothing is called", async () => {
+    const repo = await deliveryRepo();
+    const boardPath = await writeMergeBoard();
+    const stub = await mergeGhStub(mergeAnswers());
+
+    const outcome = await withGhStub(stub, () =>
+      mergeChange({ boardPath, changeId: "OV-999-C9", cwd: repo.root }),
+    );
+
+    expect(outcome.status).toBe("failed");
+    expect(outcome.reason).toContain("unknown change id: OV-999-C9");
+    expect(await ghCalls(stub)).toEqual([]);
+  }, 20_000);
+
+  test("a merge that GitHub does not report back is reported rather than assumed", async () => {
+    const repo = await deliveryRepo();
+    const boardPath = await writeMergeBoard();
+    const stub = await mergeGhStub(
+      mergeAnswers({ "view-60.json": mergedView({ state: "OPEN" }) }),
+    );
+
+    const outcome = await withGhStub(stub, () =>
+      mergeChange({ boardPath, changeId: "OV-600-C1", cwd: repo.root }),
+    );
+
+    expect(outcome.status).toBe("failed");
+    expect(outcome.reason).toContain("was merged, but GitHub still reports");
+    expect(outcome.reason).toContain("change sync OV-600");
+    expect(await mergedPullRequests(stub)).toEqual([
+      ["pr", "merge", "60", "--merge"],
+    ]);
+  }, 20_000);
+
+  test("a merge that gh refuses leaves the board untouched", async () => {
+    const repo = await deliveryRepo();
+    const boardPath = await writeMergeBoard();
+    const before = await Bun.file(boardPath).text();
+    // No merge-60.txt, so the stub fails the merge the way a conflicting or a
+    // protected pull request makes `gh pr merge` fail.
+    const stub = await mergeGhStub({
+      "check-60.json": mergeView(),
+      "view-60.json": mergedView(),
+    });
+
+    const outcome = await withGhStub(stub, () =>
+      mergeChange({ boardPath, changeId: "OV-600-C1", cwd: repo.root }),
+    );
+
+    expect(outcome.status).toBe("failed");
+    expect(outcome.reason).toContain("gh pr merge 60 --merge failed");
+    expect(await Bun.file(boardPath).text()).toBe(before);
+  }, 20_000);
+});
+
+describe("merge CLI", () => {
+  async function runMerge(
+    argv: string[],
+    cwd: string,
+    stub: { dir: string; log: string },
+  ): Promise<{ code: number; stdout: string; stderr: string }> {
+    const previous = process.cwd();
+    process.chdir(cwd);
+    try {
+      return await withGhStub(stub, () => capture(() => merge(argv)));
+    } finally {
+      process.chdir(previous);
+    }
+  }
+
+  test("without a change id it prints the usage and exits 2", async () => {
+    const { code, stderr } = await captureStderr(() => merge([]));
+    expect(code).toBe(2);
+    expect(stderr).toContain("usage: change merge <change-id>");
+  });
+
+  test("every option but --board is a usage error", async () => {
+    const boardPath = await writeMergeBoard();
+    const before = await Bun.file(boardPath).text();
+
+    for (const option of [
+      ["--base", "main"],
+      ["--force"],
+      ["--admin"],
+      ["--squash"],
+      ["--no-ci"],
+    ]) {
+      const { code, stderr } = await captureStderr(() =>
+        merge(["OV-600-C1", "--board", boardPath, ...option, "x"]),
+      );
+      expect(code).toBe(2);
+      expect(stderr).toContain("takes no option other than --board");
+      expect(stderr).toContain("cannot be turned off");
+    }
+    expect(await Bun.file(boardPath).text()).toBe(before);
+  });
+
+  test("the usage text names no way to skip a check", async () => {
+    const { code, stdout } = await capture(() => main(["--help"]));
+    expect(code).toBe(0);
+    expect(stdout).toContain("merge <change-id>");
+    expect(stdout).toContain(
+      "There is no option and no\n                      environment variable that skips any of those checks",
+    );
+    expect(stdout).toContain(
+      "merge takes only <change-id> and --board; any other option is a usage error.",
+    );
+    // Nothing in the usage offers a way around the gates.
+    expect(stdout).not.toContain("--force");
+    expect(stdout).not.toContain("--admin");
+  });
+
+  test("a merged change is reported line by line and exits 0", async () => {
+    const repo = await deliveryRepo();
+    const boardPath = await writeMergeBoard();
+    const stub = await mergeGhStub(mergeAnswers());
+
+    const { code, stdout, stderr } = await runMerge(
+      ["OV-600-C1", "--board", boardPath],
+      repo.root,
+      stub,
+    );
+
+    expect(stderr).toBe("");
+    expect(code).toBe(0);
+    expect(stdout).toBe(
+      [
+        "change:           OV-600-C1",
+        "pull request:     #60 (open)",
+        "head branch:      overlord/OV-600-C1",
+        "base branch:      overlord-console",
+        `reviewed commit:  ${MERGE_SHA}`,
+        "checks:           1 of 1 passed",
+        "merged:           #60 with a merge commit",
+        "change state:     done",
+        `board updated:    ${boardPath}`,
+        "https://github.com/o/r/pull/60",
+        "",
+      ].join("\n"),
+    );
+  }, 20_000);
+
+  test("a refused merge reports what it checked on stdout and why on stderr, and exits 1", async () => {
+    const repo = await deliveryRepo();
+    const boardPath = await writeMergeBoard();
+    const stub = await mergeGhStub(
+      mergeAnswers({ "check-60.json": mergeView({ baseRefName: "main" }) }),
+    );
+
+    const { code, stdout, stderr } = await runMerge(
+      ["OV-600-C1", "--board", boardPath],
+      repo.root,
+      stub,
+    );
+
+    expect(code).toBe(1);
+    expect(stdout).toContain("base branch:      main");
+    expect(stdout).not.toContain("merged:");
+    expect(stdout).not.toContain("board updated:");
+    expect(stderr).toContain('merges into "main"');
+    expect(stderr).toContain(`Nothing was merged and nothing was written to ${boardPath}`);
   }, 20_000);
 });

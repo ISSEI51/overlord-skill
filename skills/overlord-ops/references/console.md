@@ -158,6 +158,8 @@ cmux new-workspace --name "<change-id> <title>" --cwd <出力された worktree 
 /path/to/overlord/scripts/change.sh pr <change-id>         # push して PR を作り change.pr を記録
 # 独立レビューで blocking finding なしと判断した時点
 /path/to/overlord/scripts/change.sh reviewed <change-id>   # レビューした commit を change.pr.reviewed_sha に記録
+# レビュー済みで CI が通り、base が作業ブランチのとき
+/path/to/overlord/scripts/change.sh merge <change-id>      # change の PR を merge commit でマージし board に記録
 # 状態を報告する前、マージの後
 /path/to/overlord/scripts/change.sh sync <card-id>         # カードの各 change の PR 状態を board に反映
 # カードの change が全て merged になった後
@@ -166,7 +168,7 @@ cmux new-workspace --name "<change-id> <title>" --cwd <出力された worktree 
 
 Every subcommand takes `--board <path>` (a `board.yaml`, or a project directory containing one) when the board is not the one under the current directory; without it they fall back to `$OVERLORD_BOARD` and then to the current directory. `start` and `pr` also take `--base <branch>`, which defaults to the current branch of the main checkout: `start` branches from it and `pr` opens the pull request against it. A change that builds on the previous one is stacked by passing `--base overlord/<前の change-id>` to both commands, so its diff shows only its own work.
 
-Exit codes are the same for all five: 0 when the command did what it says, 1 when a git, `gh` or board step failed, and 2 for a usage or argument error. A failure leaves `board.yaml` untouched.
+Exit codes are the same for all six: 0 when the command did what it says, 1 when a git, `gh` or board step failed, and 2 for a usage or argument error. A failure leaves `board.yaml` untouched.
 
 `start` prints the worktree path on its last line — `<repo>/.overlord/worktrees/<change-id>` — and writes `changes[].branch` plus `changes[].state: implementing`. `pr` pushes the branch, opens the pull request — or reuses the one already open for that branch — and writes `changes[].pr` (`number`, `url`, `state`, `head_sha`). The change state follows the pull request: `reviewing` for an open one, `done` for one that is already merged, unchanged for a closed one. `pr --number <n>` records a pull request that was opened from the GitHub web UI instead of creating one; the number is checked against `changes[].branch` (`gh pr view --json headRefName`), and a pull request on any other branch is refused without writing the board, so a mistyped number cannot overwrite the record of the correct pull request. Both commands leave `board.yaml` untouched when the git or `gh` step fails, so they can be run again.
 
@@ -194,6 +196,82 @@ Finally the session is written into the card, with `cwd` set to the worktree `st
 ```
 
 The console shows this session read-only on the card with a `cmux で開く` button. The identifiers become stale when the workspace is closed; the console then reports the session as not found. Work that does not need its own terminal — discovery, card creation, briefs, independent review — runs as a subagent inside the commander session and never appears in `agent`.
+
+## change をマージする
+
+`change merge <change-id>` は、レビュー済みで CI が通った change の pull request を、その pull request 自身の base ブランチへ **merge commit** でマージし、結果を board に記録する。
+
+```bash
+cd <project-directory>
+/path/to/overlord/scripts/change.sh merge <change-id> [--board <path>]
+```
+
+引数は `<change-id>` と `--board <path>` だけである。検査を外す引数は無い。`--base` / `--force` / `--admin` / `--squash` のような他の引数を渡すと、マージせず exit 2 で終了する（`change merge takes no option other than --board`）。検査を外す環境変数も無い。
+
+### 何を検査するか
+
+マージの前に次を順に検査し、1つでも該当すれば **`gh pr merge` を呼ばず、`board.yaml` を1バイトも変更せず** exit 1 で終了する。判断材料は board の記録ではなく `gh pr view` で読んだ現在の pull request である。
+
+1. **base ブランチ** — `baseRefName` が `main` または `master`（大小文字を区別しない）、あるいはリポジトリのデフォルトブランチと一致すれば拒否する。デフォルトブランチを特定できない場合（`git symbolic-ref --short refs/remotes/origin/HEAD` と `gh repo view --json defaultBranchRef` のどちらも答えない場合）も、判定できないので拒否する。base が空の pull request も拒否する。
+2. **pull request の同一性** — `headRefName` が `changes[].branch` と一致しなければ拒否する。`pr --number` と `sync` が適用するのと同じ規則で、`pr.number` の誤りが無関係な pull request をマージすることを防ぐ。
+3. **pull request の状態** — `state` が open でなければ拒否する。既にマージ済み、またはクローズ済みの pull request にはマージするものが無い。
+4. **レビュー** — `changes[].pr.reviewed_sha` が記録されていない、または pull request の `headRefOid` と一致しなければ拒否する。短縮 SHA は前方一致で同一とみなすので、`reviewed --sha <7桁以上>` で記録した値もそのまま使える。
+5. **CI** — `gh pr view --json statusCheckRollup` を読み、次のいずれかなら拒否する。
+   - 失敗したチェックがある（`FAILURE` / `TIMED_OUT` / `CANCELLED` / `ACTION_REQUIRED` / `STARTUP_FAILURE` / `STALE`、status context なら `FAILURE` / `ERROR`）
+   - 完了していないチェックがある（`COMPLETED` 以外の status、status context の `PENDING` / `EXPECTED`）
+   - チェックが1件も無い（**未実行**として扱う。CI 導入前に作られた pull request がこの状態になる。このリポジトリの PR #24 が実例で、CI 導入前に作られたためチェックは0件だった）
+   - 成功したチェックが1件も無い（全てが `SKIPPED` / `NEUTRAL`。検査されたものが無いという点でチェック0件と同じ）
+
+`SKIPPED` と `NEUTRAL` のチェックは、成功したチェックが他に1件以上あれば妨げにならない。
+
+### なぜ base ガードがあるか
+
+change 単位の pull request（作業ブランチ向け）と、カードの配送 pull request（`deliver` が作るデフォルトブランチ向け）は、どちらも同じ `gh pr merge` でマージできてしまう。両者を機械的に区別できるのは base ブランチだけであり、後者をマージすることは「このカードをリリースする」という利用者の判断そのものである。
+
+したがって base が `main` / `master` / デフォルトブランチの pull request は、このコマンドでは常に拒否する。**main / master へのマージは、常に利用者が行う。** `deliver` が作った配送 pull request の番号を `change merge` に渡しても、この規則で必ず拒否される。
+
+### マージと board への記録
+
+マージは `gh pr merge <n> --merge` だけを呼ぶ。merge commit のみで、squash と rebase は使わない（README「なぜ merge commit なのか」）。squash / rebase を選ぶ引数は無い。
+
+マージ後に `gh pr view <n> --json number,url,state,headRefOid,headRefName` をもう一度読み、**`sync` と同じ経路（`applyPullRequestView`）** で board に書く。したがって `changes[].pr` と `changes[].state: done` は、後から `sync` を実行した場合とまったく同じ値になり、`reviewed_sha` はそのまま保たれる。board への書き込みは1回だけで、カードの `state` は動かさない（カードを進めるのは司令塔の判断である）。
+
+出力は他のサブコマンドと同じ体裁で、成功したときは次の行を印字する。
+
+```text
+change:           OV-111-C1
+pull request:     #27 (open)
+head branch:      overlord/OV-111-C1
+base branch:      overlord-console
+reviewed commit:  1a2b3c4d…
+checks:           2 of 2 passed
+merged:           #27 with a merge commit
+change state:     done
+board updated:    /Users/example/project/docs/product-ops/board.yaml
+https://github.com/example/repo/pull/27
+```
+
+拒否されたときは `change:` から `checks:` までの行を stdout に、拒否の理由と `Nothing was merged and nothing was written to <board>` を stderr に出す。
+
+exit code: マージした場合は 0、検査による拒否と git / `gh` / board の失敗は 1、引数エラーは 2。`gh pr merge` が成功した後に読み戻しや board への書き込みが失敗した場合も 1 で、pull request はマージ済みだが board は未記録である旨と、`change sync <card-id>` を実行するよう stderr に出す。
+
+### 利用者が追加する許可規則
+
+司令塔のセッションから `change.sh merge` を実行するには、Bash の許可規則が要る。利用者は自分の `settings.json`（`~/.claude/settings.json`、またはプロジェクトの `.claude/settings.json`）に、**`change.sh merge` だけ**を対象とする規則を追加する。Overlord 側はこのファイルを作成も編集もしない。
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "Bash(/path/to/overlord/scripts/change.sh merge:*)"
+    ]
+  }
+}
+```
+
+`/path/to/overlord` は、司令塔が実際に打つのと同じ Overlord チェックアウトの絶対パスにする（`scripts/install.sh` がスキルの隣の `overlord-checkout` に書いた値）。前方一致なので、`change.sh merge <change-id> --board <path>` はこの1行で許可される。
+
+**`gh pr merge` を直接許可する規則を案内してはならない。** 許可規則はコマンド文字列の前方一致で判定するのに対し、`gh pr merge <n> --merge` には pull request 番号しか現れず、base ブランチはコマンド文字列のどこにも含まれない。つまり許可規則では base を区別できない。`Bash(gh pr merge:*)` を許可すると、作業ブランチ向けの change の pull request と main 向けの配送 pull request が同じ規則で許可され、リリースの判断が利用者の手を離れる。`change.sh merge` を許可の単位にすれば、base の判定は実装側（上記の base ガード）で行われ、main / master / デフォルトブランチ向けの pull request は許可の有無にかかわらずマージされない。
 
 ## カードを配送する
 
