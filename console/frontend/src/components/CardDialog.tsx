@@ -16,7 +16,12 @@ import { errorMessage } from "@/lib/api";
 
 /**
  * "気づきを追加" dialog. Cancel and Escape keep what was typed (the
- * component stays mounted); a successful submit clears the note fields.
+ * component stays mounted); a successful submit clears every field, so the
+ * next card starts empty.
+ *
+ * The dialog asks for the heading and the note only. `project` is not asked
+ * for: the server derives it from the board, and typing it here used to
+ * change the new card's id prefix without saying so.
  */
 export function CardDialog({
   open,
@@ -27,7 +32,6 @@ export function CardDialog({
 }) {
   const { createItem, load, select } = useConsole();
   const [title, setTitle] = useState("");
-  const [project, setProject] = useState("");
   const [evidence, setEvidence] = useState("");
 
   const submit = async () => {
@@ -39,7 +43,6 @@ export function CardDialog({
     try {
       const item = await createItem({
         title: trimmed,
-        project: project.trim() || undefined,
         evidence: evidence.trim() || undefined,
       });
       setTitle("");
@@ -72,14 +75,7 @@ export function CardDialog({
               onChange={(event) => setTitle(event.target.value)}
             />
           </Field>
-          <Field label="プロジェクト（任意）">
-            <Input
-              value={project}
-              autoComplete="off"
-              onChange={(event) => setProject(event.target.value)}
-            />
-          </Field>
-          <Field label="根拠・再現手順（任意・複数行可）">
+          <Field label="困っていることと根拠（任意・複数行可）">
             <Textarea
               value={evidence}
               rows={4}

@@ -6,14 +6,14 @@ Store the source of truth in `docs/product-ops/board.yaml`.
 version: 1
 updated_at: "2026-08-25T00:00:00Z"
 commander:
-  workspace_id: "C06728B8-B8BA-4D83-A69D-9ADE254532CB"
-  surface_id: "93EF686E-FAF3-4474-850A-0DEAC3C5BD8D"
+  workspace_id: "11111111-1111-1111-1111-111111111111"
+  surface_id: "22222222-2222-2222-2222-222222222222"
   cwd: "/Users/example/dev/project"
 decisions_required:
-  - "RC-UX-001 の実装を承認する"
+  - "NOTE-031 の実装を承認する"
 items:
-  - id: "RC-UX-001"
-    project: "RaidCoder"
+  - id: "NOTE-031"
+    project: "Notes App"
     title: "ログイン後に元のURLへ戻る"
     state: "specified"
     priority:
@@ -31,21 +31,21 @@ items:
     next_action: "実装ブリーフを作成する"
     blocker: null
     changes:
-      - id: "RC-UX-001-C1"
+      - id: "NOTE-031-C1"
         title: "redirect先を認証フローへ引き渡す"
         state: "implementing"
         agent:
-          workspace_id: "50BC5A54-92C7-4A08-B31F-3DB33591D052"
-          surface_id: "973ECD38-E9D7-4AF8-88AB-56F226E24C5B"
-          cwd: "/Users/example/worktrees/RC-UX-001-C1"
-        branch: "overlord/RC-UX-001-C1"
+          workspace_id: "33333333-3333-3333-3333-333333333333"
+          surface_id: "44444444-4444-4444-4444-444444444444"
+          cwd: "/Users/example/worktrees/NOTE-031-C1"
+        branch: "overlord/NOTE-031-C1"
         pr:
           number: 12
           url: "https://github.com/example/repo/pull/12"
           state: "open"
           head_sha: null
           reviewed_sha: null
-      - id: "RC-UX-001-C2"
+      - id: "NOTE-031-C2"
         title: "callbackでredirect先を検証する"
         state: "specified"
         agent: null
@@ -60,15 +60,17 @@ Use ISO 8601 timestamps in UTC. Do not store credentials, user code, full logs, 
 
 `commander` is the single cmux session the user talks to in Overlord Console. It is optional and holds cmux UUIDs. See [the console reference](console.md).
 
+`project` names the product a card belongs to. Overlord Console shows it as a tag on the card and in the card detail header. The server writes it: `POST /api/items` takes the board's project when the board names exactly one and leaves it null when the board names none or more than one, so the "気づきを追加" dialog does not ask for it. A card id never encodes the project; a new id follows the prefix the board's other cards already use. Correct either afterwards with `PATCH /api/items/<id>` or by editing this file.
+
 `changes` is the engineering split of one card, in dependency order. A card is a product outcome and a change is one delivery unit: 1 change = 1 worktree = 1 branch = 1 pull request = 1 agent execution unit. Splitting work into changes never adds cards to the kanban, and the console shows changes read-only inside the card.
 
 | Field | Meaning |
 | --- | --- |
-| `id` | Derived from the card, e.g. `RC-UX-001-C1` |
+| `id` | Derived from the card, e.g. `NOTE-031-C1` |
 | `title` | What this delivery unit changes |
 | `state` | `specified`, `implementing`, `reviewing`, `done`, or `blocked`. `acceptance` never appears here: acceptance is the user's decision and belongs to the card |
 | `agent` | The cmux session working this change. This is where new work records its session |
-| `branch` | The branch for this change, e.g. `overlord/RC-UX-001-C1` |
+| `branch` | The branch for this change, e.g. `overlord/NOTE-031-C1` |
 | `pr` | `number`, `url`, `state` (`open` / `merged` / `closed`), `head_sha`, `reviewed_sha`. Unknown values stay null |
 
 Every `pr` field has exactly one writer, so no agent edits the record by hand:

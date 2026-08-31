@@ -1,7 +1,16 @@
 .DS_Store
+
+# justfile が dotenv として読む。ローカルの絶対パスやトークンが入りうる。
+.env
+.env.local
 console/node_modules/
 console/frontend/node_modules/
 .overlord/
+
+# This repository's own working board. Overlord rewrites it whenever it runs
+# against this repository, and it records local directory paths and cmux
+# session ids. The tracked template is docs/product-ops/board.example.yaml.
+docs/product-ops/board.yaml
 
 # board.yaml write path: the cross-process lock and the atomic-rename staging
 # files, neither of which ever outlives a write.

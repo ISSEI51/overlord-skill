@@ -15,8 +15,8 @@ Overlord は、Claude Code や Codex のコーディングエージェントを1
 - **決めることだけが残る** — 「今日の判断」バーには最大3件しか出ません。水色枠はあなたの操作待ち、黄色枠は AI が作業中。見る場所はこの2つだけです
 - **AI をチームとして動かす** — あなたが会話するのは司令塔セッション1つだけ。カードごとの調査・実装前整理・実装・レビューは、司令塔がサブエージェントを起動して進めます
 - **PR 単位で並行して進む** — 1変更 = 1 worktree = 1 branch = 1 PR = 1 エージェント実行。大きな仕事はカードを増やさずに変更へ分割します
-- **実装した AI に自分の変更を承認させない** — 独立レビューは実装とは別のサブエージェントが担当します。レビュー済みの commit が PR の先頭と食い違う変更は、完成確認待ちに上がりません
-- **状態は1ファイルに集約** — AI は `docs/product-ops/board.yaml` だけを読み書きし、あなたはブラウザのカンバンで見ます。書き込みは楽観ロックで保護されます
+- **実装した AI に自分の変更を承認させない** — 独立レビューは実装とは別のサブエージェントが担当します。レビュー済みの commit が PR の先頭と食い違うときは `sync` が警告を出します。その変更を完成確認待ちに上げないことは、スキルの規則として定めています
+- **状態は1ファイルに集約** — AI が読み書きする管理情報は `docs/product-ops/board.yaml` だけで、あなたはブラウザのカンバンで見ます。書き込みは楽観ロックで保護されます
 - **ローカルで完結** — コンソールは `127.0.0.1` だけで待ち受け、loopback 以外の `Host` / `Origin` を拒否します
 
 ## Quick Start
@@ -25,7 +25,12 @@ Overlord は、Claude Code や Codex のコーディングエージェントを1
 
 - [Claude Code](https://claude.com/claude-code)（または Codex）
 - [Bun](https://bun.sh) — Overlord Console の実行に必要です
-- cmux — 司令塔サイドバーとカードの指示ボタンに必要です。cmux が無くても、カンバンの閲覧・編集と「気づきを追加」は動きます
+- `git` と [GitHub CLI](https://cli.github.com/)（`gh`）— `scripts/change.sh` は `git` と `gh` を直接起動します（`start` / `pr` / `reviewed` / `sync` / `deliver` の5つすべて）。`start` は `git worktree add` と `git rev-parse`、`pr` は `git push` と `gh pr list` / `gh pr create` / `gh pr view`、`reviewed` は `git worktree list` と worktree での `git rev-parse HEAD`（worktree が残っていない場合は `gh pr view --json headRefOid`）、`sync` は `gh pr view`、`deliver` は `git fetch` / `git diff` と `gh repo view` / `gh pr view` / `gh pr create` / `gh pr edit` を使います。`gh auth login` で認証済みである必要があります。`change.sh` は司令塔が自動で実行するコマンドで、あなたが直接打つ場面はありません
+- [cmux](https://cmux.com/ja) — 複数の AI セッションを1画面のワークスペースとして扱う macOS 用のターミナルです。Overlord は司令塔セッションの画面の読み取りと入力の送信をこれ経由で行うため、司令塔サイドバーとカードの指示ボタンに必要です
+
+動作環境: コンソールとスキルは macOS 固有の処理を持たないため、Bun が動く環境（macOS / Linux）で動作します。cmux は macOS アプリで、コンソールは `cmux` コマンドが PATH に無いときは `/Applications/cmux.app/Contents/Resources/bin/cmux` を参照します。cmux が使えない環境でも、カンバンの閲覧・編集、「気づきを追加」、`scripts/change.sh` の各コマンドは動きます。使えないのは司令塔サイドバーとカードの指示ボタン、および `console.sh --open` です。
+
+Overlord は、AI が読む**スキル5件**と、あなたが見る**コンソール**（上のスクリーンショットの画面）の2つで構成されます。手順1でスキルを、手順2でコンソールを用意します。
 
 1. **スキルをインストールする**
 
@@ -43,7 +48,7 @@ Overlord は、Claude Code や Codex のコーディングエージェントを1
 
    起動すると待ち受けアドレス（既定は `http://127.0.0.1:7377`）が表示されます。ブラウザで開いてください。
 
-3. **司令塔を用意する** — 画面右のサイドバー（初回は開いています。閉じているときはトップバーのアイコンまたは **⌘B** で開きます）で「司令塔を新しく起動」を押し、対象プロジェクトのディレクトリを入力して「起動」。Claude Code が動く cmux ワークスペースが作られ、司令塔として登録され、入力欄に最初の指示が入ります。そのまま「送信」を押すと、司令塔が `docs/product-ops/board.yaml` を読み（無ければ作り）、今日の状況を返します。
+3. **司令塔を用意する** — 画面右のサイドバー（初回は開いています。閉じているときはトップバーのアイコンまたは **⌘B**（Linux では Ctrl+B）で開きます）で「司令塔を新しく起動」を押し、対象プロジェクトのディレクトリを入力して「起動」。Claude Code が動く cmux ワークスペースが作られ、司令塔として登録され、入力欄に最初の指示が入ります。そのまま「送信」を押すと、司令塔が `docs/product-ops/board.yaml` を読み（無ければ作り）、今日の状況を返します。
 
 4. **1件試す** — トップバーの「気づきを追加」で気づきを1行書くと、受信箱にカードができます。カードを開いて「進める」を押すと、司令塔がそのカードの状態に必要な作業をサブエージェントに割り当てます。
 
@@ -64,7 +69,7 @@ Overlord は、Claude Code や Codex のコーディングエージェントを1
 | 要素 | 役割 |
 | --- | --- |
 | スキル5種 | AIの作業手順（下記） |
-| `docs/product-ops/board.yaml` | AIが読む唯一の管理ファイル |
+| `docs/product-ops/board.yaml` | AIが読み書きする管理情報の唯一の置き場 |
 | Overlord Console | 管理ファイルをブラウザで表示・操作するダッシュボード |
 | 司令塔 | あなたが会話する唯一の cmux セッション。各カードの作業はここからサブエージェントに割り振られる |
 
@@ -78,7 +83,7 @@ board は3階層で構成され、**あなたが管理するのは一番上の�
 | **変更** | 1つの実装単位。1変更 = 1 worktree = 1 branch = 1 PR = 1 エージェント実行単位 | カード詳細の「変更（PR単位）」（読み取り専用） |
 | **タスク** | エージェント内部の手順 | 表示しない |
 
-1つの変更は PR 単位で進みます。`start`（worktree とブランチを作る）→ 実装 → `pr`（push して PR を作る）→ 別のAIによるレビュー → `reviewed`（レビューした commit を記録）→ マージ → `sync`（PR の状態を board に反映）。この各段階は `scripts/change.sh` が実行し、board への記録も合わせて行うため、手で書き換える必要はありません。レビュー済みの commit と PR の先頭が食い違う変更は、完成確認待ちには上げません。
+1つの変更は PR 単位で進みます。`start`（worktree とブランチを作る）→ 実装 → `pr`（push して PR を作る）→ 別のAIによるレビュー → `reviewed`（レビューした commit を記録）→ マージ → `sync`（PR の状態を board に反映）。この各段階は `scripts/change.sh` が実行し、board への記録も合わせて行うため、手で書き換える必要はありません。レビュー済みの commit と PR の先頭が食い違うときは `sync` が警告を出します。その変更を完成確認待ちに上げないことは、スキルの規則として定めています。
 
 作業が大きいときは**変更**に分割します。ファイル数が多い、バックエンドとフロントに分かれる、マイグレーションがある、PRを小さくしたい — これらはすべて変更への分割で解決し、**カードは増えません**。
 
@@ -121,10 +126,10 @@ React + shadcn/ui 製のローカルダッシュボードです。`board.yaml` �
 
 画面右のサイドバーが司令塔（あなたが会話する cmux セッション）です。
 
-- トップバーのアイコンまたは **⌘B** で開閉。開閉状態は保存されます
+- トップバーのアイコンまたは **⌘B**（Linux では Ctrl+B）で開閉。開閉状態は保存されます
 - 端末ミラーは司令塔の活動に反応してほぼ即時に更新されます（イベント駆動 + 10秒の安全網。cmux とはソケット直結で子プロセスを起動しません）
 - 「過去の出力を読む」で履歴（最大2000行）を遡れます。閲覧中は更新が止まり、「追従を再開」で戻ります
-- 定型ボタン（今日の状況 / 作業を割り当て / 気づきをカードに / ボード更新）と自由入力欄、キー操作（Enter / Esc / ↑ / ↓ / 中断）を備えます
+- 定型ボタン（今日の状況 / 作業を割り当て / 気づきをカードに / ボード更新）、自由入力欄と「送信」「貼り付けのみ」、キー操作（Enter / Esc / ↑ / ↓ / 中断）を備えます
 - サイドバーが勝手に開くことはありません。開閉は常にあなたの操作です
 
 ## インストール
@@ -139,6 +144,27 @@ cd overlord-skill
 ```
 
 Codex 向けは `./scripts/install.sh codex` です。同名スキルがある場合、インストーラーは安全のため停止します。
+
+### インストール済みの `overlord-*` を更新する
+
+`scripts/install.sh` は同名のスキルが1件でもあるとその時点で終了します（`Refusing to overwrite existing skill:` を出して exit 1）。したがって更新は、既存の `overlord-*` 5件を削除してから入れ直します。
+
+```bash
+cd /path/to/overlord
+git pull
+
+# 個人用 (~/.claude/skills) の場合
+rm -rf ~/.claude/skills/overlord-ops \
+       ~/.claude/skills/overlord-improvement-card \
+       ~/.claude/skills/overlord-ux-audit \
+       ~/.claude/skills/overlord-implementation-brief \
+       ~/.claude/skills/overlord-change-review
+./scripts/install.sh claude
+```
+
+Codex の場合は `${CODEX_HOME:-~/.codex}/skills` の同じ5件を削除して `./scripts/install.sh codex`、プロジェクト単位でインストールしている場合は対象リポジトリの `.claude/skills/overlord-*` を削除して `/path/to/overlord/scripts/install.sh project` です。
+
+削除の前に `ls -l ~/.claude/skills | grep overlord-` で対象を確認してください。スキルはセッションの開始時に読み込まれるため、入れ直したら Claude Code / Codex のセッションを起動し直します。
 
 ### 旧スキル（`product-*`）の削除
 
@@ -199,6 +225,10 @@ docs/product-ops/board.yaml を作成してください。
 
 別のターミナルでコンソールを起動し、サイドバーの「変更」からこの Claude Code セッションを司令塔として登録します（司令塔側から `cmux identify --json --id-format both` で自分の ID を読み、board の `commander` に書き込む方法もあります）。
 
+board 自体を手で書きたい場合は、このリポジトリの `docs/product-ops/board.example.yaml` を対象リポジトリの `docs/product-ops/board.yaml` にコピーして出発点にできます。中身は架空のサンプルなので、`items` を自分のカードに置き換えてください（スキーマは `skills/overlord-ops/references/board-schema.md`）。
+
+`board.yaml` には `commander.cwd` と `changes[].agent.cwd` としてホームディレクトリを含む絶対パスが、`commander` と `changes[].agent` としてローカルの cmux UUID が入ります。**公開リポジトリで Overlord を使う場合は、対象リポジトリの `.gitignore` に `docs/product-ops/board.yaml` を追加してください。** これらを追跡対象から外すためです（このリポジトリ自身も同じ理由で追跡していません）。
+
 リポジトリのマージ方式の設定については、[なぜ merge commit なのか](#なぜ-merge-commit-なのか)を参照してください。
 
 ## 日常の使い方
@@ -220,11 +250,11 @@ docs/product-ops/board.yaml を作成してください。
 
 squash は main に新しいコミットを1つ作ります。作業ブランチ側の元のコミットは main の履歴に入らないため、内容が同じでもマージ後に merge-base が前進しません。この状態で、main の squash コミットが変更した行、またはその近傍の行を作業ブランチが再度変更すると、次の main 向けPRがその行で競合します。実際に PR #10 がこの経路で競合し、手作業で解消しました。
 
-squash を使うと**必ず**競合するわけではありません。両側の差分が同じ内容なら git は解決できます。競合するのは、squash が変更した行と重なる範囲を作業ブランチが再度書き換えた場合です。同じファイルでも変更行が十分に離れていれば git は自動で解決します。ただし `.gitignore` や `console/src/board.ts`、`docs/product-ops/board.yaml` のように繰り返し変更するファイルでは、squash を続ける限り再発します。
+squash を使うと**必ず**競合するわけではありません。両側の差分が同じ内容なら git は解決できます。競合するのは、squash が変更した行と重なる範囲を作業ブランチが再度書き換えた場合です。同じファイルでも変更行が十分に離れていれば git は自動で解決します。ただし `.gitignore` や `console/src/board.ts`、`console/src/change.ts` のように繰り返し変更するファイルでは、squash を続ける限り再発します。
 
 merge commit なら配送のたびに merge-base が前進するため、この分岐そのものが起きません。
 
-PR #10 も squash でマージされたため、この分岐は現時点でまだ残っています。次の main 向けPRを merge commit でマージすると解消されます。
+PR #10 の squash で生じた分岐は、PR #16 を merge commit でマージした時点で解消しました。
 
 この決まりは main 向けのPRについてのものです。変更（change）単位のPRは作業ブランチに向けたもので、ここでは対象外です。
 
