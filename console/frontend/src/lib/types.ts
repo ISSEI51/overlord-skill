@@ -51,6 +51,66 @@ export type Change = {
   pr?: PullRequest | null;
 };
 
+/**
+ * The card-level delivery record, mirrored from `Delivery` in
+ * console/src/board.ts. It is the last attempt to propose the finished card
+ * to the repository default branch, rewritten on every attempt: `error` is
+ * null after a delivery that recorded a pull request, and carries the
+ * diagnostic of the last failure otherwise.
+ *
+ * A `skipped` or `blocked` run writes no delivery record, so a card can have
+ * a live outcome (see `DeliveryEvent`) and nothing here.
+ */
+export type Delivery = {
+  /** Head branch the delivery pull request was opened from. */
+  branch?: string | null;
+  /** Branch the delivery pull request merges into. */
+  base?: string | null;
+  pr?: PullRequest | null;
+  error?: string | null;
+  attempted_at?: string | null;
+};
+
+/**
+ * How one delivery run ended, mirrored from `DeliverOutcome["status"]` in
+ * console/src/change.ts plus the server's `running`, which it broadcasts when
+ * a run starts.
+ */
+export type DeliveryStatus =
+  | "running"
+  | "created"
+  | "updated"
+  | "skipped"
+  | "blocked"
+  | "failed";
+
+/**
+ * The `{"type":"delivery"}` frame of `/api/events`, mirrored from
+ * `DeliveryEvent` in console/src/server.ts. `running` carries nothing but the
+ * card; every other frame is one `DeliverOutcome` spread into it, so which
+ * fields are present depends on `status`:
+ *
+ * - `created` / `updated`: `pr` is the delivery pull request
+ * - `skipped`: `reason` is `no-diff`, `same-branch`, `no-remote` or
+ *   `no-repository`
+ * - `blocked`: `unmerged` lists the changes that are not merged yet, each
+ *   `"<change-id>  <title>"`
+ * - `failed`: `reason` is the diagnostic, also written to `delivery.error`
+ */
+export type DeliveryEvent = {
+  type: "delivery";
+  card: string;
+  status: DeliveryStatus;
+  reason?: string | null;
+  pr?: PullRequest | null;
+  /** Head branch the attempt used; `Delivery.branch` under another name. */
+  head?: string | null;
+  base?: string | null;
+  unmerged?: string[] | null;
+  /** Non-fatal problems: the run continued in spite of them. */
+  warnings?: string[] | null;
+};
+
 export type Priority = {
   impact?: number | null;
   urgency?: number | null;
@@ -76,6 +136,8 @@ export type Item = {
   agent?: SessionLink | null;
   /** Engineering split of this card, in dependency order. */
   changes?: Change[] | null;
+  /** Last attempt to deliver the finished card to the default branch. */
+  delivery?: Delivery | null;
   brief?: unknown;
   review?: unknown;
 };

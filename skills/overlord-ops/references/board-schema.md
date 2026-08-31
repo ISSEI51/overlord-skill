@@ -82,4 +82,35 @@ Every `pr` field has exactly one writer, so no agent edits the record by hand:
 
 `pr` and `sync` carry `reviewed_sha` over untouched, and `reviewed` touches nothing but `reviewed_sha`, so a review result and a pull request refresh never overwrite each other. `head_sha` is the current head of the pull request and `reviewed_sha` is the commit a review actually read: while they differ, the change carries commits no review has read, `sync` says so, and the card is not ready for `acceptance`.
 
+`delivery` is the card-level pull request that proposes the finished card to the repository default branch: the branch the card's work sits on (`branch`) against that default branch (`base`). It appears once a delivery has been attempted, and is absent on every other card — a card is delivered only after every one of its changes is merged, so the example above, whose changes are still open, has none. One card holds one delivery record, rewritten on every attempt, so it says what the last attempt did rather than keeping a history.
+
+```yaml
+    delivery:
+      branch: "overlord/NOTE-031"
+      base: "main"
+      pr:
+        number: 34
+        url: "https://github.com/example/repo/pull/34"
+        state: "open"
+        head_sha: "9f1c2ab"
+        reviewed_sha: null
+      error: null
+      attempted_at: "2026-08-26T09:12:00Z"
+```
+
+| Field | Meaning |
+| --- | --- |
+| `branch` | Head branch the delivery pull request was opened from |
+| `base` | Branch it merges into: the repository default branch unless `--base` said otherwise |
+| `pr` | The delivery pull request, in the same shape as a change's: `number`, `url`, `state`, `head_sha`, `reviewed_sha`. `reviewed_sha` stays null, because the review happened on the changes |
+| `error` | `null` when the last attempt recorded a pull request; the diagnostic of the failure otherwise |
+| `attempted_at` | When the attempt this record describes ran |
+
+| Written by | When |
+| --- | --- |
+| `change.sh deliver <card-id>` | After `gh pr view` confirmed the pull request's `headRefName` and `baseRefName`. Writes the whole record with `error: null` |
+| Overlord Console | The same code, run by the server when a card moves 完成確認待ち -> 完了, and by `POST /api/items/:id/deliver`. A failure is recorded by the server with the diagnostic in `error`, keeping the branches and the pull request the attempt or the previous record knew |
+
+No agent edits this record by hand, and nothing else writes it: a delivery touches neither `state` nor `changes`, and a failed delivery does not move the card out of `done`. A run that had nothing to deliver (`skipped`) or that found unmerged changes (`blocked`) writes no `delivery` at all - a blocked one may still write `changes[].pr`, because it synchronizes the change pull requests before it decides - so those two outcomes leave whatever `delivery` the card already had, or none. See [the console reference](console.md) for every outcome and the event they are reported on.
+
 The card-level `agent` is kept for cards written before `changes` existed; when both are present the change's session wins. Cards without `changes` behave exactly as before.

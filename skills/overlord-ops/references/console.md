@@ -144,3 +144,59 @@ cd <project-directory>
 ```
 
 exit code: 配送した (`created` / `updated`) と配送するものが無かった (`skipped`) は 0、`blocked` と `failed` は 1、引数エラーは 2。
+
+## コンソールが自動で配送する
+
+コンソールのサーバーは、カードが 完成確認待ち (`acceptance`) から 完了 (`done`) へ移ったときに、上と同じ配送を自動で実行する（`console/src/server.ts` の deliver 節）。ユーザーが `change deliver` を打つ場面を無くすためのもので、実行するのは `deliverCard`、つまり上と同一の処理である。
+
+- **契機は 1 つだけ**: `PATCH /api/items/:id` が `state: "done"` を書き、かつ直前の状態が `acceptance` だったときに起動する。カードのモーダルの「受け入れて完了」がこの遷移を作る操作で、完成確認待ち 列から 完了 列へのドラッグも同じ PATCH になる。それ以外の列から 完了 列へドラッグした場合と、既に `done` のカードへの PATCH（2 回目のクリック、別のタブ）は board を書くだけで配送しない。
+- **PATCH は配送を待たない**: 配送は `git fetch` / `git push` と複数の `gh` 呼び出しを行い数秒かかる。サーバーは board を書いた時点で応答し、配送の結果はイベントストリームで報告する。git と `gh` の 1 コマンドあたりのタイムアウトは 120 秒。
+- **同一カードで多重起動しない**: そのカードの配送が走っている間に来た起動要求は、新しい実行を始めない。走っている実行が結果を報告する。リポジトリ単位の直列化は `deliverCard` 側にある。
+- **失敗してもカードは戻らない**: 配送が失敗してもカードは `done` のままで、失敗は `items[].delivery.error` に記録される。ブラウザを閉じた後やイベントストリームが切れた後でも、PR が作られなかった理由がカードに残る。`branch` / `base` / `pr` は今回分かった値と前回の記録で埋めるので、失敗が過去に記録した pull request を消すことはない。
+- **配送先が無いリポジトリは失敗ではない**: git リポジトリでない、またはリモートが無い場合は `skipped` (`no-repository` / `no-remote`) として報告する。それ以外の `git remote` の失敗は `failed`。
+
+### 配送のイベント（SSE）
+
+`/api/events` に `{"type":"delivery"}` フレームが流れる。カード ID は `card`。
+
+```json
+{"type":"delivery","card":"OV-105","status":"running"}
+{"type":"delivery","card":"OV-105","status":"created","pr":{"number":12,"url":"https://github.com/example/repo/pull/12","state":"open","head_sha":"...","reviewed_sha":null},"warnings":[]}
+```
+
+| `status` | 意味 | 一緒に来るもの |
+| --- | --- | --- |
+| `running` | 実行を開始した | なし（このフレームだけが `DeliverOutcome` ではない） |
+| `created` / `updated` | 成果 pull request がある | `pr` |
+| `skipped` | 配送するものが無い | `reason`: `no-diff` / `same-branch` / `no-remote` / `no-repository` |
+| `blocked` | 未マージの change が残っている | `unmerged`: `"<change-id>  <title>"` の配列 |
+| `failed` | git / `gh` / board のいずれかが失敗した | `reason`（同じ文字列が `delivery.error` にも入る） |
+
+`warnings`（実行を止めなかった問題）は `running` 以外のフレームに必ず配列で付く。`head` と `base` は、失敗したがブランチまでは解決できた実行に付く。
+
+`skipped` と `blocked` は `items[].delivery` を書かない（`blocked` は配送の手順 1 の同期で `changes[].pr` を書くことはある）。したがってこの 2 つの結果はこのフレームにしか残らない。コンソールの画面はフレームをカード単位で保持し、カードのモーダルの「成果の配送」に出す。
+
+### 手動で配送し直す
+
+```
+POST /api/items/:id/deliver
+```
+
+body は不要。応答は `{"ok":true,"card":"<id>","started":true}` で、`started` が `false` のときは「そのカードの配送が既に走っていた」ことを表す（要求自体は受け付けている）。
+
+- 自動の契機は `acceptance` -> `done` だけなので、既に `done` のカードを自動で配送し直すには、いったん 完成確認待ち へ戻してもう一度 完了 にするしかない。この endpoint は列を動かさずに同じ配送を実行する。失敗した配送からの復帰経路である。
+- カードの状態は問わない。`change deliver` と同じ扱いで、未マージの change が残っていれば `deliverCard` が `blocked` で拒否する。
+- 結果は上と同じ `delivery` フレームで届き、失敗は `delivery.error` に残る。
+- 404: 不明なカード、または board が見つからない。409: そのサーバーで配送が無効化されている。
+- 画面では、カードのモーダルの「成果の配送」に `配送をやり直す` として出る（配送が `failed` または `blocked` のときだけ）。
+
+### 配送を止める
+
+```bash
+/path/to/overlord/scripts/console.sh <project-directory> --no-deliver
+OVERLORD_DELIVER=0 /path/to/overlord/scripts/console.sh <project-directory>
+```
+
+`OVERLORD_DELIVER` は `0` / `false` / `off` / `no`（大文字小文字を問わない）で無効になる。起動時の 4 行目に `deliver on done   off` と出る。`console.sh ensure` は `--no-deliver` をサーバーへ渡さないので、そちらでは `OVERLORD_DELIVER` を使う（環境変数はサーバープロセスへ引き継がれる）。
+
+無効なサーバーでは、`acceptance` -> `done` で配送は起動せず、`POST /api/items/:id/deliver` は 409 と理由を返す。画面はこの応答をエラーとして表示する。
