@@ -25,7 +25,7 @@ Overlord は、Claude Code や Codex のコーディングエージェントを1
 
 - [Claude Code](https://claude.com/claude-code)（または Codex）
 - [Bun](https://bun.sh) — Overlord Console の実行に必要です
-- `git` と [GitHub CLI](https://cli.github.com/)（`gh`）— `scripts/change.sh` は `git` と `gh` を直接起動します（`start` / `pr` / `reviewed` / `sync` / `deliver` の5つすべて）。`start` は `git worktree add` と `git rev-parse`、`pr` は `git push` と `gh pr list` / `gh pr create` / `gh pr view`、`reviewed` は `git worktree list` と worktree での `git rev-parse HEAD`（worktree が残っていない場合は `gh pr view --json headRefOid`）、`sync` は `gh pr view`、`deliver` は `git fetch` / `git diff` と `gh repo view` / `gh pr view` / `gh pr create` / `gh pr edit` を使います。`gh auth login` で認証済みである必要があります。`change.sh` は司令塔が自動で実行するコマンドで、あなたが直接打つ場面はありません
+- `git` と [GitHub CLI](https://cli.github.com/)（`gh`）— `scripts/change.sh` は `git` と `gh` を直接起動します（`start` / `pr` / `reviewed` / `sync` / `merge` / `deliver` の6つすべて）。`start` は `git worktree add` と `git rev-parse`、`pr` は `git push` と `gh pr list` / `gh pr create` / `gh pr view`、`reviewed` は `git worktree list` と worktree での `git rev-parse HEAD`（worktree が残っていない場合は `gh pr view --json headRefOid`）、`sync` は `gh pr view`、`merge` は `git rev-parse` / `git symbolic-ref` と `gh pr view` / `gh repo view` / `gh pr merge`、`deliver` は `git fetch` / `git diff` と `gh repo view` / `gh pr view` / `gh pr create` / `gh pr edit` を使います。`gh auth login` で認証済みである必要があります。`change.sh` は司令塔が自動で実行するコマンドで、あなたが直接打つ場面はありません
 - [cmux](https://cmux.com/ja) — 複数の AI セッションを1画面のワークスペースとして扱う macOS 用のターミナルです。Overlord は司令塔セッションの画面の読み取りと入力の送信をこれ経由で行うため、司令塔サイドバーとカードの指示ボタンに必要です
 
 動作環境: コンソールとスキルは macOS 固有の処理を持たないため、Bun が動く環境（macOS / Linux）で動作します。cmux は macOS アプリで、コンソールは `cmux` コマンドが PATH に無いときは `/Applications/cmux.app/Contents/Resources/bin/cmux` を参照します。cmux が使えない環境でも、カンバンの閲覧・編集、「気づきを追加」、`scripts/change.sh` の各コマンドは動きます。使えないのは司令塔サイドバーとカードの指示ボタン、`console.sh --open`、および `console.sh ensure` による司令塔の自動登録です（`ensure` のそれ以外の処理は cmux が無くても動き、サーバーは detached プロセスとして起動して出力を `<プロジェクト>/.overlord/console.log` に書きます）。
@@ -96,7 +96,7 @@ board は3階層で構成され、**あなたが管理するのは一番上の�
 | **変更** | 1つの実装単位。1変更 = 1 worktree = 1 branch = 1 PR = 1 エージェント実行単位 | カード詳細の「変更（PR単位）」（読み取り専用） |
 | **タスク** | エージェント内部の手順 | 表示しない |
 
-1つの変更は PR 単位で進みます。`start`（worktree とブランチを作る）→ 実装 → `pr`（push して PR を作る）→ 別のAIによるレビュー → `reviewed`（レビューした commit を記録）→ マージ → `sync`（PR の状態を board に反映）。この各段階は `scripts/change.sh` が実行し、board への記録も合わせて行うため、手で書き換える必要はありません。レビュー済みの commit と PR の先頭が食い違うときは `sync` が警告を出します。その変更を完成確認待ちに上げないことは、スキルの規則として定めています。
+1つの変更は PR 単位で進みます。`start`（worktree とブランチを作る）→ 実装 → `pr`（push して PR を作る）→ 別のAIによるレビュー → `reviewed`（レビューした commit を記録）→ `merge`（レビュー済みかつ CI 成功かつ base が作業ブランチのときだけマージする）→ `sync`（PR の状態を board に反映）。この各段階は `scripts/change.sh` が実行し、board への記録も合わせて行うため、手で書き換える必要はありません。レビュー済みの commit と PR の先頭が食い違うときは `sync` が警告を出します。その変更を完成確認待ちに上げないことは、スキルの規則として定めています。
 
 作業が大きいときは**変更**に分割します。ファイル数が多い、バックエンドとフロントに分かれる、マイグレーションがある、PRを小さくしたい — これらはすべて変更への分割で解決し、**カードは増えません**。
 
@@ -290,6 +290,7 @@ board 自体を手で書きたい場合は、このリポジトリの `docs/prod
 - コンソールはあなたが見る画面であり、AIは常に `board.yaml` を読んで作業します。書き込みは楽観ロックで保護され、AIの更新が黙って上書きされることはありません
 - 実装したAIに自分の変更を最終確認させないため、独立レビューは別のサブエージェントが行います
 - main 向けのPR（カードの配送PR）は **merge commit** でマージします。squash と rebase は使いません
+- main / master へのマージは常にあなたが行います。AIは `scripts/change.sh merge` でしかマージできず、このコマンドは base が main / master / 既定ブランチのPRを必ず拒否します
 
 ### なぜ merge commit なのか
 
@@ -301,7 +302,7 @@ merge commit なら配送のたびに merge-base が前進するため、この�
 
 PR #10 の squash で生じた分岐は、PR #16 を merge commit でマージした時点で解消しました。
 
-この決まりは main 向けのPRについてのものです。変更（change）単位のPRは作業ブランチに向けたもので、ここでは対象外です。
+この決まりは main 向けのPRについてのものです。変更（change）単位のPRは作業ブランチに向けたもので、ここでは対象外です。なお `scripts/change.sh merge` は変更単位のPRも `gh pr merge --merge` でマージします。squash と rebase を選ぶ引数はありません。
 
 現在の設定は次で確認できます。
 

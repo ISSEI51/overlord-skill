@@ -15,6 +15,7 @@
  *   change pr       <change-id> [--board <path>] [--base <branch>] [--number <n>]
  *   change reviewed <change-id> [--board <path>] [--sha <sha>]
  *   change sync     [<card-id>] [--all] [--board <path>]
+ *   change merge    <change-id> [--board <path>]
  *   change deliver  <card-id> [--board <path>] [--base <branch>] [--head <branch>]
  */
 
@@ -1509,19 +1510,23 @@ export type DeliverOutcome = {
 };
 
 /**
- * The branch a delivery pull request merges into.
+ * The repository default branch, or null when neither source could name it.
  *
  * `origin/HEAD` is what the repository itself says the default branch is, so
  * it is asked first and costs no network call. It is a local symbolic ref that
  * only exists once something set it (`git clone` does, `git init` does not), so
- * GitHub is asked next, and `main` is the last resort rather than an error:
- * a wrong base is caught by the `baseRefName` check before anything is
- * written to the board.
+ * GitHub is asked next.
+ *
+ * Null is a real answer and not an error, because the two callers need
+ * different things from it: a delivery falls back to `main` and is caught by
+ * the `baseRefName` check if that guess was wrong, while `merge` refuses
+ * outright — it cannot tell whether a base is the default branch it must not
+ * merge into if nothing can name that branch.
  */
-export async function resolveDeliveryBase(
+export async function resolveDefaultBranch(
   root: string,
   timeoutMs?: number,
-): Promise<string> {
+): Promise<string | null> {
   const symbolic = await git(
     ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
     root,
@@ -1548,7 +1553,20 @@ export async function resolveDeliveryBase(
     if (typeof name === "string" && name.trim()) return name.trim();
   }
 
-  return "main";
+  return null;
+}
+
+/**
+ * The branch a delivery pull request merges into.
+ *
+ * `main` is the last resort rather than an error: a wrong base is caught by
+ * the `baseRefName` check before anything is written to the board.
+ */
+export async function resolveDeliveryBase(
+  root: string,
+  timeoutMs?: number,
+): Promise<string> {
+  return (await resolveDefaultBranch(root, timeoutMs)) ?? "main";
 }
 
 /**
@@ -2201,6 +2219,608 @@ export async function deliver(argv: string[]): Promise<number> {
 }
 
 // ---------------------------------------------------------------------------
+// merge
+// ---------------------------------------------------------------------------
+
+/**
+ * Branches a change pull request is never merged into by this command.
+ *
+ * `change merge` merges one change into the branch the card's work is being
+ * built on, which is another branch inside the repository. Merging into the
+ * default branch is a different act: it releases the card, it is what the
+ * card-level pull request `deliver` opens, and it stays the user's decision.
+ * The two are told apart by the base branch alone, so the base is what is
+ * guarded here.
+ *
+ * `main` and `master` are refused by name as well as through the repository
+ * default branch, so a repository that renamed its default branch cannot be
+ * released through the name it no longer uses either. The comparison ignores
+ * case, because a base that differs from `main` only in case is a typo far
+ * more often than it is a second branch.
+ */
+const PROTECTED_BASES = ["main", "master"];
+
+/** `gh pr view` fields the merge checks are made on. */
+export type MergeView = PullRequestView & {
+  baseRefName: string;
+  /** Every check GitHub reports for the pull request head; shape below. */
+  statusCheckRollup?: unknown;
+};
+
+const MERGE_VIEW_FIELDS =
+  "number,url,state,headRefOid,headRefName,baseRefName,statusCheckRollup";
+
+/** How many failing checks the refusal names before it counts the rest. */
+const MAX_NAMED_CHECKS = 5;
+
+/** What one entry of `statusCheckRollup` says about one check. */
+export type CheckOutcome = "passed" | "neutral" | "pending" | "failed";
+
+/**
+ * The state of the checks on a pull request head.
+ *
+ * `passed` counts only the checks that concluded successfully, so it is not
+ * `total` minus the failures: a check that was skipped or that reported a
+ * neutral conclusion is counted in `total` and in neither of the two.
+ */
+export type CiState = {
+  /** Every check GitHub reported. */
+  total: number;
+  /** Checks that concluded successfully. */
+  passed: number;
+  /** Why the pull request must not be merged, or null when the CI is green. */
+  reason: string | null;
+};
+
+/**
+ * The entries of `statusCheckRollup`, whichever shape `gh` returned.
+ *
+ * `gh pr view --json statusCheckRollup` returns a flat array; the same field
+ * read through the GraphQL connection is an object with a `nodes` array. Both
+ * are accepted so that the gate does not depend on which one the installed
+ * `gh` produces. Anything else - null for a pull request with no checks at
+ * all, or a shape neither of these - yields no entries, which the gate refuses
+ * as "no check has run" rather than passes.
+ */
+function rollupEntries(rollup: unknown): unknown[] {
+  if (Array.isArray(rollup)) return rollup;
+  if (rollup && typeof rollup === "object") {
+    const nodes = (rollup as { nodes?: unknown }).nodes;
+    if (Array.isArray(nodes)) return nodes;
+  }
+  return [];
+}
+
+/** The name to report a check by: a check run's, or a status context's. */
+function checkName(entry: Record<string, unknown>): string {
+  const name = entry.name ?? entry.context;
+  return typeof name === "string" && name.trim() ? name.trim() : "(unnamed)";
+}
+
+/**
+ * Read one rollup entry as one of four outcomes.
+ *
+ * The two entry types are read the way GitHub defines them:
+ *
+ *   - a `CheckRun` finishes when `status` is `COMPLETED`, and only then does
+ *     `conclusion` mean anything. `SUCCESS` passed; `SKIPPED` and `NEUTRAL`
+ *     neither passed nor failed, which is what a job that a workflow condition
+ *     turned off looks like; every other conclusion - `FAILURE`, `TIMED_OUT`,
+ *     `CANCELLED`, `ACTION_REQUIRED`, `STARTUP_FAILURE`, `STALE` - failed;
+ *   - a `StatusContext` carries `state` instead, with `PENDING` and `EXPECTED`
+ *     unfinished and `SUCCESS` the only passing value.
+ *
+ * An entry that says neither is read as `pending`: an unfinished check and an
+ * unreadable one both mean the CI has not been shown to be green, and this
+ * command refuses in both cases.
+ */
+export function checkOutcome(entry: unknown): CheckOutcome {
+  if (!entry || typeof entry !== "object") return "pending";
+  const node = entry as Record<string, unknown>;
+
+  const status = typeof node.status === "string" ? node.status.toUpperCase() : null;
+  if (status !== null && status !== "COMPLETED") return "pending";
+
+  const conclusion =
+    typeof node.conclusion === "string" ? node.conclusion.toUpperCase() : null;
+  if (conclusion !== null) {
+    if (conclusion === "SUCCESS") return "passed";
+    if (conclusion === "SKIPPED" || conclusion === "NEUTRAL") return "neutral";
+    return "failed";
+  }
+
+  const state = typeof node.state === "string" ? node.state.toUpperCase() : null;
+  if (state !== null) {
+    if (state === "SUCCESS") return "passed";
+    if (state === "PENDING" || state === "EXPECTED") return "pending";
+    return "failed";
+  }
+
+  return "pending";
+}
+
+/**
+ * Decide whether the CI on a pull request head allows a merge.
+ *
+ * Kept pure so the gate can be fixed by tests without reaching GitHub, and so
+ * the same reading is reported to the operator and used for the decision.
+ *
+ * A pull request with no check at all is refused rather than passed. "No check
+ * ran" and "every check passed" are indistinguishable to a rule that only
+ * looks for failures, and the first one is exactly what a pull request opened
+ * before the repository had CI looks like - pull request #24 of this
+ * repository was merged in that state. Treating it as unverified is the point
+ * of the gate.
+ *
+ * A run where every check was skipped is refused for the same reason: nothing
+ * was verified, so `passed` has to be at least one.
+ */
+export function checkRollup(rollup: unknown): CiState {
+  const entries = rollupEntries(rollup);
+  const failed: string[] = [];
+  const pending: string[] = [];
+  let passed = 0;
+
+  for (const entry of entries) {
+    const outcome = checkOutcome(entry);
+    const name = checkName((entry ?? {}) as Record<string, unknown>);
+    if (outcome === "passed") passed += 1;
+    else if (outcome === "failed") failed.push(name);
+    else if (outcome === "pending") pending.push(name);
+  }
+
+  const total = entries.length;
+  const state: CiState = { total, passed, reason: null };
+
+  if (total === 0) {
+    state.reason =
+      "no check has run on this pull request, so its CI has not been shown " +
+      "to pass; a pull request without CI is not merged by this command";
+    return state;
+  }
+  if (failed.length > 0) {
+    state.reason = `${failed.length} of ${total} checks did not pass: ${nameList(failed)}`;
+    return state;
+  }
+  if (pending.length > 0) {
+    state.reason = `${pending.length} of ${total} checks have not finished: ${nameList(pending)}`;
+    return state;
+  }
+  if (passed === 0) {
+    state.reason =
+      `none of the ${total} checks concluded successfully (every one was ` +
+      "skipped or neutral), so the CI has not been shown to pass";
+    return state;
+  }
+  return state;
+}
+
+/** At most `MAX_NAMED_CHECKS` names, with the rest counted. */
+function nameList(names: string[]): string {
+  const rest = names.length - MAX_NAMED_CHECKS;
+  const head = names.slice(0, MAX_NAMED_CHECKS).join(", ");
+  return rest > 0 ? `${head}, and ${rest} more` : head;
+}
+
+/** One line describing what the checks said, for the command's output. */
+export function checkSummary(checks: CiState): string {
+  if (checks.total === 0) return "none have run";
+  return `${checks.passed} of ${checks.total} passed`;
+}
+
+/** What `mergeRefusal` is asked about. */
+export type MergeCandidate = {
+  changeId: string;
+  /** `changes[].branch`, the branch the board records for this change. */
+  branch: string | null | undefined;
+  /** `changes[].pr.reviewed_sha`, as the board records it. */
+  reviewedSha: string | null | undefined;
+  /** The pull request as GitHub reports it now. */
+  view: MergeView;
+  /** The repository default branch, or null when it could not be named. */
+  defaultBranch: string | null;
+  /** The reading of `view.statusCheckRollup`. */
+  checks: CiState;
+};
+
+/**
+ * Why this pull request must not be merged, or null when every gate passed.
+ *
+ * The whole merge decision, as one pure function, so that every gate can be
+ * fixed by a test without reaching GitHub and so that no caller can merge
+ * while skipping one. There is deliberately no argument and no environment
+ * variable that relaxes any of them: a merge this refuses is a merge a person
+ * performs.
+ *
+ * The gates, in the order they are reported:
+ *
+ *  1. the base branch. Checked first because it separates the two kinds of
+ *     pull request - a change pull request between branches of the repository,
+ *     and the card-level delivery pull request that releases work to the
+ *     default branch - and only the first kind is this command's to merge;
+ *  2. the head branch is the one the board records for the change, the same
+ *     check `pr --number` and `sync` make. Without it a wrong `pr.number`
+ *     merges somebody else's pull request;
+ *  3. the pull request is open. A merged or closed one has nothing to merge;
+ *  4. the review. `reviewed_sha` is written by the independent reviewer, so a
+ *     change without one has not been reviewed at all, and one that does not
+ *     name the pull request head carries commits no review has read;
+ *  5. the CI, as `checkRollup` read it.
+ */
+export function mergeRefusal(candidate: MergeCandidate): string | null {
+  const { changeId, branch, reviewedSha, view, defaultBranch, checks } = candidate;
+  const number = view.number;
+  const base = typeof view.baseRefName === "string" ? view.baseRefName.trim() : "";
+  const head = typeof view.headRefName === "string" ? view.headRefName : "";
+
+  // 1. base branch.
+  if (!base) {
+    return (
+      `pull request #${number} does not name a base branch, so whether it ` +
+      "merges into the repository default branch cannot be decided"
+    );
+  }
+  if (PROTECTED_BASES.includes(base.toLowerCase())) {
+    return (
+      `pull request #${number} merges into "${base}". A pull request whose ` +
+      "base is main or master releases the work, and that merge is the " +
+      "user's to perform; this command only merges a change into the branch " +
+      "the card is built on"
+    );
+  }
+  if (defaultBranch === null) {
+    return (
+      "the repository default branch could not be determined, so whether " +
+      `pull request #${number} merges into it cannot be decided`
+    );
+  }
+  if (base.toLowerCase() === defaultBranch.trim().toLowerCase()) {
+    return (
+      `pull request #${number} merges into "${base}", the repository default ` +
+      "branch. Merging into the default branch releases the work and is the " +
+      "user's to perform"
+    );
+  }
+
+  // 2. head branch.
+  if (!branch) {
+    return (
+      `change ${changeId} has no branch on the board, so pull request ` +
+      `#${number} cannot be checked against it`
+    );
+  }
+  if (head !== branch) {
+    return (
+      `pull request #${number} is on branch "${head || "(unknown)"}", not ` +
+      `the branch recorded for ${changeId} ("${branch}")`
+    );
+  }
+
+  // 3. pull request state.
+  const state = normalizePrState(view.state);
+  if (state !== "open") {
+    return (
+      `pull request #${number} is ${state ?? "in an unknown state"}, not ` +
+      "open, so there is nothing to merge"
+    );
+  }
+
+  // 4. review.
+  const headSha = typeof view.headRefOid === "string" ? view.headRefOid : "";
+  if (!headSha) {
+    return `the head commit of pull request #${number} could not be read`;
+  }
+  if (!reviewedSha) {
+    return (
+      `change ${changeId} has no reviewed_sha on the board, so no independent ` +
+      `review has been recorded for it; run "change reviewed ${changeId}" ` +
+      "after the review concludes"
+    );
+  }
+  if (!sameCommit(headSha, reviewedSha)) {
+    return (
+      `commits were added after the review of ${changeId} (reviewed ` +
+      `${reviewedSha}, head ${headSha}); review the new commits and record ` +
+      `them with "change reviewed ${changeId}"`
+    );
+  }
+
+  // 5. CI.
+  if (checks.reason) {
+    return `pull request #${number}: ${checks.reason}`;
+  }
+
+  return null;
+}
+
+export type MergeOptions = {
+  boardPath: string;
+  changeId: string;
+  /** Directory to resolve the repository from; the process cwd by default. */
+  cwd?: string;
+  /** Per-command timeout for every git and `gh` call. */
+  timeoutMs?: number;
+};
+
+/** The pull request as the gates saw it, for the command's output. */
+export type MergeCheckedPullRequest = {
+  number: number;
+  state: string | null;
+  head: string;
+  base: string;
+  reviewedSha: string | null;
+  checks: CiState;
+};
+
+export type MergeOutcome = {
+  /**
+   * `refused` is a gate saying no: nothing was merged and nothing was written.
+   * `failed` is a git, `gh` or board step that did not complete.
+   */
+  status: "merged" | "refused" | "failed";
+  /** Why the run ended this way; absent on a plain success. */
+  reason?: string;
+  /** What the gates were given, when the run got as far as reading them. */
+  checked?: MergeCheckedPullRequest;
+  /** The pull request record written to the board, on a merge. */
+  pr?: PullRequest;
+  /** The change state after the board write. */
+  changeState?: State;
+  /** Non-fatal problems: the run continued in spite of them. */
+  warnings: string[];
+};
+
+/**
+ * Merge one change pull request into its own base branch and record it.
+ *
+ * Writes nothing to stdout or stderr: everything it did is in the returned
+ * `MergeOutcome`, the same way `deliverCard` reports itself, so the CLI
+ * wrapper owns the output.
+ *
+ * The order of the steps is the point of the command:
+ *
+ *  1. the pull request is read from GitHub, never from the board, so every
+ *     gate is decided on what is true now;
+ *  2. `mergeRefusal` decides. A refusal returns before `gh pr merge` is
+ *     called, so a refused run leaves GitHub and `board.yaml` both untouched;
+ *  3. the merge is a merge commit (`--merge`). Squash and rebase are not used
+ *     and cannot be selected: a squash does not advance the merge base, which
+ *     made later pull requests conflict on the same lines (README, "なぜ merge
+ *     commit なのか");
+ *  4. the board is written from a second `gh pr view`, through
+ *     `applyPullRequestView` - the function `sync` writes with - so a merge
+ *     records exactly what a later `sync` would have recorded, and `done` has
+ *     one writer rather than two.
+ */
+export async function mergeChange(
+  options: MergeOptions,
+): Promise<MergeOutcome> {
+  const { boardPath, changeId, cwd, timeoutMs } = options;
+  const warnings: string[] = [];
+
+  const loaded = await loadBoard(boardPath);
+  if (!loaded.exists) {
+    return { status: "failed", reason: `board not found: ${boardPath}`, warnings };
+  }
+  const found = findChange(loaded.board, changeId);
+  if (!found) {
+    return {
+      status: "failed",
+      reason: `unknown change id: ${changeId} (board: ${boardPath})`,
+      warnings,
+    };
+  }
+
+  const number = found.change.pr?.number;
+  if (typeof number !== "number") {
+    return {
+      status: "failed",
+      reason:
+        `change ${changeId} has no pull request on the board; ` +
+        `run "change pr ${changeId}" first.`,
+      warnings,
+    };
+  }
+
+  let root: string;
+  try {
+    root = await mainRepoRoot(cwd, timeoutMs);
+  } catch (error) {
+    return {
+      status: "failed",
+      reason: `could not resolve the repository root: ${(error as Error).message}`,
+      warnings,
+    };
+  }
+
+  const viewed = await gh(
+    ["pr", "view", String(number), "--json", MERGE_VIEW_FIELDS],
+    root,
+    timeoutMs,
+  );
+  if (viewed.code !== 0) {
+    return {
+      status: "failed",
+      reason: `gh pr view ${number} failed: ${failureMessage(viewed)}`,
+      warnings,
+    };
+  }
+  const view = parseJson<MergeView>(viewed.stdout);
+  if (!view || typeof view.number !== "number") {
+    return {
+      status: "failed",
+      reason: `could not read: gh pr view ${number}`,
+      warnings,
+    };
+  }
+
+  const defaultBranch = await resolveDefaultBranch(root, timeoutMs);
+  const checks = checkRollup(view.statusCheckRollup);
+  const checked: MergeCheckedPullRequest = {
+    number: view.number,
+    state: normalizePrState(view.state),
+    head: typeof view.headRefName === "string" ? view.headRefName : "",
+    base: typeof view.baseRefName === "string" ? view.baseRefName : "",
+    reviewedSha: found.change.pr?.reviewed_sha ?? null,
+    checks,
+  };
+
+  const refusal = mergeRefusal({
+    changeId,
+    branch: found.change.branch,
+    reviewedSha: found.change.pr?.reviewed_sha,
+    view,
+    defaultBranch,
+    checks,
+  });
+  if (refusal) {
+    return {
+      status: "refused",
+      reason:
+        `${refusal}.\nNothing was merged and nothing was written to ${boardPath}.`,
+      checked,
+      warnings,
+    };
+  }
+
+  const merged = await gh(
+    ["pr", "merge", String(view.number), "--merge"],
+    root,
+    timeoutMs,
+  );
+  if (merged.code !== 0) {
+    return {
+      status: "failed",
+      reason:
+        `gh pr merge ${view.number} --merge failed: ${failureMessage(merged)}`,
+      checked,
+      warnings,
+    };
+  }
+
+  // Read back rather than assume: the board records the pull request GitHub
+  // reports after the merge, which is also what a later `sync` would record.
+  const after = await gh(
+    ["pr", "view", String(view.number), "--json", PR_VIEW_FIELDS],
+    root,
+    timeoutMs,
+  );
+  const unrecorded = (detail: string): MergeOutcome => ({
+    status: "failed",
+    reason:
+      `pull request #${view.number} was merged, but ${detail}, so ` +
+      `${boardPath} still shows the change as it was. Run ` +
+      `"change sync ${found.item.id}" to record it.`,
+    checked,
+    warnings,
+  });
+  if (after.code !== 0) {
+    return unrecorded(`gh pr view ${view.number} failed: ${failureMessage(after)}`);
+  }
+  const afterView = parseJson<PullRequestView>(after.stdout);
+  if (!afterView || typeof afterView.number !== "number") {
+    return unrecorded(`gh pr view ${view.number} could not be read`);
+  }
+  if (afterView.headRefName !== found.change.branch) {
+    return unrecorded(
+      `it is now reported on branch "${afterView.headRefName ?? "(unknown)"}" ` +
+        `rather than "${found.change.branch}"`,
+    );
+  }
+
+  let written: Change;
+  try {
+    written = await updateChange(boardPath, changeId, (change) => {
+      applyPullRequestView(change, afterView);
+    });
+  } catch (error) {
+    return unrecorded(`writing the board failed: ${(error as Error).message}`);
+  }
+
+  const pullRequest = written.pr ?? undefined;
+  if (written.state !== "done") {
+    return {
+      status: "failed",
+      reason:
+        `pull request #${view.number} was merged, but GitHub still reports ` +
+        `it as ${normalizePrState(afterView.state) ?? "unknown"}, so ` +
+        `${changeId} was not moved to done. Run ` +
+        `"change sync ${found.item.id}" once GitHub reports the merge.`,
+      checked,
+      ...(pullRequest ? { pr: pullRequest } : {}),
+      changeState: written.state,
+      warnings,
+    };
+  }
+
+  return {
+    status: "merged",
+    checked,
+    ...(pullRequest ? { pr: pullRequest } : {}),
+    changeState: written.state,
+    warnings,
+  };
+}
+
+/**
+ * CLI wrapper around `mergeChange`: it only formats the outcome.
+ *
+ * `--board` is the only option it takes. Every other option is a usage error
+ * rather than an ignored argument, so that a `--force`, a `--base` or an
+ * `--admin` copied from `gh` fails loudly instead of looking as though it
+ * relaxed a gate that it did not.
+ */
+export async function merge(argv: string[]): Promise<number> {
+  const { positional, options } = parseArgs(argv);
+  const changeId = positional[0];
+  if (!changeId) {
+    process.stderr.write("usage: change merge <change-id> [--board <path>]\n");
+    return 2;
+  }
+
+  const unknown = Object.keys(options).filter((name) => name !== "board");
+  if (unknown.length > 0) {
+    process.stderr.write(
+      `change merge takes no option other than --board: ` +
+        `${unknown.map((name) => `--${name}`).join(", ")}\n` +
+        "The base, review and CI checks cannot be turned off.\n",
+    );
+    return 2;
+  }
+
+  const boardPath = resolveBoardPath(options.board);
+  const outcome = await mergeChange({ boardPath, changeId });
+
+  process.stdout.write(`change:           ${changeId}\n`);
+  const checked = outcome.checked;
+  if (checked) {
+    process.stdout.write(
+      `pull request:     #${checked.number} (${checked.state ?? "unknown"})\n`,
+    );
+    process.stdout.write(`head branch:      ${checked.head || "(unknown)"}\n`);
+    process.stdout.write(`base branch:      ${checked.base || "(unknown)"}\n`);
+    process.stdout.write(
+      `reviewed commit:  ${checked.reviewedSha ?? "(not recorded)"}\n`,
+    );
+    process.stdout.write(`checks:           ${checkSummary(checked.checks)}\n`);
+  }
+  if (outcome.status === "merged") {
+    process.stdout.write(
+      `merged:           #${outcome.pr?.number ?? checked?.number} with a merge commit\n`,
+    );
+    process.stdout.write(`change state:     ${outcome.changeState}\n`);
+    process.stdout.write(`board updated:    ${boardPath}\n`);
+  }
+
+  for (const warning of outcome.warnings) process.stderr.write(`${warning}\n`);
+  if (outcome.reason) process.stderr.write(`${outcome.reason}\n`);
+
+  if (outcome.status !== "merged") return 1;
+  if (outcome.pr?.url) process.stdout.write(`${outcome.pr.url}\n`);
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
 
@@ -2217,6 +2837,14 @@ commands:
   sync [<card-id>]    read the pull request state of every recorded change of
                       one card, or of the whole board with --all, and write it
                       back in a single board write
+  merge <change-id>   merge the change pull request into its own base branch
+                      with a merge commit, after checking that the base is not
+                      main, master or the repository default branch, that the
+                      pull request is the change's own and still open, that its
+                      head is the reviewed commit, and that its CI passed, then
+                      record the merge on the board. There is no option and no
+                      environment variable that skips any of those checks: a
+                      merge this refuses is a merge the user performs
   deliver <card-id>   synchronize the card's changes, then open (or update) the
                       pull request that merges the finished card into the
                       repository default branch, and record it in the card's
@@ -2235,6 +2863,8 @@ options:
   --sha <sha>         reviewed only: the reviewed commit, instead of the
                       worktree HEAD or the pull request head
   --all               sync only: every card on the board instead of one card
+
+merge takes only <change-id> and --board; any other option is a usage error.
 `;
 
 export async function main(argv: string[]): Promise<number> {
@@ -2243,6 +2873,7 @@ export async function main(argv: string[]): Promise<number> {
   if (command === "pr") return pr(argv.slice(1));
   if (command === "reviewed") return reviewed(argv.slice(1));
   if (command === "sync") return sync(argv.slice(1));
+  if (command === "merge") return merge(argv.slice(1));
   if (command === "deliver") return deliver(argv.slice(1));
   if (command === undefined || command === "--help" || command === "-h") {
     process.stdout.write(USAGE);
