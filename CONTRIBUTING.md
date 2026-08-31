@@ -42,8 +42,11 @@ The same commands without `just`:
 # server-side tests (board read/write, change.ts)
 cd console && bun test
 
-# run the console against any project directory
+# run the console against any project directory, in the foreground
 ./scripts/console.sh /path/to/project --port 7400
+
+# or bring one up idempotently and get the terminal back
+./scripts/console.sh ensure /path/to/project --port 7400
 
 # frontend: install deps once, then typecheck or rebuild
 cd console/frontend && bun install
