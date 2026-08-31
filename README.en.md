@@ -30,7 +30,7 @@ You need:
 - `git` and the [GitHub CLI](https://cli.github.com/) (`gh`) — `scripts/change.sh` invokes `git` and `gh` directly, in all five subcommands (`start`, `pr`, `reviewed`, `sync`, `deliver`): `start` runs `git worktree add` and `git rev-parse`; `pr` runs `git push` plus `gh pr list` / `gh pr create` / `gh pr view`; `reviewed` runs `git worktree list` and `git rev-parse HEAD` inside the worktree, falling back to `gh pr view --json headRefOid` when the worktree is gone; `sync` runs `gh pr view`; `deliver` runs `git fetch` / `git diff` plus `gh repo view` / `gh pr view` / `gh pr create` / `gh pr edit`. So `gh` has to be authenticated with `gh auth login`. The commander runs `change.sh` for you — there is no point where you type it yourself
 - [cmux](https://cmux.com/) — a macOS terminal that holds several AI sessions as workspaces on one screen. Overlord reads the commander session's screen and sends its input through cmux, which is why it is required for the commander sidebar and the card instruction buttons
 
-Platform: the console and the skills contain no macOS-specific code, so they run anywhere Bun runs (macOS and Linux). cmux is a macOS app; when `cmux` is not on `PATH` the console falls back to `/Applications/cmux.app/Contents/Resources/bin/cmux`. Without cmux you can still browse and edit the kanban, add observations, and run every `scripts/change.sh` command. What you lose is the commander sidebar, the card instruction buttons, and `console.sh --open`.
+Platform: the console and the skills contain no macOS-specific code, so they run anywhere Bun runs (macOS and Linux). cmux is a macOS app; when `cmux` is not on `PATH` the console falls back to `/Applications/cmux.app/Contents/Resources/bin/cmux`. Without cmux you can still browse and edit the kanban, add observations, and run every `scripts/change.sh` command. What you lose is the commander sidebar, the card instruction buttons, `console.sh --open`, and the automatic commander registration `console.sh ensure` performs (everything else `ensure` does works without cmux: the server is started as a detached process with its output in `<project>/.overlord/console.log`).
 
 Overlord is two things: **five skills** the AI reads, and the **console** you look at (the screenshot above). Step 1 installs the skills, step 2 starts the console.
 
@@ -45,12 +45,25 @@ Overlord is two things: **five skills** the AI reads, and the **console** you lo
 2. **Start the console against the project you want to manage**
 
    ```bash
-   ./scripts/console.sh ~/dev/your-project
+   ./scripts/console.sh ensure ~/dev/your-project
    ```
 
-   It prints the address it listens on (`http://127.0.0.1:7377` by default). Open it in a browser.
+   One command does the whole setup: it creates `docs/product-ops/board.yaml` when there is none, starts the server unless a console is already serving that board, and — when you run it from a cmux session — registers that session as the commander. It prints lines like these:
 
-3. **Set up the commander** — in the right sidebar (open on first launch; the top-bar icon or **⌘B**, Ctrl+B on Linux, toggles it), press "司令塔を新しく起動" (start a new commander), enter the project directory, and press start. The console creates a cmux workspace running Claude Code, records it as the commander, and pre-fills the composer with the first instruction. Press send: the commander reads `docs/product-ops/board.yaml` (creating it if it does not exist) and reports today's status.
+   ```text
+   board:            /Users/example/dev/your-project/docs/product-ops/board.yaml
+   console:          http://127.0.0.1:7377
+   board file:       created
+   server:           started, cmux workspace workspace:48
+   stop:             close the cmux workspace workspace:48, or: kill $(lsof -ti tcp:7377 -sTCP:LISTEN)
+   commander:        registered, surface 22222222-2222-2222-2222-222222222222
+   ```
+
+   **Open the address on the `console:` line in a browser.** `ensure` does not open one for you.
+
+   `ensure` is idempotent: when a console is already serving that board it starts no second server (`server: already running, nothing started`) and just prints the address and how to stop it, so running it again is harmless. It still prints a `commander:` line — `unchanged, …` when you run it from the session that is already the commander, leaving `board.yaml` untouched; run it from a different cmux session and that session takes the commander role over. Use `--port 7400` for a different port. **When the port is already serving another project's board, it exits 1 without touching that console and asks you to pick another port.**
+
+3. **Set up the commander** — if you ran step 2 from a cmux session, the `commander:` line reads `registered, surface …` and that session is already the commander. If it reads `not registered, …` (cmux is not reachable, or the command was not run inside a cmux session), use the right sidebar instead (open on first launch; the top-bar icon or **⌘B**, Ctrl+B on Linux, toggles it): press "司令塔を新しく起動" (start a new commander), enter the project directory, and press start. The console creates a cmux workspace running Claude Code, records it as the commander, and pre-fills the composer with the first instruction. Press send: the commander reads `docs/product-ops/board.yaml` (creating it if it does not exist) and reports today's status.
 
 4. **Try one item** — press "気づきを追加" (add an observation) in the top bar and write one line; a card appears in the inbox. Open the card and press "進める" (advance), and the commander assigns the step that card's state calls for to a subagent.
 
@@ -205,10 +218,42 @@ Requires [Bun](https://bun.sh). A prebuilt frontend is included, so it runs as i
 
 ```bash
 brew install oven-sh/bun/bun     # if not installed yet
-/path/to/overlord/scripts/console.sh ~/dev/your-project
+/path/to/overlord/scripts/console.sh ensure ~/dev/your-project
 ```
 
-Opens at `http://127.0.0.1:7377`. Use `--port 7400` to change the port, `--open` to open it in a cmux browser pane.
+There are two ways to start it, and both run the same server.
+
+| Form | When to use it | Behavior |
+| --- | --- | --- |
+| `console.sh ensure [<project>] [--port 7400] [--open]` | the commander's entry point; you can type it yourself too | Idempotent. Creates the board if it is missing, starts the server only if nothing is serving that board yet, and registers the commander when run from a cmux session. The server runs in a cmux workspace (a detached process without cmux), so the terminal you ran it from is free again |
+| `console.sh <project> [--port 7400] [--open]` | starting a console yourself with a port or a browser pane you choose | Runs the server in the foreground; closing that terminal stops the console |
+
+Both take the same arguments in the same places. Omit the project to use the current directory; a path to a `board.yaml` also works. `--port 7400` changes the port (the default is `$OVERLORD_PORT`, then 7377), and `--open` shows the console in a cmux browser pane — it does not open your own browser.
+
+What `ensure` prints:
+
+| Line | Meaning |
+| --- | --- |
+| `board` | the board file it resolved; `<project>/docs/product-ops/board.yaml` when you passed a directory |
+| `console` | the address to open in a browser |
+| `board file` | `created` or `already present`; printed only on the run that starts a server |
+| `server` | `already running, nothing started`, or `started,` followed by `cmux workspace <ref>` or `detached process <pid>, log: <path>` |
+| `stop` | how to stop that console: close the cmux workspace, or `kill $(lsof -ti tcp:<port> -sTCP:LISTEN)` |
+| `commander` | `registered, surface <id>` / `unchanged, this session is already the commander (surface <id>)` / `not registered, …` with the reason |
+
+Two further labels show up only on their own path: `cmux` when creating the workspace failed and the console is started detached instead, and `open` when `--open` was passed and the cmux browser pane could not be opened.
+
+`ensure` exits 1 without starting anything — and without creating the board file — in three cases:
+
+- the project directory does not exist (`ensure` creates the board file, not the project)
+- the port is serving another project's board
+- the port is held by a process that is not an Overlord console
+
+For the two port cases, pass `--port` with a free port rather than stopping whatever holds it.
+
+Separately, it also exits 1 when the server it started does not answer `/api/state` within 30 seconds. That path has already started the server, so the `server:` and `stop:` lines are printed and the process is left running: stop it as the `stop:` line says, then read `.overlord/console.log` (or the cmux workspace, when it was started there).
+
+Without cmux the `commander` line reads `not registered, cmux is not reachable`, followed by a line pointing at the sidebar. The board and the server still come up, and the exit code is 0.
 
 After changing the frontend, install its dependencies with `cd console/frontend && bun install`, then regenerate `console/public` with `cd console && bun run build`.
 
@@ -226,7 +271,7 @@ then create docs/product-ops/board.yaml.
 Give me at most three decisions to make first.
 ```
 
-Start the console in another terminal and register that session as the commander from the sidebar's "変更" (change) button. A session can also write its own IDs to the board's `commander` field after reading them with `cmux identify --json --id-format both`.
+If no console is running yet, run `/path/to/overlord/scripts/console.sh ensure .` from that same Claude Code session: it starts the console and, when that session runs inside cmux, registers it as the commander in one step. If you started the console in another terminal instead, register that session as the commander from the sidebar's "変更" (change) button. A session can also write its own IDs to the board's `commander` field after reading them with `cmux identify --json --id-format both`.
 
 To write the board yourself instead, copy this repository's `docs/product-ops/board.example.yaml` to `docs/product-ops/board.yaml` in the target repository and start from there. Its contents are invented, so replace `items` with your own cards; the schema is documented in `skills/overlord-ops/references/board-schema.md`.
 
@@ -244,7 +289,7 @@ For the repository's merge-method setting, see [Why merge commits](#why-merge-co
 ## Operating rules
 
 - At most three cards in implementation at once; around ten active items total (the top bar warns when exceeded)
-- One `board.yaml` per repository; run one console per repo (on different ports) for multi-repo work
+- One `board.yaml` per repository; run one console per repo on its own port for multi-repo work (`console.sh ensure <project> --port <port>`; given a port another board already serves, `ensure` stops rather than taking it over)
 - The console is your view; the AI always works from `board.yaml`. Writes are protected by optimistic locking, so the AI's updates are never silently overwritten
 - Independent review is done by a different subagent from the one that implemented, so no AI reviews its own change
 - Pull requests targeting `main` (a card's delivery PR) are merged with a **merge commit**. Squash and rebase are not used

@@ -28,7 +28,7 @@ Overlord は、Claude Code や Codex のコーディングエージェントを1
 - `git` と [GitHub CLI](https://cli.github.com/)（`gh`）— `scripts/change.sh` は `git` と `gh` を直接起動します（`start` / `pr` / `reviewed` / `sync` / `deliver` の5つすべて）。`start` は `git worktree add` と `git rev-parse`、`pr` は `git push` と `gh pr list` / `gh pr create` / `gh pr view`、`reviewed` は `git worktree list` と worktree での `git rev-parse HEAD`（worktree が残っていない場合は `gh pr view --json headRefOid`）、`sync` は `gh pr view`、`deliver` は `git fetch` / `git diff` と `gh repo view` / `gh pr view` / `gh pr create` / `gh pr edit` を使います。`gh auth login` で認証済みである必要があります。`change.sh` は司令塔が自動で実行するコマンドで、あなたが直接打つ場面はありません
 - [cmux](https://cmux.com/ja) — 複数の AI セッションを1画面のワークスペースとして扱う macOS 用のターミナルです。Overlord は司令塔セッションの画面の読み取りと入力の送信をこれ経由で行うため、司令塔サイドバーとカードの指示ボタンに必要です
 
-動作環境: コンソールとスキルは macOS 固有の処理を持たないため、Bun が動く環境（macOS / Linux）で動作します。cmux は macOS アプリで、コンソールは `cmux` コマンドが PATH に無いときは `/Applications/cmux.app/Contents/Resources/bin/cmux` を参照します。cmux が使えない環境でも、カンバンの閲覧・編集、「気づきを追加」、`scripts/change.sh` の各コマンドは動きます。使えないのは司令塔サイドバーとカードの指示ボタン、および `console.sh --open` です。
+動作環境: コンソールとスキルは macOS 固有の処理を持たないため、Bun が動く環境（macOS / Linux）で動作します。cmux は macOS アプリで、コンソールは `cmux` コマンドが PATH に無いときは `/Applications/cmux.app/Contents/Resources/bin/cmux` を参照します。cmux が使えない環境でも、カンバンの閲覧・編集、「気づきを追加」、`scripts/change.sh` の各コマンドは動きます。使えないのは司令塔サイドバーとカードの指示ボタン、`console.sh --open`、および `console.sh ensure` による司令塔の自動登録です（`ensure` のそれ以外の処理は cmux が無くても動き、サーバーは detached プロセスとして起動して出力を `<プロジェクト>/.overlord/console.log` に書きます）。
 
 Overlord は、AI が読む**スキル5件**と、あなたが見る**コンソール**（上のスクリーンショットの画面）の2つで構成されます。手順1でスキルを、手順2でコンソールを用意します。
 
@@ -43,12 +43,25 @@ Overlord は、AI が読む**スキル5件**と、あなたが見る**コンソ�
 2. **管理したいプロジェクトを指定してコンソールを起動する**
 
    ```bash
-   ./scripts/console.sh ~/dev/your-project
+   ./scripts/console.sh ensure ~/dev/your-project
    ```
 
-   起動すると待ち受けアドレス（既定は `http://127.0.0.1:7377`）が表示されます。ブラウザで開いてください。
+   `ensure` は1コマンドで、`docs/product-ops/board.yaml` が無ければ作り、そのボードを配信しているコンソールがまだ無ければサーバーを起動し、cmux のセッションから実行した場合はそのセッションを司令塔として登録します。次のような行が表示されます。
 
-3. **司令塔を用意する** — 画面右のサイドバー（初回は開いています。閉じているときはトップバーのアイコンまたは **⌘B**（Linux では Ctrl+B）で開きます）で「司令塔を新しく起動」を押し、対象プロジェクトのディレクトリを入力して「起動」。Claude Code が動く cmux ワークスペースが作られ、司令塔として登録され、入力欄に最初の指示が入ります。そのまま「送信」を押すと、司令塔が `docs/product-ops/board.yaml` を読み（無ければ作り）、今日の状況を返します。
+   ```text
+   board:            /Users/example/dev/your-project/docs/product-ops/board.yaml
+   console:          http://127.0.0.1:7377
+   board file:       created
+   server:           started, cmux workspace workspace:48
+   stop:             close the cmux workspace workspace:48, or: kill $(lsof -ti tcp:7377 -sTCP:LISTEN)
+   commander:        registered, surface 22222222-2222-2222-2222-222222222222
+   ```
+
+   **`console:` に出たアドレスをブラウザで開いてください。** `ensure` はブラウザを開きません。
+
+   `ensure` は冪等です。同じボードのコンソールが既に動いていれば、サーバーは起動せず（`server: already running, nothing started`）アドレスと止め方を出すだけなので、何度実行しても構いません（このとき `commander:` の行も出ます。同じセッションから実行した場合は `unchanged, ...` となり `board.yaml` は書き換わりません。別の cmux セッションから実行した場合は、そのセッションが司令塔として登録し直されます）。ポートは `--port 7400` で変えられます。**別のプロジェクトのボードが同じポートを使っている場合は、そのコンソールを止めずに終了し（exit 1）、別のポートを指定するよう促します。**
+
+3. **司令塔を用意する** — cmux のセッションから手順2を実行した場合は、`commander:` 行が `registered, surface ...` になり、そのセッションが司令塔として登録済みです。`not registered, ...` と出た場合（cmux が使えない、または cmux のセッション内で実行していない場合）は、画面右のサイドバー（初回は開いています。閉じているときはトップバーのアイコンまたは **⌘B**（Linux では Ctrl+B）で開きます）で「司令塔を新しく起動」を押し、対象プロジェクトのディレクトリを入力して「起動」。Claude Code が動く cmux ワークスペースが作られ、司令塔として登録され、入力欄に最初の指示が入ります。そのまま「送信」を押すと、司令塔が `docs/product-ops/board.yaml` を読み（無ければ作り）、今日の状況を返します。
 
 4. **1件試す** — トップバーの「気づきを追加」で気づきを1行書くと、受信箱にカードができます。カードを開いて「進める」を押すと、司令塔がそのカードの状態に必要な作業をサブエージェントに割り当てます。
 
@@ -202,10 +215,42 @@ rm -rf ~/.codex/skills/product-ops \
 
 ```bash
 brew install oven-sh/bun/bun     # まだ入っていない場合
-/path/to/overlord/scripts/console.sh ~/dev/your-project
+/path/to/overlord/scripts/console.sh ensure ~/dev/your-project
 ```
 
-`http://127.0.0.1:7377` で開きます。ポートは `--port 7400`、cmux のブラウザペインで開くなら `--open` を付けます。
+起動方法は2通りあり、どちらも同じサーバーを起動します。
+
+| 形 | 使う場面 | 挙動 |
+| --- | --- | --- |
+| `console.sh ensure [<プロジェクト>] [--port 7400] [--open]` | 司令塔が使う入口。あなたが手で打ってもよい | 冪等。ボードが無ければ作り、まだ起動していなければサーバーを起動し、cmux のセッションから実行した場合は司令塔も登録する。サーバーは cmux ワークスペース（cmux が使えないときは detached プロセス）で動くので、実行した端末は空く |
+| `console.sh <プロジェクト> [--port 7400] [--open]` | ポートやブラウザペインを自分で指定して起動する場面 | サーバーをフォアグラウンドで起動する。端末を閉じるとコンソールも止まる |
+
+引数は両方とも同じ位置で同じものを取ります。プロジェクトを省略すると現在のディレクトリが対象になり、`board.yaml` のパスを直接渡すこともできます。ポートは `--port 7400`（既定は環境変数 `OVERLORD_PORT`、無ければ 7377）、cmux のブラウザペインで開くなら `--open` です。`--open` は cmux のペインを開くもので、あなたのブラウザは開きません。
+
+`ensure` が出す行の意味:
+
+| 行 | 意味 |
+| --- | --- |
+| `board` | 対象のボードファイル。ディレクトリを渡した場合は `<プロジェクト>/docs/product-ops/board.yaml` |
+| `console` | ブラウザで開くアドレス |
+| `board file` | `created`（新しく作った）または `already present`。サーバーを起動する回にだけ出ます |
+| `server` | `already running, nothing started`、または `started,` に続けて `cmux workspace <ref>` か `detached process <pid>, log: <パス>` |
+| `stop` | そのコンソールの止め方。cmux ワークスペースを閉じるか、`kill $(lsof -ti tcp:<ポート> -sTCP:LISTEN)` |
+| `commander` | `registered, surface <id>` / `unchanged, this session is already the commander (surface <id>)` / `not registered, ...`（理由付き） |
+
+この他に、cmux のワークスペース作成に失敗して detached プロセスに切り替えたときの `cmux` 行と、`--open` の実行に失敗したときの `open` 行が出ることがあります。
+
+`ensure` が何も起動せずに exit 1 で終わるのは次の3つの場合です。ボードファイルも作られません。
+
+- プロジェクトのディレクトリが存在しない（`ensure` はボードファイルを作りますが、プロジェクトは作りません）
+- そのポートを別のプロジェクトのボードが使っている
+- そのポートを Overlord のコンソール以外のプロセスが使っている
+
+後の2つでは、相手を止めるのではなく `--port` で空いているポートを指定してください。
+
+これとは別に、起動したサーバーが30秒以内に `/api/state` に応答しない場合も exit 1 になります。この場合はサーバーの起動まで進んでいるため、`server:` と `stop:` の行は既に出力されており、起動したプロセスはそのまま残ります。`stop:` の行のとおりに止めてから、`.overlord/console.log`（cmux ワークスペースで起動した場合はその画面）を確認してください。
+
+cmux が無い環境では、`commander` 行が `not registered, cmux is not reachable` になり、続けてサイドバーから登録するよう促す行が出ます。ボードの作成とサーバーの起動はそのまま行われ、終了コードは 0 です。
 
 フロントエンドを変更した場合は `cd console/frontend && bun install` で依存を入れたうえで、`cd console && bun run build` を実行し `console/public` を再生成します。
 
@@ -223,7 +268,7 @@ docs/product-ops/board.yaml を作成してください。
 最初に私が決めることは最大3件にしてください。
 ```
 
-別のターミナルでコンソールを起動し、サイドバーの「変更」からこの Claude Code セッションを司令塔として登録します（司令塔側から `cmux identify --json --id-format both` で自分の ID を読み、board の `commander` に書き込む方法もあります）。
+コンソールがまだ動いていない場合は、その Claude Code セッションから `/path/to/overlord/scripts/console.sh ensure .` を実行すれば、コンソールの起動と、そのセッション（cmux 上で動いている場合）の司令塔登録が同時に行われます。別のターミナルでコンソールを起動した場合は、サイドバーの「変更」からこの Claude Code セッションを司令塔として登録します（司令塔側から `cmux identify --json --id-format both` で自分の ID を読み、board の `commander` に書き込む方法もあります）。
 
 board 自体を手で書きたい場合は、このリポジトリの `docs/product-ops/board.example.yaml` を対象リポジトリの `docs/product-ops/board.yaml` にコピーして出発点にできます。中身は架空のサンプルなので、`items` を自分のカードに置き換えてください（スキーマは `skills/overlord-ops/references/board-schema.md`）。
 
@@ -241,7 +286,7 @@ board 自体を手で書きたい場合は、このリポジトリの `docs/prod
 ## 運用の決まり
 
 - 同時に実装するのは最大3件。AIが抱える作業は10件前後まで（超えるとトップバーに警告が出ます）
-- 1リポジトリ1 `board.yaml` が原則です。複数リポジトリはコンソールを別ポートで並行起動してください
+- 1リポジトリ1 `board.yaml` が原則です。複数リポジトリはコンソールを別ポートで並行起動してください（`console.sh ensure <プロジェクト> --port <ポート>`。既に別のボードが使っているポートを指定すると、`ensure` はそのコンソールを止めずに終了します）
 - コンソールはあなたが見る画面であり、AIは常に `board.yaml` を読んで作業します。書き込みは楽観ロックで保護され、AIの更新が黙って上書きされることはありません
 - 実装したAIに自分の変更を最終確認させないため、独立レビューは別のサブエージェントが行います
 - main 向けのPR（カードの配送PR）は **merge commit** でマージします。squash と rebase は使いません

@@ -20,6 +20,14 @@ Operate as the human's product-development control plane. The goal is to minimiz
 
 The user's visual control surface is Overlord Console, a localhost dashboard that renders `docs/product-ops/board.yaml` and connects each card to a cmux agent session. See [the console reference](references/console.md).
 
+- On the first product-operations request, bring the console up once from the project root. The installed skill does not carry `scripts/`, so call the Overlord checkout recorded next to this skill:
+
+  ```bash
+  cd <project-directory>
+  "$(cat <skill-dir>/overlord-checkout)/scripts/console.sh" ensure .
+  ```
+
+  `<skill-dir>` is this skill's own directory; `scripts/install.sh` writes the absolute path of the Overlord checkout into the `overlord-checkout` file there. The command is idempotent: it creates `docs/product-ops/board.yaml` when it is missing, starts the server only when nothing is serving that board yet, and otherwise prints the address and starts nothing. Running it on every request is therefore safe. Give the user the printed `console:` address — the command never opens a browser. When cmux is not reachable, only the commander registration is skipped; the console itself still comes up and the user can register the session from the sidebar. When the port is already serving a different project's board, the command exits 1 without starting anything; run it again with `--port <n>` on a free port instead of stopping the other console.
 - The console holds no state of its own. It reads the YAML file and re-renders when the file changes, so writing the file is the only step needed to update the user's view.
 - Do not create or update a Claude Artifact for the board.
 - The console shows the states `inbox`, `discovery`, `specified`, `implementing`, `reviewing`, `acceptance`, `done`, and `blocked`, a `Decisions required today` area limited to three cards, and a warning when more than three cards are `implementing` or more than ten cards are active (`discovery` through `acceptance`).
@@ -59,7 +67,7 @@ The console has one fixed session, the commander, and the user talks only to it.
 
 Maintain `docs/product-ops/board.yaml` in the repository as the sole machine-readable source of truth.
 
-- On the first product-operations request, create it using [the board schema](references/board-schema.md).
+- On the first product-operations request, create it using [the board schema](references/board-schema.md). `console.sh ensure` only writes the empty skeleton, so filling the board is still this skill's work.
 - On every request that creates, reprioritizes, changes the state of, blocks, or accepts a card, update this file. The console reflects the change; there is no separate visual update step.
 - Read this file before making product-operation decisions. Do not infer current state from old chat messages or from what the console showed earlier.
 - Keep only task state and decision-relevant evidence in the file. Long research, code explanations, and screenshots belong elsewhere.

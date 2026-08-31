@@ -98,16 +98,17 @@ git grep -nIE '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' -- .
 
 # 4. 個人のホームディレクトリなど内部パス
 git grep -nI '/Users/' -- .
-#=> skills/overlord-ops/references/board-schema.md:11,40  /Users/example/...（サンプル。対処不要）
-#=> skills/overlord-ops/references/console.md:29,98       /Users/example/...（サンプル。対処不要）
-#=> docs/launch-checklist.md                              この走査コマンド自身の行
+#=> skills/overlord-ops/references/board-schema.md:11,40      /Users/example/...（サンプル。対処不要）
+#=> skills/overlord-ops/references/console.md:88,89,124,193   /Users/example/...（サンプル。対処不要）
+#=> README.md:52 / README.en.md:54                            /Users/example/...（ensure の出力例。対処不要）
+#=> docs/launch-checklist.md:100-103                          この走査コマンドの行と、その結果を引用している行
 #   docs/product-ops/board.yaml は追跡外になったため、この走査には現れません
 
 # 5. board.yaml が追跡されていないこと
 git ls-files docs/product-ops/
 #=> docs/product-ops/board.example.yaml
 git check-ignore -v docs/product-ops/board.yaml
-#=> .gitignore:9:docs/product-ops/board.yaml	docs/product-ops/board.yaml
+#=> .gitignore:13:docs/product-ops/board.yaml	docs/product-ops/board.yaml
 
 # 6. コミット作者
 git log --format='%ae' | sort | uniq -c | sort -rn
@@ -120,9 +121,13 @@ git log --format='%ae' | sort | uniq -c | sort -rn
 #    「該当なし」と読み違えないこと。下の形（\b なし）で走査します。
 git grep -nIE '[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}' -- .
 #=> skills/overlord-ops/references/board-schema.md:9,10,38,39
-#=> skills/overlord-ops/references/console.md:27,28,96,97
-#   計8件。すべて 11111111-… / 22222222-…（commander の workspace / surface）と
+#=> skills/overlord-ops/references/console.md:122,123,191,192
+#=> README.md:57 / README.en.md:59
+#=> console/src/ensure.test.ts:163,167,176,199,200,400,401,687,688,708,709,718,722,723
+#   ドキュメント側は 11111111-… / 22222222-…（commander の workspace / surface）と
 #   33333333-… / 44444444-…（change の agent の workspace / surface）のダミー値です。
+#   README の2件は ensure の出力例で、commander の surface に同じ 22222222-… を使っています。
+#   `ensure.test.ts` の 0BE47E1C-0000-4000-8000-0000000000xx はテスト用の固定値です。
 #   実在の cmux ID は0件。
 ```
 
@@ -149,7 +154,7 @@ git grep -nIE '[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A
   cp /tmp/board.backup.yaml docs/product-ops/board.yaml
   ```
 
-  書き戻したあとは、取り込んだ `.gitignore` の効果で `board.yaml` は無視されます（`git status` は clean、`git check-ignore -v docs/product-ops/board.yaml` が `.gitignore:9` を返す）。衝突した場合は `git checkout --ours docs/product-ops/board.yaml` ではなく、`git rm docs/product-ops/board.yaml` で衝突を解消してから、退避したファイルを同じ場所に置き直します。
+  書き戻したあとは、取り込んだ `.gitignore` の効果で `board.yaml` は無視されます（`git status` は clean、`git check-ignore -v docs/product-ops/board.yaml` が `.gitignore:13` を返す）。衝突した場合は `git checkout --ours docs/product-ops/board.yaml` ではなく、`git rm docs/product-ops/board.yaml` で衝突を解消してから、退避したファイルを同じ場所に置き直します。
 - [ ] **同梱スクリーンショットの撮り直し（未実施）** — `docs/images/console-board.jpg` と `docs/images/card-modal.jpg` は追跡されており、README から表示されます。目視で確認した結果、次の4種類が読める大きさで写っています。画像は文字列走査の対象外なので、`board.yaml` を追跡から外しても解消しません。
   - トップバーの board パス表示（ホームディレクトリ名を含む）
   - 実在のプロジェクト名2件と、そのカード本文

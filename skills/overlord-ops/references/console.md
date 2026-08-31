@@ -4,11 +4,106 @@ Overlord Console is a localhost web dashboard for `docs/product-ops/board.yaml`.
 
 ## Start
 
+There are two entry points to the same server.
+
 ```bash
+# the commander's entry point: idempotent, starts nothing that is already running
+/path/to/overlord/scripts/console.sh ensure [<project-directory>] [--port 7377] [--open]
+
+# the explicit form: starts one server in the foreground and holds the terminal
 /path/to/overlord/scripts/console.sh <project-directory> [--port 7377] [--open]
 ```
 
-`--open` creates a cmux browser split showing the console. The server binds to `127.0.0.1` only and rejects requests whose `Host` or `Origin` header is not loopback.
+`ensure` is the form the commander runs, from the project directory, on the first
+product-operations request. The installed skill has no `scripts/` of its own, so it is
+called through the checkout path `scripts/install.sh` recorded beside the skill:
+
+```bash
+cd <project-directory>
+"$(cat <skill-dir>/overlord-checkout)/scripts/console.sh" ensure .
+```
+
+The explicit form is for the user starting a console themselves, when they want to
+choose the port or the cmux browser split by hand. It runs the server in the foreground,
+so the console stops when that terminal is closed; `ensure` puts the server in a cmux
+workspace or in a detached process instead, and leaves the calling terminal free.
+
+Both take the same arguments in the same places, and differ only in how they reject a
+mistyped one (see below). `<project-directory>` defaults to the current directory and
+may also be a `board.yaml` inside a project. `--port` defaults to
+`$OVERLORD_PORT`, then to 7377. `--open` shows the console in a cmux browser split; it
+does not open the user's own browser. The server binds to `127.0.0.1` only and rejects
+requests whose `Host` or `Origin` header is not loopback.
+
+### What `ensure` does, and does not do
+
+Each step is a no-op when it is already done, so a second run produces the same result:
+
+1. the project directory has to exist. `ensure` writes into it; it does not create it,
+   and a path that is not a directory exits 1;
+2. `docs/product-ops/board.yaml` is created when it is missing — the skeleton only
+   (`version`, `updated_at`, `items: []`). An existing board is not rewritten;
+3. the server is started only when nothing is already serving that board on that port.
+   With cmux reachable it runs in its own cmux workspace the user can see and close;
+   otherwise it is started detached, with its output in `<project>/.overlord/console.log`;
+4. the calling cmux session is registered as the board's `commander`. An unchanged
+   commander is not written back, so a re-run does not touch `board.yaml` and does not
+   make open consoles re-render.
+
+`ensure` does not open a browser. The address it prints is the user's to open.
+
+### The lines it prints
+
+| Line | Meaning |
+| --- | --- |
+| `board` | the board file it resolved, `<project>/docs/product-ops/board.yaml` for a directory |
+| `console` | the address to give the user |
+| `board file` | `created` or `already present`; printed only on the run that starts a server |
+| `server` | `already running, nothing started`, or `started, ` plus `cmux workspace <ref>` or `detached process <pid>, log: <path>` |
+| `stop` | how to stop that console: closing the cmux workspace, or `kill $(lsof -ti tcp:<port> -sTCP:LISTEN)` |
+| `commander` | `registered, surface <id>`, `unchanged, this session is already the commander (surface <id>)`, or a `not registered, …` reason |
+
+Two more labels appear only on their own path: `cmux` when `new-workspace` failed and
+the console is being started detached instead, and `open` when `--open` was passed and
+`cmux browser open` failed. Some lines are followed by an unlabeled continuation line
+(`register the session from the console sidebar instead`, `starting the console as a
+detached process instead`).
+
+The commander line is printed on the already-running path too, so a second session can
+take an existing console over by running `ensure` from there — that run does write
+`board.yaml`. Only a re-run from the session that is already the commander leaves the
+file untouched.
+
+Without cmux only the commander step is skipped: the line reads `not registered, cmux is
+not reachable`, followed by `register the session from the console sidebar instead`. A
+run from a shell that is reachable to cmux but not itself a cmux session reads `not
+registered, this command is not running inside a cmux session`. In both cases the board
+and the server are already up and the exit code is 0.
+
+### When it refuses
+
+`ensure` exits 1 without starting anything when the port is not free for this board:
+
+```text
+port 7377 is serving another board: /Users/example/other/docs/product-ops/board.yaml
+choose a free port instead of stopping it: console.sh ensure /Users/example/project --port <port>
+```
+
+Run it again with `--port <n>` on a free port; do not stop the other project's console.
+A port held by something that is not an Overlord console is refused the same way, with
+`port 7377 is held by another process: <detail>` followed by `choose a free port
+instead:` — and is also a reason to choose another port rather than to free this one.
+It also exits 1, without creating the board file, when the project directory does not
+exist.
+
+One failure is not of that kind: when the server it started does not answer
+`<address>/api/state` within 30 seconds, `ensure` exits 1 with the board file created,
+the `server:` and `stop:` lines already printed, and the started process still running.
+Stop it as the `stop:` line says before running `ensure` again.
+
+`ensure` also exits 1 on a mistyped option (`unknown option: --prot (see: console.sh
+ensure --help)`) and on a port outside 1-65535. The explicit form's parser ignores an
+unknown option instead, and `--help` exists only on `ensure`.
 
 ## What the console reads and writes
 
