@@ -21,6 +21,7 @@
 import { dirname, resolve } from "node:path";
 
 import {
+  BoardLockError,
   boardPathFor,
   canonicalItem,
   loadBoard,
@@ -205,6 +206,113 @@ export class CommandError extends Error {
  */
 export const RUN_FAILED = -1;
 
+/** Resolution of a race that the command lost. */
+const TIMED_OUT = Symbol("timed out");
+
+/**
+ * How long a timed-out command is given to die, per signal.
+ *
+ * SIGTERM first, so git removes the `.lock` files it holds instead of leaving
+ * them for the next command to trip over, then SIGKILL. Once both graces are
+ * spent the pipes are abandoned, so nothing the command started can hold `run`
+ * for longer than `timeoutMs` plus the two graces.
+ */
+const TERM_GRACE_MS = 500;
+const KILL_GRACE_MS = 250;
+
+/** A piped stream being read into memory as it arrives. */
+type CollectedStream = {
+  /** Everything received so far, decoded. */
+  text: () => string;
+  /** Resolves when the stream ended, or when `cancel` released it. */
+  done: Promise<void>;
+  /** Stop reading and release the pipe. */
+  cancel: () => void;
+};
+
+/**
+ * Read a pipe incrementally rather than with `new Response(stream).text()`.
+ *
+ * `text()` can be called at any time, so a command that is killed at its
+ * timeout still reports the diagnostics it printed before it died, and
+ * `cancel()` lets the caller stop waiting for a pipe that something other than
+ * the command itself is still holding open.
+ */
+function collectStream(stream: ReadableStream<Uint8Array>): CollectedStream {
+  const chunks: Uint8Array[] = [];
+  const reader = stream.getReader();
+  const done = (async () => {
+    try {
+      for (;;) {
+        const { done: ended, value } = await reader.read();
+        if (ended) break;
+        if (value) chunks.push(value);
+      }
+    } catch {
+      // Cancelled here, or broken with the process that was writing to it.
+    }
+  })();
+  return {
+    text: () => {
+      let total = 0;
+      for (const chunk of chunks) total += chunk.length;
+      const joined = new Uint8Array(total);
+      let offset = 0;
+      for (const chunk of chunks) {
+        joined.set(chunk, offset);
+        offset += chunk.length;
+      }
+      return new TextDecoder().decode(joined);
+    },
+    done,
+    cancel: () => {
+      void reader.cancel().catch(() => undefined);
+    },
+  };
+}
+
+/** Wait for `settled`, giving up after `ms` and reporting which one happened. */
+async function raceDeadline<T>(
+  settled: Promise<T>,
+  ms: number,
+): Promise<T | typeof TIMED_OUT> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const reached = new Promise<typeof TIMED_OUT>((resolveDeadline) => {
+    timer = setTimeout(() => resolveDeadline(TIMED_OUT), ms);
+  });
+  try {
+    return await Promise.race([settled, reached]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+/**
+ * Signal a timed-out command and everything it started.
+ *
+ * A command that carries a timeout is spawned detached, so it leads its own
+ * process group and the negative pid reaches its children too. That is the
+ * part that matters here: `git push` starts `git-remote-https` or `ssh`, both
+ * of which inherit the pipes, so signalling git alone leaves the pipes open
+ * and the grandchild running.
+ */
+function signalTree(
+  proc: ReturnType<typeof Bun.spawn>,
+  signal: "SIGTERM" | "SIGKILL",
+): void {
+  try {
+    process.kill(-proc.pid, signal);
+    return;
+  } catch {
+    // No such process group (it already exited, or it was never detached).
+  }
+  try {
+    proc.kill(signal);
+  } catch {
+    // Already exited.
+  }
+}
+
 /**
  * Run a command and collect its output.
  *
@@ -217,14 +325,24 @@ export const RUN_FAILED = -1;
  *   - a command that never finishes would otherwise hang the caller for ever,
  *     so `timeoutMs` kills it and reports `RUN_FAILED`.
  *
+ * `timeoutMs` bounds the elapsed time of the call, not just the life of the
+ * command: the process group is signalled and, if the pipes are still held
+ * after both graces, they are abandoned unread. Waiting for the pipes to close
+ * used to be the last step, which meant a grandchild that inherited them
+ * (`git push` starts `git-remote-https` or `ssh`) kept the call running for as
+ * long as the grandchild lived - measured at 10.4 s for a 1 s timeout.
+ *
  * Without a `timeoutMs` the call waits as long as the command takes, which is
- * what the CLI subcommands want.
+ * what the CLI subcommands want, and the command is not detached: `setsid`
+ * takes the controlling terminal away, and a CLI `git push` may still need it
+ * to prompt for a credential.
  */
 export async function run(
   command: string[],
   cwd?: string,
   timeoutMs?: number,
 ): Promise<RunResult> {
+  const bounded = timeoutMs !== undefined && timeoutMs > 0;
   let proc: ReturnType<typeof Bun.spawn>;
   try {
     proc = Bun.spawn(command, {
@@ -237,6 +355,9 @@ export async function run(
       stdout: "pipe",
       stderr: "pipe",
       stdin: "ignore",
+      // Its own process group, so `signalTree` can reach the whole tree. Only
+      // when there is a timeout to enforce; see the note about the terminal.
+      detached: bounded,
     });
   } catch (error) {
     return {
@@ -246,32 +367,40 @@ export async function run(
     };
   }
 
-  let timedOut = false;
-  const timer =
-    timeoutMs !== undefined && timeoutMs > 0
-      ? setTimeout(() => {
-          timedOut = true;
-          proc.kill();
-        }, timeoutMs)
-      : null;
-
-  try {
-    const [stdout, stderr] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-    ]);
-    const code = await proc.exited;
-    if (timedOut) {
-      return {
-        code: RUN_FAILED,
-        stdout,
-        stderr: `${stderr}${command.join(" ")}: timed out after ${timeoutMs}ms\n`,
-      };
+  const out = collectStream(proc.stdout as ReadableStream<Uint8Array>);
+  const err = collectStream(proc.stderr as ReadableStream<Uint8Array>);
+  const finished = (async (): Promise<number> => {
+    await Promise.all([out.done, err.done]);
+    try {
+      return await proc.exited;
+    } catch {
+      return RUN_FAILED;
     }
-    return { code, stdout, stderr };
-  } finally {
-    if (timer !== null) clearTimeout(timer);
+  })();
+
+  if (!bounded) {
+    const code = await finished;
+    return { code, stdout: out.text(), stderr: err.text() };
   }
+
+  const settled = await raceDeadline(finished, timeoutMs!);
+  if (settled !== TIMED_OUT) {
+    return { code: settled, stdout: out.text(), stderr: err.text() };
+  }
+
+  signalTree(proc, "SIGTERM");
+  if ((await raceDeadline(finished, TERM_GRACE_MS)) === TIMED_OUT) {
+    signalTree(proc, "SIGKILL");
+    await raceDeadline(finished, KILL_GRACE_MS);
+  }
+  // Whatever still holds the pipes is not waited for any longer.
+  out.cancel();
+  err.cancel();
+  return {
+    code: RUN_FAILED,
+    stdout: out.text(),
+    stderr: `${err.text()}${command.join(" ")}: timed out after ${timeoutMs}ms\n`,
+  };
 }
 
 export async function runOrThrow(
@@ -1365,6 +1494,14 @@ export type DeliverOutcome = {
   reason?: string;
   /** The delivery pull request, as it was written to the board. */
   pr?: PullRequest;
+  /**
+   * Head branch the attempt used, on a failure that got far enough to resolve
+   * one. The caller records it, so that a failure on the board names the same
+   * branches a success would have.
+   */
+  head?: string;
+  /** Base branch the attempt used, on a failure that got far enough. */
+  base?: string;
   /** `<change-id>  <title>` for every change that is not merged yet. */
   unmerged?: string[];
   /** Non-fatal problems: the run continued in spite of them. */
@@ -1434,6 +1571,13 @@ export async function resolveDeliveryBase(
  *     really is `head -> base`. A failure at any step therefore leaves
  *     `board.yaml` exactly as it was and the command can be run again.
  *
+ * A `failed` outcome carries `head` and `base` as far as the attempt resolved
+ * them, and `pr` when the pull request was created but recording it was what
+ * failed. `deliverCard` itself still writes nothing on a failure; the caller
+ * decides whether the failure belongs on the board, which the console server
+ * does and the CLI does not (the CLI operator reads the diagnostic on stderr,
+ * a browser that has gone away does not).
+ *
  * A base that has moved on while the card was in flight is reported as a
  * warning and nothing more: the delivery is not stopped and the base is not
  * merged into the head, because the pull request is where the two branches
@@ -1443,35 +1587,98 @@ export async function resolveDeliveryBase(
  * than a second one created, and its title is left alone because a person may
  * have renamed it. A head that is already identical to the base is reported as
  * skipped instead of producing an empty pull request.
+ *
+ * Serialized per repository: see `deliveryQueues`.
  */
 export async function deliverCard(
+  options: DeliverOptions,
+): Promise<DeliverOutcome> {
+  const key = await deliveryQueueKey(options);
+  return queueDelivery(key, () => deliverOneCard(options));
+}
+
+/**
+ * In-process queue of deliveries, keyed by repository.
+ *
+ * The counterpart of `mutateBoard`'s `writeQueues`, for the git side. The
+ * console starts one delivery per card and they used to overlap, but a
+ * delivery contends for things the card does not own: two cards that sit on
+ * the same branch push the same ref, and the second push failed with
+ * `remote: error: cannot lock ref 'refs/heads/<branch>': reference already
+ * exists`. Queueing rather than dropping is the point: the second card is
+ * delivered after the first one finishes instead of being lost.
+ *
+ * The key is the main checkout of the repository, not the board path, because
+ * the contended resources - the local refs, `origin` and the pull requests -
+ * belong to the repository. Two boards inside one repository therefore still
+ * serialize against each other. The board path is only the fallback for a
+ * target git cannot answer for, where the delivery is going to fail anyway.
+ *
+ * This process only. A `change deliver` run in another process is not covered;
+ * git itself reports that collision, as it did before.
+ */
+const deliveryQueues = new Map<string, Promise<unknown>>();
+
+async function deliveryQueueKey(options: DeliverOptions): Promise<string> {
+  try {
+    return await mainRepoRoot(options.cwd, options.timeoutMs);
+  } catch {
+    return resolve(options.boardPath);
+  }
+}
+
+function queueDelivery<T>(key: string, work: () => Promise<T>): Promise<T> {
+  const previous = deliveryQueues.get(key);
+  const started = (
+    previous ? previous.then(ignore, ignore) : Promise.resolve()
+  ).then(work);
+  const tail = started.then(ignore, ignore);
+  deliveryQueues.set(key, tail);
+  void tail.then(() => {
+    if (deliveryQueues.get(key) === tail) deliveryQueues.delete(key);
+  });
+  return started;
+}
+
+function ignore(): void {
+  return undefined;
+}
+
+async function deliverOneCard(
   options: DeliverOptions,
 ): Promise<DeliverOutcome> {
   const { boardPath, cardId, cwd, timeoutMs } = options;
   const warnings: string[] = [];
 
+  // The branches this attempt resolved, reported on a failure so that the
+  // caller can record it against the same head and base a success would name.
+  let head = options.head?.trim() || null;
+  let base = options.base?.trim() || null;
+  const failed = (reason: string, pr?: PullRequest): DeliverOutcome => ({
+    status: "failed",
+    reason,
+    ...(pr ? { pr } : {}),
+    ...(head ? { head } : {}),
+    ...(base ? { base } : {}),
+    warnings,
+  });
+
   const loaded = await loadBoard(boardPath);
   if (!loaded.exists) {
-    return { status: "failed", reason: `board not found: ${boardPath}`, warnings };
+    return failed(`board not found: ${boardPath}`);
   }
   const item = findItem(loaded.board, cardId);
   if (!item) {
-    return {
-      status: "failed",
-      reason: `unknown card id: ${cardId} (board: ${boardPath})`,
-      warnings,
-    };
+    return failed(`unknown card id: ${cardId} (board: ${boardPath})`);
   }
 
   let root: string;
   try {
     root = await mainRepoRoot(cwd, timeoutMs);
   } catch (error) {
-    return {
-      status: "failed",
-      reason: `could not resolve the repository root: ${(error as Error).message}`,
-      warnings,
-    };
+    return failed(
+      `could not resolve the repository root: ${(error as Error).message}`,
+    );
   }
 
   // 1. Synchronize this card's change pull requests before deciding anything.
@@ -1492,7 +1699,6 @@ export async function deliverCard(
   }
 
   // 3. Head: the branch the card's work sits on.
-  let head = options.head?.trim() || null;
   if (!head) {
     const current = await git(
       ["rev-parse", "--abbrev-ref", "HEAD"],
@@ -1500,25 +1706,20 @@ export async function deliverCard(
       timeoutMs,
     );
     if (current.code !== 0) {
-      return {
-        status: "failed",
-        reason: `could not read the current branch: ${failureMessage(current)}`,
-        warnings,
-      };
+      return failed(
+        `could not read the current branch: ${failureMessage(current)}`,
+      );
     }
     head = current.stdout.trim();
     if (!head || head === "HEAD") {
-      return {
-        status: "failed",
-        reason:
-          `${root} has a detached HEAD, so there is no branch to deliver; ` +
+      return failed(
+        `${root} has a detached HEAD, so there is no branch to deliver; ` +
           "pass --head <branch>",
-        warnings,
-      };
+      );
     }
   }
 
-  const base = options.base?.trim() || (await resolveDeliveryBase(root, timeoutMs));
+  if (!base) base = await resolveDeliveryBase(root, timeoutMs);
 
   if (head === base) {
     return {
@@ -1558,11 +1759,9 @@ export async function deliverCard(
   // `git diff --quiet` exits 1 for "there are differences" and above 1 for a
   // real error, which must not be read as a difference.
   if (diff.code !== 1) {
-    return {
-      status: "failed",
-      reason: `git diff ${diffBase} ${head} failed: ${failureMessage(diff)}`,
-      warnings,
-    };
+    return failed(
+      `git diff ${diffBase} ${head} failed: ${failureMessage(diff)}`,
+    );
   }
 
   // 6. Report what the base holds that the head does not. This never changes
@@ -1571,11 +1770,7 @@ export async function deliverCard(
 
   const push = await pushBranch(root, head, timeoutMs);
   if (!push.ok) {
-    return {
-      status: "failed",
-      reason: push.error || `git push origin ${head} failed`,
-      warnings,
-    };
+    return failed(push.error || `git push origin ${head} failed`);
   }
 
   // 7. Reuse the pull request already open for this head and base.
@@ -1596,19 +1791,13 @@ export async function deliverCard(
     timeoutMs,
   );
   if (listed.code !== 0) {
-    return {
-      status: "failed",
-      reason: `gh pr list --head ${head} failed: ${failureMessage(listed)}`,
-      warnings,
-    };
+    return failed(
+      `gh pr list --head ${head} failed: ${failureMessage(listed)}`,
+    );
   }
   const open = parseJson<{ number: number }[]>(listed.stdout.trim() || "[]");
   if (!open || !Array.isArray(open)) {
-    return {
-      status: "failed",
-      reason: `could not read: gh pr list --head ${head} --base ${base}`,
-      warnings,
-    };
+    return failed(`could not read: gh pr list --head ${head} --base ${base}`);
   }
 
   const section = deliveryBodyFor(item);
@@ -1649,11 +1838,7 @@ export async function deliverCard(
       timeoutMs,
     );
     if (edited.code !== 0) {
-      return {
-        status: "failed",
-        reason: `gh pr edit ${number} failed: ${failureMessage(edited)}`,
-        warnings,
-      };
+      return failed(`gh pr edit ${number} failed: ${failureMessage(edited)}`);
     }
     status = "updated";
     ref = String(number);
@@ -1675,11 +1860,7 @@ export async function deliverCard(
       timeoutMs,
     );
     if (created.code !== 0) {
-      return {
-        status: "failed",
-        reason: `gh pr create failed: ${failureMessage(created)}`,
-        warnings,
-      };
+      return failed(`gh pr create failed: ${failureMessage(created)}`);
     }
     status = "created";
     ref = head;
@@ -1694,30 +1875,19 @@ export async function deliverCard(
     timeoutMs,
   );
   if (viewed.code !== 0) {
-    return {
-      status: "failed",
-      reason: `gh pr view ${ref} failed: ${failureMessage(viewed)}`,
-      warnings,
-    };
+    return failed(`gh pr view ${ref} failed: ${failureMessage(viewed)}`);
   }
   const view = parseJson<DeliveryView>(viewed.stdout);
   if (!view || typeof view.number !== "number") {
-    return {
-      status: "failed",
-      reason: `could not read: gh pr view ${ref}`,
-      warnings,
-    };
+    return failed(`could not read: gh pr view ${ref}`);
   }
   if (view.headRefName !== head || view.baseRefName !== base) {
-    return {
-      status: "failed",
-      reason:
-        `pull request #${view.number} is ` +
+    return failed(
+      `pull request #${view.number} is ` +
         `"${view.headRefName ?? "(unknown)"}" -> ` +
         `"${view.baseRefName ?? "(unknown)"}", not "${head}" -> "${base}". ` +
         `Nothing was written to ${boardPath}.`,
-      warnings,
-    };
+    );
   }
 
   const pullRequest: PullRequest = {
@@ -1739,11 +1909,56 @@ export async function deliverCard(
     error: null,
     attempted_at: attemptedAt,
   };
-  await updateItem(boardPath, cardId, (target) => {
-    target.delivery = delivery;
-  });
+  try {
+    await writeDelivery(boardPath, cardId, delivery);
+  } catch (error) {
+    // The pull request exists on GitHub; only the record of it is missing.
+    // Saying "failed" without saying that would send the reader looking for a
+    // pull request that is already there.
+    return failed(
+      `pull request #${pullRequest.number} was ${status} ` +
+        `(${pullRequest.url ?? "no url"}), but recording it in ${boardPath} ` +
+        `failed: ${(error as Error).message}`,
+      pullRequest,
+    );
+  }
 
   return { status, pr: pullRequest, warnings };
+}
+
+/** Board writes of one delivery record, including the retries. */
+const DELIVERY_WRITE_ATTEMPTS = 3;
+
+/**
+ * Record a delivery on the card, retrying while the board is locked.
+ *
+ * `mutateBoard` already waits `boardLock.acquireTimeoutMs` for the lock and
+ * then gives up with a `BoardLockError`. That is the right answer for a
+ * request a person is waiting on, and the wrong one here: the pull request has
+ * already been created, so losing the record leaves GitHub and the board
+ * disagreeing about work that was really done. Every other failure is raised
+ * on the first attempt, because retrying it would only repeat it.
+ */
+async function writeDelivery(
+  boardPath: string,
+  cardId: string,
+  delivery: Delivery,
+): Promise<void> {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      await updateItem(boardPath, cardId, (target) => {
+        target.delivery = delivery;
+      });
+      return;
+    } catch (error) {
+      if (
+        !(error instanceof BoardLockError) ||
+        attempt >= DELIVERY_WRITE_ATTEMPTS
+      ) {
+        throw error;
+      }
+    }
+  }
 }
 
 /**
