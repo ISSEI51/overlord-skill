@@ -17,6 +17,7 @@
  *   change sync     [<card-id>] [--all] [--board <path>]
  *   change merge    <change-id> [--board <path>]
  *   change deliver  <card-id> [--board <path>] [--base <branch>] [--head <branch>]
+ *   change identity
  */
 
 import { dirname, resolve } from "node:path";
@@ -35,6 +36,22 @@ import {
   type PullRequest,
   type State,
 } from "./board.ts";
+import {
+  agentIdentity,
+  describeAccount,
+  ghEnvFor,
+  pushAttributionWarning,
+  pushCredentialArgs,
+  pushCredentialEnv,
+  unconfiguredHint,
+} from "./github-identity.ts";
+import {
+  CommandError,
+  run,
+  runOrThrow,
+  RUN_FAILED,
+  type RunResult,
+} from "./run.ts";
 
 // ---------------------------------------------------------------------------
 // board helpers
@@ -181,245 +198,21 @@ export function resolveBoardPath(explicit?: string | null): string {
 }
 
 // ---------------------------------------------------------------------------
-// process helpers
+// git and gh
 // ---------------------------------------------------------------------------
 
-export type RunResult = { code: number; stdout: string; stderr: string };
-
-export class CommandError extends Error {
-  constructor(
-    readonly command: string[],
-    readonly result: RunResult,
-  ) {
-    super(
-      `${command.join(" ")} exited with ${result.code}: ` +
-        (result.stderr.trim() || result.stdout.trim()),
-    );
-    this.name = "CommandError";
-  }
-}
-
-/**
- * `code` for a command that never produced an exit status of its own: the
- * executable could not be spawned, or the run was killed at `timeoutMs`. It is
- * outside the 0-255 range a process can exit with, so it cannot collide with a
- * real status, and every caller already treats "not 0" as a failure.
- */
-export const RUN_FAILED = -1;
-
-/** Resolution of a race that the command lost. */
-const TIMED_OUT = Symbol("timed out");
-
-/**
- * How long a timed-out command is given to die, per signal.
- *
- * SIGTERM first, so git removes the `.lock` files it holds instead of leaving
- * them for the next command to trip over, then SIGKILL. Once both graces are
- * spent the pipes are abandoned, so nothing the command started can hold `run`
- * for longer than `timeoutMs` plus the two graces.
- */
-const TERM_GRACE_MS = 500;
-const KILL_GRACE_MS = 250;
-
-/** A piped stream being read into memory as it arrives. */
-type CollectedStream = {
-  /** Everything received so far, decoded. */
-  text: () => string;
-  /** Resolves when the stream ended, or when `cancel` released it. */
-  done: Promise<void>;
-  /** Stop reading and release the pipe. */
-  cancel: () => void;
-};
-
-/**
- * Read a pipe incrementally rather than with `new Response(stream).text()`.
- *
- * `text()` can be called at any time, so a command that is killed at its
- * timeout still reports the diagnostics it printed before it died, and
- * `cancel()` lets the caller stop waiting for a pipe that something other than
- * the command itself is still holding open.
- */
-function collectStream(stream: ReadableStream<Uint8Array>): CollectedStream {
-  const chunks: Uint8Array[] = [];
-  const reader = stream.getReader();
-  const done = (async () => {
-    try {
-      for (;;) {
-        const { done: ended, value } = await reader.read();
-        if (ended) break;
-        if (value) chunks.push(value);
-      }
-    } catch {
-      // Cancelled here, or broken with the process that was writing to it.
-    }
-  })();
-  return {
-    text: () => {
-      let total = 0;
-      for (const chunk of chunks) total += chunk.length;
-      const joined = new Uint8Array(total);
-      let offset = 0;
-      for (const chunk of chunks) {
-        joined.set(chunk, offset);
-        offset += chunk.length;
-      }
-      return new TextDecoder().decode(joined);
-    },
-    done,
-    cancel: () => {
-      void reader.cancel().catch(() => undefined);
-    },
-  };
-}
-
-/** Wait for `settled`, giving up after `ms` and reporting which one happened. */
-async function raceDeadline<T>(
-  settled: Promise<T>,
-  ms: number,
-): Promise<T | typeof TIMED_OUT> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const reached = new Promise<typeof TIMED_OUT>((resolveDeadline) => {
-    timer = setTimeout(() => resolveDeadline(TIMED_OUT), ms);
-  });
-  try {
-    return await Promise.race([settled, reached]);
-  } finally {
-    if (timer !== undefined) clearTimeout(timer);
-  }
-}
-
-/**
- * Signal a timed-out command and everything it started.
- *
- * A command that carries a timeout is spawned detached, so it leads its own
- * process group and the negative pid reaches its children too. That is the
- * part that matters here: `git push` starts `git-remote-https` or `ssh`, both
- * of which inherit the pipes, so signalling git alone leaves the pipes open
- * and the grandchild running.
- */
-function signalTree(
-  proc: ReturnType<typeof Bun.spawn>,
-  signal: "SIGTERM" | "SIGKILL",
-): void {
-  try {
-    process.kill(-proc.pid, signal);
-    return;
-  } catch {
-    // No such process group (it already exited, or it was never detached).
-  }
-  try {
-    proc.kill(signal);
-  } catch {
-    // Already exited.
-  }
-}
-
-/**
- * Run a command and collect its output.
- *
- * Two failure modes are turned into a `RunResult` rather than an exception,
- * because `deliverCard` is called from the console server, where an unhandled
- * rejection would take down a request handler:
- *
- *   - `Bun.spawn` throws synchronously when the executable is not on the PATH
- *     (no `gh` installed, for instance);
- *   - a command that never finishes would otherwise hang the caller for ever,
- *     so `timeoutMs` kills it and reports `RUN_FAILED`.
- *
- * `timeoutMs` bounds the elapsed time of the call, not just the life of the
- * command: the process group is signalled and, if the pipes are still held
- * after both graces, they are abandoned unread. Waiting for the pipes to close
- * used to be the last step, which meant a grandchild that inherited them
- * (`git push` starts `git-remote-https` or `ssh`) kept the call running for as
- * long as the grandchild lived - measured at 10.4 s for a 1 s timeout.
- *
- * Without a `timeoutMs` the call waits as long as the command takes, which is
- * what the CLI subcommands want, and the command is not detached: `setsid`
- * takes the controlling terminal away, and a CLI `git push` may still need it
- * to prompt for a credential.
- */
-export async function run(
-  command: string[],
-  cwd?: string,
-  timeoutMs?: number,
-): Promise<RunResult> {
-  const bounded = timeoutMs !== undefined && timeoutMs > 0;
-  let proc: ReturnType<typeof Bun.spawn>;
-  try {
-    proc = Bun.spawn(command, {
-      cwd,
-      // A copy of the current environment rather than the default: Bun resolves
-      // the executable against the PATH of the environment it is handed, and the
-      // default is the environment the process was started with, so a PATH set
-      // after startup would otherwise be ignored.
-      env: { ...process.env },
-      stdout: "pipe",
-      stderr: "pipe",
-      stdin: "ignore",
-      // Its own process group, so `signalTree` can reach the whole tree. Only
-      // when there is a timeout to enforce; see the note about the terminal.
-      detached: bounded,
-    });
-  } catch (error) {
-    return {
-      code: RUN_FAILED,
-      stdout: "",
-      stderr: `${command.join(" ")}: ${(error as Error).message}\n`,
-    };
-  }
-
-  const out = collectStream(proc.stdout as ReadableStream<Uint8Array>);
-  const err = collectStream(proc.stderr as ReadableStream<Uint8Array>);
-  const finished = (async (): Promise<number> => {
-    await Promise.all([out.done, err.done]);
-    try {
-      return await proc.exited;
-    } catch {
-      return RUN_FAILED;
-    }
-  })();
-
-  if (!bounded) {
-    const code = await finished;
-    return { code, stdout: out.text(), stderr: err.text() };
-  }
-
-  const settled = await raceDeadline(finished, timeoutMs!);
-  if (settled !== TIMED_OUT) {
-    return { code: settled, stdout: out.text(), stderr: err.text() };
-  }
-
-  signalTree(proc, "SIGTERM");
-  if ((await raceDeadline(finished, TERM_GRACE_MS)) === TIMED_OUT) {
-    signalTree(proc, "SIGKILL");
-    await raceDeadline(finished, KILL_GRACE_MS);
-  }
-  // Whatever still holds the pipes is not waited for any longer.
-  out.cancel();
-  err.cancel();
-  return {
-    code: RUN_FAILED,
-    stdout: out.text(),
-    stderr: `${err.text()}${command.join(" ")}: timed out after ${timeoutMs}ms\n`,
-  };
-}
-
-export async function runOrThrow(
-  command: string[],
-  cwd?: string,
-  timeoutMs?: number,
-): Promise<RunResult> {
-  const result = await run(command, cwd, timeoutMs);
-  if (result.code !== 0) throw new CommandError(command, result);
-  return result;
-}
+// Re-exported rather than moved out of sight: `run`, `RunResult` and the rest
+// were part of this module's surface before they moved to `run.ts`, and both
+// `server.ts` and the tests import them from here.
+export { CommandError, run, runOrThrow, RUN_FAILED, type RunResult };
 
 export function git(
   args: string[],
   cwd?: string,
   timeoutMs?: number,
+  env?: Record<string, string>,
 ): Promise<RunResult> {
-  return run(["git", ...args], cwd, timeoutMs);
+  return run(["git", ...args], cwd, timeoutMs, env);
 }
 
 export function gitOrThrow(
@@ -430,20 +223,58 @@ export function gitOrThrow(
   return runOrThrow(["git", ...args], cwd, timeoutMs);
 }
 
-export function gh(
+/**
+ * Run `gh` as the agent account.
+ *
+ * Every `gh` call goes through here, reads as well as writes. Splitting them —
+ * the agent account for `pr create`, the user's for `pr view` — would mean
+ * keeping a list of which subcommands write, and a subcommand missing from
+ * that list would quietly open a pull request under the user's name, which is
+ * the one failure this must not have. The cost is that the agent account needs
+ * read access to every repository Overlord is used in, which it needs anyway
+ * to open a pull request there.
+ *
+ * An account that was asked for but could not be resolved fails the call
+ * instead of running under the active account. The failure is returned as a
+ * `RunResult` rather than thrown, because `deliverCard` runs inside the console
+ * server's request handler.
+ */
+export async function gh(
   args: string[],
   cwd?: string,
   timeoutMs?: number,
 ): Promise<RunResult> {
-  return run(["gh", ...args], cwd, timeoutMs);
+  const resolution = await agentIdentity();
+  if (resolution.status === "failed") {
+    return { code: RUN_FAILED, stdout: "", stderr: `${resolution.reason}\n` };
+  }
+  return run(["gh", ...args], cwd, timeoutMs, ghEnvFor(resolution));
 }
 
-export function ghOrThrow(
+export async function ghOrThrow(
   args: string[],
   cwd?: string,
   timeoutMs?: number,
 ): Promise<RunResult> {
-  return runOrThrow(["gh", ...args], cwd, timeoutMs);
+  const result = await gh(args, cwd, timeoutMs);
+  if (result.code !== 0) throw new CommandError(["gh", ...args], result);
+  return result;
+}
+
+/**
+ * The `agent account:` line the commands print before they push.
+ *
+ * A pull request opened under the wrong account is only visible on GitHub,
+ * long after the run, so the account is named in the output of every run that
+ * creates one.
+ */
+async function agentAccountLine(): Promise<string> {
+  const resolution = await agentIdentity();
+  if (resolution.status === "unconfigured") {
+    return `(none configured, using the active gh account)`;
+  }
+  if (resolution.status === "failed") return "(could not be resolved)";
+  return describeAccount(resolution.identity);
 }
 
 /** Repository root containing `cwd`. */
@@ -732,7 +563,74 @@ export type PushOutcome = {
   lines: string[];
   /** The failing command's own diagnostics, or null when the push worked. */
   error: string | null;
+  /**
+   * Things the caller should say but that did not stop the push — currently
+   * only a remote the agent account's token cannot authenticate to.
+   */
+  warnings: string[];
 };
+
+/** The push URL of `origin`, or null when it cannot be read. */
+async function pushRemoteUrl(
+  root: string,
+  timeoutMs?: number,
+): Promise<string | null> {
+  const url = await git(
+    ["remote", "get-url", "--push", "origin"],
+    root,
+    timeoutMs,
+  );
+  if (url.code !== 0) return null;
+  const value = url.stdout.trim();
+  return value === "" ? null : value;
+}
+
+/**
+ * How `git push` is authenticated, and what to say about it.
+ *
+ * With no agent account configured this adds nothing and the push uses the
+ * credentials git already had, exactly as before.
+ */
+async function pushIdentity(
+  root: string,
+  timeoutMs?: number,
+): Promise<
+  | { ok: true; args: string[]; env?: Record<string, string>; warnings: string[] }
+  | { ok: false; error: string }
+> {
+  const resolution = await agentIdentity();
+  if (resolution.status === "failed") {
+    return { ok: false, error: resolution.reason };
+  }
+  if (resolution.status === "unconfigured") {
+    return { ok: true, args: [], warnings: [] };
+  }
+
+  const url = await pushRemoteUrl(root, timeoutMs);
+  if (url === null) {
+    return {
+      ok: true,
+      args: pushCredentialArgs(),
+      env: pushCredentialEnv(resolution.identity),
+      warnings: [
+        "could not read the push URL of origin, so it could not be checked " +
+          "that the agent account's token is sent to that host.",
+      ],
+    };
+  }
+  const warning = pushAttributionWarning(resolution.identity, url);
+  if (warning) {
+    // No credential is injected: a token for github.com must not be sent to a
+    // host it does not belong to, and an SSH remote never asks for one.
+    return { ok: true, args: [], warnings: [warning] };
+  }
+  return {
+    ok: true,
+    args: pushCredentialArgs(),
+    env: pushCredentialEnv(resolution.identity),
+    warnings: [],
+  };
+}
 
 /**
  * Make sure `origin/<branch>` exists and carries the local commits.
@@ -741,12 +639,23 @@ export type PushOutcome = {
  * works whichever checkout the command was started from. The branch is always
  * named explicitly, so the current HEAD of that checkout is never pushed by
  * accident.
+ *
+ * The push is the one git command that is authenticated as the agent account:
+ * GitHub attributes a push to the owner of the credential that made it, and
+ * everything else this module runs is either local or a read that no account
+ * is recorded against.
  */
 async function pushBranch(
   root: string,
   branch: string,
   timeoutMs?: number,
 ): Promise<PushOutcome> {
+  const identity = await pushIdentity(root, timeoutMs);
+  if (!identity.ok) {
+    return { ok: false, lines: [], error: identity.error, warnings: [] };
+  }
+  const { args: auth, env, warnings } = identity;
+
   const upstream = await git(
     ["rev-parse", "--abbrev-ref", "--symbolic-full-name", `${branch}@{upstream}`],
     root,
@@ -754,11 +663,16 @@ async function pushBranch(
   );
   if (upstream.code !== 0) {
     const lines = [`push:             git push -u origin ${branch}`];
-    const pushed = await git(["push", "-u", "origin", branch], root, timeoutMs);
+    const pushed = await git(
+      [...auth, "push", "-u", "origin", branch],
+      root,
+      timeoutMs,
+      env,
+    );
     if (pushed.code !== 0) {
-      return { ok: false, lines, error: failureMessage(pushed) };
+      return { ok: false, lines, error: failureMessage(pushed), warnings };
     }
-    return { ok: true, lines, error: null };
+    return { ok: true, lines, error: null, warnings };
   }
 
   const ahead = await git(
@@ -768,17 +682,23 @@ async function pushBranch(
   );
   if (ahead.code === 0 && Number.parseInt(ahead.stdout.trim(), 10) > 0) {
     const lines = [`push:             git push origin ${branch}`];
-    const pushed = await git(["push", "origin", branch], root, timeoutMs);
+    const pushed = await git(
+      [...auth, "push", "origin", branch],
+      root,
+      timeoutMs,
+      env,
+    );
     if (pushed.code !== 0) {
-      return { ok: false, lines, error: failureMessage(pushed) };
+      return { ok: false, lines, error: failureMessage(pushed), warnings };
     }
-    return { ok: true, lines, error: null };
+    return { ok: true, lines, error: null, warnings };
   }
 
   return {
     ok: true,
     lines: [`push:             origin/${branch} is up to date`],
     error: null,
+    warnings,
   };
 }
 
@@ -842,6 +762,7 @@ export async function pr(argv: string[]): Promise<number> {
 
   process.stdout.write(`base branch:      ${base}\n`);
   process.stdout.write(`head branch:      ${branch}\n`);
+  process.stdout.write(`agent account:    ${await agentAccountLine()}\n`);
 
   // What `gh pr view` is asked about: a number when one is already known, the
   // branch when the pull request was just created.
@@ -850,6 +771,9 @@ export async function pr(argv: string[]): Promise<number> {
   if (number === null) {
     const pushed = await pushBranch(root, branch);
     for (const line of pushed.lines) process.stdout.write(`${line}\n`);
+    for (const warning of pushed.warnings) {
+      process.stderr.write(`${warning}\n`);
+    }
     if (!pushed.ok) {
       if (pushed.error) process.stderr.write(`${pushed.error}\n`);
       return 1;
@@ -1787,6 +1711,7 @@ async function deliverOneCard(
   warnings.push(...(await baseGapWarnings(root, diffBase, head, timeoutMs)));
 
   const push = await pushBranch(root, head, timeoutMs);
+  warnings.push(...push.warnings);
   if (!push.ok) {
     return failed(push.error || `git push origin ${head} failed`);
   }
@@ -2821,6 +2746,150 @@ export async function merge(argv: string[]): Promise<number> {
 }
 
 // ---------------------------------------------------------------------------
+// identity
+// ---------------------------------------------------------------------------
+
+/** Repository permissions that allow a branch to be pushed. */
+const WRITE_PERMISSIONS = new Set(["WRITE", "MAINTAIN", "ADMIN"]);
+
+/** The `gh repo view` fields `identity` reads. */
+const REPO_VIEW_FIELDS = "nameWithOwner,viewerPermission";
+
+/**
+ * Report the account Overlord acts as here, and check that it can do the two
+ * things it exists for: open a pull request, and push a branch.
+ *
+ * This is a preflight for a project Overlord has not been used in yet. The
+ * account is configured once for every project, but access is granted per
+ * repository, so the answer to "will pull requests here be opened by the bot?"
+ * is different in every checkout and is otherwise only discovered by opening
+ * one under the wrong name.
+ *
+ * Exit 0 when a configured account was verified, 1 otherwise — including when
+ * no account is configured at all, because the question the command answers is
+ * "does this repository produce agent-owned pull requests?", and then it does
+ * not.
+ */
+export async function identity(argv: string[]): Promise<number> {
+  const { positional, options } = parseArgs(argv);
+  if (positional.length > 0 || Object.keys(options).length > 0) {
+    process.stderr.write(
+      "usage: change identity\n" +
+        "change identity takes no argument: it reports the account this " +
+        "checkout acts as.\n",
+    );
+    return 2;
+  }
+
+  const resolution = await agentIdentity();
+  if (resolution.status === "unconfigured") {
+    process.stdout.write(`agent account:    (none configured)\n`);
+    for (const line of unconfiguredHint()) process.stderr.write(`${line}\n`);
+    return 1;
+  }
+  if (resolution.status === "failed") {
+    process.stdout.write(`agent account:    (could not be resolved)\n`);
+    process.stderr.write(`${resolution.reason}\n`);
+    return 1;
+  }
+
+  const { identity: account } = resolution;
+  process.stdout.write(`agent account:    ${describeAccount(account)}\n`);
+  process.stdout.write(`token source:     ${account.source}\n`);
+
+  let root: string;
+  try {
+    root = await mainRepoRoot();
+  } catch (error) {
+    process.stderr.write(
+      `not inside a git repository: ${(error as Error).message}\n`,
+    );
+    return 1;
+  }
+
+  // 1. The token has to belong to the account that was asked for. A token
+  //    read from `$OVERLORD_GH_TOKEN` is whatever the user pasted, and a
+  //    keyring entry can be renamed; either way, acting as the wrong account
+  //    would be invisible until a pull request appeared under it.
+  const viewer = await gh(["api", "user", "--jq", ".login"], root);
+  if (viewer.code !== 0) {
+    process.stderr.write(
+      `the agent account's token was rejected by GitHub: ` +
+        `${failureMessage(viewer)}\n`,
+    );
+    return 1;
+  }
+  const login = viewer.stdout.trim();
+  process.stdout.write(`github login:     ${login || "(unknown)"}\n`);
+  if (
+    account.account !== null &&
+    login.toLowerCase() !== account.account.toLowerCase()
+  ) {
+    process.stderr.write(
+      `the token resolved for "${account.account}" authenticates as ` +
+        `"${login}". Pull requests would be opened by "${login}".\n`,
+    );
+    return 1;
+  }
+
+  // 2. Write access on this repository, which is granted per repository and is
+  //    what a push and a pull request both need.
+  const repo = await gh(["repo", "view", "--json", REPO_VIEW_FIELDS], root);
+  if (repo.code !== 0) {
+    process.stderr.write(
+      `${login} cannot read this repository: ${failureMessage(repo)}\n` +
+        `Add ${login} as a collaborator with write access.\n`,
+    );
+    return 1;
+  }
+  const view = parseJson<{
+    nameWithOwner?: unknown;
+    viewerPermission?: unknown;
+  }>(repo.stdout);
+  if (!view) {
+    process.stderr.write(
+      `could not read: gh repo view --json ${REPO_VIEW_FIELDS}\n`,
+    );
+    return 1;
+  }
+  const nameWithOwner =
+    typeof view.nameWithOwner === "string" ? view.nameWithOwner : "(unknown)";
+  const permission =
+    typeof view.viewerPermission === "string"
+      ? view.viewerPermission
+      : "(unknown)";
+  process.stdout.write(`repository:       ${nameWithOwner}\n`);
+  process.stdout.write(`permission:       ${permission}\n`);
+  if (!WRITE_PERMISSIONS.has(permission)) {
+    process.stderr.write(
+      `${login} has "${permission}" on ${nameWithOwner}, which cannot push a ` +
+        `branch or open a pull request. Add ${login} as a collaborator with ` +
+        `write access.\n`,
+    );
+    return 1;
+  }
+
+  // 3. The push is authenticated by a credential helper, which only HTTPS
+  //    remotes ask for.
+  const url = await pushRemoteUrl(root);
+  process.stdout.write(`push remote:      ${url ?? "(none)"}\n`);
+  if (url === null) {
+    process.stderr.write(
+      `origin has no push URL, so no branch can be pushed from here.\n`,
+    );
+    return 1;
+  }
+  const warning = pushAttributionWarning(account, url);
+  if (warning) {
+    process.stdout.write(`push identity:    (not the agent account)\n`);
+    process.stderr.write(`${warning}\n`);
+    return 1;
+  }
+  process.stdout.write(`push identity:    ${login}\n`);
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
 
@@ -2849,6 +2918,8 @@ commands:
                       pull request that merges the finished card into the
                       repository default branch, and record it in the card's
                       delivery
+  identity            report the GitHub account this checkout pushes and opens
+                      pull requests as, and check that it can do both here
 
 options:
   --board <path>      board.yaml, or a project directory containing one
@@ -2865,6 +2936,17 @@ options:
   --all               sync only: every card on the board instead of one card
 
 merge takes only <change-id> and --board; any other option is a usage error.
+identity takes no argument at all.
+
+environment:
+  $OVERLORD_GH_ACCOUNT
+                      gh account to push and open pull requests as, instead of
+                      the active one. The active gh account is not switched;
+                      the token is read with "gh auth token --user <account>"
+                      and handed to each command through its environment
+  $OVERLORD_GH_TOKEN
+                      that account's token directly, for a machine where it is
+                      not in the gh keyring
 `;
 
 export async function main(argv: string[]): Promise<number> {
@@ -2875,6 +2957,7 @@ export async function main(argv: string[]): Promise<number> {
   if (command === "sync") return sync(argv.slice(1));
   if (command === "merge") return merge(argv.slice(1));
   if (command === "deliver") return deliver(argv.slice(1));
+  if (command === "identity") return identity(argv.slice(1));
   if (command === undefined || command === "--help" || command === "-h") {
     process.stdout.write(USAGE);
     return command === undefined ? 2 : 0;

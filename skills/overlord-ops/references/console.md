@@ -164,11 +164,13 @@ cmux new-workspace --name "<change-id> <title>" --cwd <出力された worktree 
 /path/to/overlord/scripts/change.sh sync <card-id>         # カードの各 change の PR 状態を board に反映
 # カードの change が全て merged になった後
 /path/to/overlord/scripts/change.sh deliver <card-id>      # カードをデフォルトブランチへ出す PR を作り item.delivery に記録
+# 新しいプロジェクトで最初に一度
+/path/to/overlord/scripts/change.sh identity               # push と PR に使う GitHub アカウントを確認する
 ```
 
-Every subcommand takes `--board <path>` (a `board.yaml`, or a project directory containing one) when the board is not the one under the current directory; without it they fall back to `$OVERLORD_BOARD` and then to the current directory. `start` and `pr` also take `--base <branch>`, which defaults to the current branch of the main checkout: `start` branches from it and `pr` opens the pull request against it. A change that builds on the previous one is stacked by passing `--base overlord/<前の change-id>` to both commands, so its diff shows only its own work.
+Every subcommand except `identity` takes `--board <path>` (a `board.yaml`, or a project directory containing one) when the board is not the one under the current directory; without it they fall back to `$OVERLORD_BOARD` and then to the current directory. `start` and `pr` also take `--base <branch>`, which defaults to the current branch of the main checkout: `start` branches from it and `pr` opens the pull request against it. A change that builds on the previous one is stacked by passing `--base overlord/<前の change-id>` to both commands, so its diff shows only its own work.
 
-Exit codes are the same for all six: 0 when the command did what it says, 1 when a git, `gh` or board step failed, and 2 for a usage or argument error. A failure leaves `board.yaml` untouched.
+Exit codes are the same for all of them: 0 when the command did what it says, 1 when a git, `gh` or board step failed, and 2 for a usage or argument error. A failure leaves `board.yaml` untouched.
 
 `start` prints the worktree path on its last line — `<repo>/.overlord/worktrees/<change-id>` — and writes `changes[].branch` plus `changes[].state: implementing`. `pr` pushes the branch, opens the pull request — or reuses the one already open for that branch — and writes `changes[].pr` (`number`, `url`, `state`, `head_sha`). The change state follows the pull request: `reviewing` for an open one, `done` for one that is already merged, unchanged for a closed one. `pr --number <n>` records a pull request that was opened from the GitHub web UI instead of creating one; the number is checked against `changes[].branch` (`gh pr view --json headRefName`), and a pull request on any other branch is refused without writing the board, so a mistyped number cannot overwrite the record of the correct pull request. Both commands leave `board.yaml` untouched when the git or `gh` step fails, so they can be run again.
 
@@ -196,6 +198,53 @@ Finally the session is written into the card, with `cwd` set to the worktree `st
 ```
 
 The console shows this session read-only on the card with a `cmux で開く` button. The identifiers become stale when the workspace is closed; the console then reports the session as not found. Work that does not need its own terminal — discovery, card creation, briefs, independent review — runs as a subagent inside the commander session and never appears in `agent`.
+
+## エージェント名義の GitHub アカウント
+
+Overlord が push する branch と作る pull request は、既定では `gh` のアクティブアカウント、つまり利用者本人の名義になる。`OVERLORD_GH_ACCOUNT` に `gh` のアカウント名を設定すると、その2つだけが別のアカウントの名義で行われる。
+
+```bash
+export OVERLORD_GH_ACCOUNT=<account>
+```
+
+これは監査のためだけの分離ではない。GitHub は pull request の作成者による自己承認を許さないため、「承認1件必須・bypass なし」の ruleset が main を守っている場合、**pull request が利用者以外の名義で作られていることが、利用者の承認なしに main へマージされないことの前提になる**。pull request が利用者名義に戻ると、この保証は失われる。
+
+| 状態 | 挙動 |
+| --- | --- |
+| 未設定 | 従来どおり。`gh` のアクティブアカウントで push し、pull request を作る |
+| 設定済み・解決できる | `gh auth token --user <account>` でトークンを読み、`gh` には `GH_TOKEN` として、`git push` には credential helper として、**そのサブプロセスにだけ**渡す |
+| 設定済み・解決できない | 該当コマンドは非0で終了する。アクティブアカウントへフォールバックしない |
+
+`OVERLORD_GH_TOKEN` にトークンを直接置くこともできる。`gh` の keyring にそのアカウントが無い環境向けで、設定されていれば `OVERLORD_GH_ACCOUNT` より優先される。
+
+決めておくこと:
+
+- **`gh auth switch` は使わない。** アクティブアカウントの切り替えはプロセス全体に永続的に効くため、並行して動く別の Overlord セッションと競合し、失敗したときに利用者のシェルが bot のままになる。トークンは各サブプロセスの環境変数として渡す。
+- **トークンは argv・標準出力・標準エラー・ファイルのいずれにも出さない。** `git -c http.extraheader=...` やリモート URL への埋め込みはコマンドラインに載るため使わない。`git push` には `-c credential.helper=`（既存の helper を空にする）と、環境変数から読む helper の2つを渡す。空にする指定が要るのは、macOS の osxkeychain と `gh auth setup-git` が入れる `credential.https://github.com.helper` が先に応答すると、利用者の資格情報で push されるためである。
+- **読み取りだけの `gh` 呼び出しも同じアカウントで実行する。** 書き込みだけを切り替える設計にすると「どの `gh` サブコマンドが書き込みか」の一覧を持つことになり、その一覧から漏れたサブコマンドが利用者名義で pull request を作る。ここで避けたい事故はそれ1つなので、`sync` や `reviewed` の読み取りも含めて一律に切り替える。代わりに、**エージェント用アカウントは Overlord を使う各リポジトリで read 権限以上を持っている必要がある**（pull request を作るためにどのみち write が要る）。
+- push にこのアカウントが使われるのは、リモートが `https://github.com/...`（`GH_HOST` を設定している場合はそのホスト）のときだけである。ssh リモートや別ホストのリモートには、トークンを送らずに警告を出して push する。
+
+`change identity` はこの設定がこのリポジトリで機能するかを確認する。
+
+```bash
+/path/to/overlord/scripts/change.sh identity
+```
+
+```text
+agent account:    ISSEI-BOT
+token source:     gh auth token --user ISSEI-BOT
+github login:     ISSEI-BOT
+repository:       ISSEI51/overlord-skill
+permission:       WRITE
+push remote:      https://github.com/ISSEI51/overlord-skill.git
+push identity:    ISSEI-BOT
+```
+
+順に、トークンが解決できること、そのトークンが名乗るアカウントが指定したアカウントと一致すること、そのアカウントがこのリポジトリで write を持つこと、push リモートがそのトークンで認証できるホストであることを確認する。どれかを満たさない場合は exit 1 で、満たさなかった項目を stderr に出す。アカウントが未設定の場合も exit 1 になる（この設問に対する答えが「いいえ」であるため）。アカウントの設定は全プロジェクト共通だが、リポジトリへのアクセス権はリポジトリごとに与えるものなので、新しいプロジェクトで Overlord を使い始めるときはこのコマンドで確認する。
+
+`pr` は実行のたびに使用したアカウントを `agent account:` の行に出す。
+
+対象外: commit の author は変わらない。commit は各 change の worktree で利用者の git 設定のまま作られる。ruleset が見るのは pull request の作成者なので、この change の目的には commit の author は関係しない。
 
 ## change をマージする
 
