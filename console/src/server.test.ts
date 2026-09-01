@@ -25,6 +25,15 @@ import { join } from "node:path";
 
 import { loadBoard, saveBoard, type Board, type Item } from "./board.ts";
 
+/**
+ * The tests below are about the behaviour with no agent account configured,
+ * which is what CI runs with. A developer who exports `OVERLORD_GH_ACCOUNT`
+ * for their own work must get the same results, so the variables are cleared
+ * for this process, and for the server it starts as a child.
+ */
+delete process.env.OVERLORD_GH_ACCOUNT;
+delete process.env.OVERLORD_GH_TOKEN;
+
 const serverPath = join(import.meta.dir, "server.ts");
 const temporaries: string[] = [];
 

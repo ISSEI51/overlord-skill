@@ -279,6 +279,63 @@ A live `board.yaml` records absolute paths that contain your home directory (`co
 
 For the repository's merge-method setting, see [Why merge commits](#why-merge-commits).
 
+## The GitHub account the agent acts as
+
+Branches Overlord pushes and pull requests it opens are attributed to your own account by default. Point Overlord at a separate account and those two operations — and only those two — happen under that account instead.
+
+This is not only about telling the agent's work apart from yours. GitHub does not let the author of a pull request approve it, so when `main` is protected by a ruleset that requires one approval and grants no bypass, **the pull request being opened by somebody other than you is what makes "nothing reaches main without your approval" true**. A pull request that goes back to your name loses that guarantee.
+
+With nothing configured, behaviour is unchanged: the active `gh` account pushes and opens pull requests.
+
+### Setting it up
+
+1. **Add the bot account to the repository as a Write collaborator.** Not Admin: an Admin can delete the ruleset, which makes the protection meaningless.
+
+2. **Create a classic personal access token on the bot account,** with exactly the `repo`, `read:org` and `gist` scopes — the scopes `gh auth login` requires. **Do not add `workflow`**; it would let the agent rewrite the CI workflow.
+
+   A fine-grained PAT may not work here: it cannot be granted access to a repository owned by another person's user account. For an organization-owned repository it can.
+
+3. **Register it with `gh`.** The active account does not change, and Overlord never changes it.
+
+   ```bash
+   gh auth login --hostname github.com
+   gh auth status          # two accounts; the active one stays yours
+   ```
+
+4. **Set the environment variable,** in your shell profile so it applies to every project.
+
+   ```bash
+   echo 'export OVERLORD_GH_ACCOUNT=<bot account name>' >> ~/.zshrc
+   ```
+
+   This repository's `.env` is another place to put it, but `.env` is read only by `just` recipes; `scripts/change.sh` and a console server started directly do not see it. `.env` is in `.gitignore`.
+
+5. **Check it** in the target repository.
+
+   ```bash
+   /path/to/overlord/scripts/change.sh identity
+   ```
+
+   ```text
+   agent account:    ISSEI-BOT
+   token source:     gh auth token --user ISSEI-BOT
+   github login:     ISSEI-BOT
+   repository:       ISSEI51/overlord-skill
+   permission:       WRITE
+   push remote:      https://github.com/ISSEI51/overlord-skill.git
+   push identity:    ISSEI-BOT
+   ```
+
+   In that order: the token can be read, the account it authenticates as is the account you named, that account has write access to this repository, and the push remote is a host the token is sent to. Anything unmet exits 1 with the reason. **The account is configured once for every project, but repository access is granted per repository, so steps 1 and 5 are what you repeat in each new project.**
+
+### What is fixed
+
+- **The active `gh` account is never switched.** `gh auth switch` is process-wide and permanent, so it would collide with a session running in parallel. The token is handed to each subprocess through its environment instead.
+- **A configured account whose token cannot be read makes the command fail.** It never falls back to your account: a pull request quietly opened under your name is the outcome this exists to prevent.
+- **The token never appears in a command line, on stdout, on stderr, or in a file.** It is passed to child processes as an environment variable and nowhere else.
+- The push uses that account only when the remote is `https://github.com/...`. An ssh remote authenticates with a key, so the push happens under the key and Overlord says so rather than sending the token.
+- Only the push and the pull request change hands. **Commits keep your authorship.** The ruleset looks at who opened the pull request, which is what this is about.
+
 ## Daily use
 
 1. **Capture observations**: 気づきを追加 (add an observation) in the top bar, or 気づきをカードに (capture an observation) in the sidebar
@@ -293,6 +350,7 @@ For the repository's merge-method setting, see [Why merge commits](#why-merge-co
 - The console is your view; the AI always works from `board.yaml`. Writes are protected by optimistic locking, so the AI's updates are never silently overwritten
 - Independent review is done by a different subagent from the one that implemented, so no AI reviews its own change
 - Pull requests targeting `main` (a card's delivery PR) are merged with a **merge commit**. Squash and rebase are not used
+- To push and open pull requests under a dedicated account, see [The GitHub account the agent acts as](#the-github-account-the-agent-acts-as). A ruleset on `main` that requires one approval depends on it
 
 ### Why merge commits
 

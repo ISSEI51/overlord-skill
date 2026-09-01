@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 import * as boardModule from "./board.ts";
+import { resetAgentIdentityCache } from "./github-identity.ts";
 import { loadBoard, saveBoard, type Board, type Change } from "./board.ts";
 import {
   applyPullRequestView,
@@ -18,7 +19,9 @@ import {
   deliveryBodyFor,
   deliveryTitleFor,
   findChange,
+  gh,
   git,
+  identity,
   ItemNotFoundError,
   main,
   merge,
@@ -50,6 +53,15 @@ import {
   type MergeView,
   type PullRequestView,
 } from "./change.ts";
+
+/**
+ * The tests below are about the behaviour with no agent account configured,
+ * which is what CI runs with. A developer who exports `OVERLORD_GH_ACCOUNT`
+ * for their own work must get the same results, so the variables are cleared
+ * for this process; the cases that need an account set it themselves.
+ */
+delete process.env.OVERLORD_GH_ACCOUNT;
+delete process.env.OVERLORD_GH_TOKEN;
 
 /**
  * Count board writes.
@@ -3993,4 +4005,530 @@ describe("merge CLI", () => {
     expect(stderr).toContain('merges into "main"');
     expect(stderr).toContain(`Nothing was merged and nothing was written to ${boardPath}`);
   }, 20_000);
+});
+
+// ---------------------------------------------------------------------------
+// the agent account
+// ---------------------------------------------------------------------------
+
+/** The environment variables the cases below set and put back. */
+const ACCOUNT_ENV = [
+  "OVERLORD_GH_ACCOUNT",
+  "OVERLORD_GH_TOKEN",
+  "PATH",
+  "GH_ACCOUNT_STUB_DIR",
+  "GH_ACCOUNT_STUB_LOG",
+  "GIT_PUSH_STUB_LOG",
+];
+
+/**
+ * Run `body` with `overrides` applied to the environment, then put it back and
+ * forget the resolved token.
+ *
+ * The token is cached for the life of the process, so a case that changed the
+ * configuration would otherwise decide what the next one resolves.
+ */
+async function withAccount<T>(
+  overrides: Record<string, string | undefined>,
+  body: () => Promise<T>,
+): Promise<T> {
+  const previous: Record<string, string | undefined> = {};
+  for (const name of ACCOUNT_ENV) previous[name] = process.env[name];
+  for (const [name, value] of Object.entries(overrides)) {
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+  }
+  resetAgentIdentityCache();
+  try {
+    return await body();
+  } finally {
+    for (const name of ACCOUNT_ENV) {
+      if (previous[name] === undefined) delete process.env[name];
+      else process.env[name] = previous[name];
+    }
+    resetAgentIdentityCache();
+  }
+}
+
+/**
+ * A `gh` that records its argument vector and the tokens in its environment.
+ *
+ * `gh auth token --user <account>` answers with `<account>-token`, so what the
+ * agent account resolved to and what reached the next `gh` call can be
+ * compared. Every other subcommand prints an empty JSON document, which is
+ * enough for the cases here: they assert on how `gh` was called, not on what
+ * it answered.
+ */
+async function ghAccountStub(
+  known: string[],
+  answers: Record<string, string> = {},
+): Promise<{
+  dir: string;
+  log: string;
+  calls: () => Promise<{ argv: string; ghToken: string; githubToken: string }[]>;
+}> {
+  const dir = await scratch();
+  const log = join(dir, "gh.log");
+  const script = [
+    "#!/bin/sh",
+    `printf 'argv=%s\\tGH_TOKEN=%s\\tGITHUB_TOKEN=%s\\n' "$*" "$GH_TOKEN" "$GITHUB_TOKEN" >> "$GH_ACCOUNT_STUB_LOG"`,
+    'if [ "$1 $2" = "auth token" ]; then',
+    `  for account in ${known.map((a) => JSON.stringify(a)).join(" ")}; do`,
+    '    if [ "$4" = "$account" ]; then echo "$account-token"; exit 0; fi',
+    "  done",
+    '  echo "no oauth token found for github.com account $4" >&2',
+    "  exit 1",
+    "fi",
+    // `identity` asks who the token is and what it may do here; a case that
+    // canned no answer for either gets a failing `gh`, not a silent success.
+    'if [ -f "$GH_ACCOUNT_STUB_DIR/$1-$2.txt" ]; then',
+    '  cat "$GH_ACCOUNT_STUB_DIR/$1-$2.txt"',
+    "  exit 0",
+    "fi",
+    'if [ "$1" = pr ]; then echo \'{}\'; exit 0; fi',
+    'echo "stub gh: no canned answer for: $*" >&2',
+    "exit 1",
+    "",
+  ].join("\n");
+  const executable = join(dir, "gh");
+  await Bun.write(executable, script);
+  chmodSync(executable, 0o755);
+  for (const [name, value] of Object.entries(answers)) {
+    await Bun.write(join(dir, `${name}.txt`), value);
+  }
+  return {
+    dir,
+    log,
+    calls: async () => {
+      if (!(await Bun.file(log).exists())) return [];
+      return (await Bun.file(log).text())
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => {
+          const [argv, ghToken, githubToken] = line.split("\t");
+          return {
+            argv: argv!.slice("argv=".length),
+            ghToken: ghToken!.slice("GH_TOKEN=".length),
+            githubToken: githubToken!.slice("GITHUB_TOKEN=".length),
+          };
+        });
+    },
+  };
+}
+
+/**
+ * A `git` that records every `push` with the credential in its environment and
+ * refuses it, and hands everything else to the real `git`.
+ *
+ * Refusing is what makes the cases safe: a test that reached a real `git push`
+ * would write to a remote.
+ */
+async function gitPushStub(): Promise<{
+  dir: string;
+  log: string;
+  pushes: () => Promise<{ argv: string[]; username: string; token: string }[]>;
+}> {
+  const dir = await scratch();
+  const log = join(dir, "push.log");
+  const real = await shell(["/bin/sh", "-c", "command -v git"], dir);
+  const script = [
+    "#!/bin/sh",
+    'for argument in "$@"; do',
+    '  if [ "$argument" = push ]; then',
+    `    printf '%s\\037' "$@" | base64 | tr -d '\\n' >> "$GIT_PUSH_STUB_LOG"`,
+    `    printf '\\t%s\\t%s\\n' "$OVERLORD_GIT_CREDENTIAL_USERNAME" "$OVERLORD_GIT_CREDENTIAL_TOKEN" >> "$GIT_PUSH_STUB_LOG"`,
+    '    echo "stub git: refusing to push" >&2',
+    "    exit 1",
+    "  fi",
+    "done",
+    `exec ${JSON.stringify(real)} "$@"`,
+    "",
+  ].join("\n");
+  const executable = join(dir, "git");
+  await Bun.write(executable, script);
+  chmodSync(executable, 0o755);
+  return {
+    dir,
+    log,
+    pushes: async () => {
+      if (!(await Bun.file(log).exists())) return [];
+      return (await Bun.file(log).text())
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => {
+          const [encoded, username, token] = line.split("\t");
+          return {
+            argv: Buffer.from(encoded!, "base64")
+              .toString("utf8")
+              .split(ARG_SEPARATOR)
+              .slice(0, -1),
+            username: username ?? "",
+            token: token ?? "",
+          };
+        });
+    },
+  };
+}
+
+describe("gh under the agent account", () => {
+  test("no account configured leaves gh exactly as it was", async () => {
+    const stub = await ghAccountStub([]);
+    const result = await withAccount(
+      {
+        OVERLORD_GH_ACCOUNT: undefined,
+        OVERLORD_GH_TOKEN: undefined,
+        PATH: `${stub.dir}:${process.env.PATH ?? ""}`,
+        GH_ACCOUNT_STUB_LOG: stub.log,
+      },
+      () => gh(["pr", "view", "7"]),
+    );
+
+    expect(result.code).toBe(0);
+    const calls = await stub.calls();
+    expect(calls.map((call) => call.argv)).toEqual(["pr view 7"]);
+    // Nothing was resolved, so nothing was added to the environment either.
+    expect(calls[0]!.ghToken).toBe("");
+  });
+
+  test("a configured account reaches gh as GH_TOKEN and not as an argument", async () => {
+    const stub = await ghAccountStub(["ISSEI-BOT"]);
+    const result = await withAccount(
+      {
+        OVERLORD_GH_ACCOUNT: "ISSEI-BOT",
+        OVERLORD_GH_TOKEN: undefined,
+        PATH: `${stub.dir}:${process.env.PATH ?? ""}`,
+        GH_ACCOUNT_STUB_LOG: stub.log,
+      },
+      () => gh(["pr", "create", "--title", "t"]),
+    );
+
+    const calls = await stub.calls();
+    expect(calls.map((call) => call.argv)).toEqual([
+      "auth token --user ISSEI-BOT",
+      "pr create --title t",
+    ]);
+    expect(calls[1]!.ghToken).toBe("ISSEI-BOT-token");
+    // GITHUB_TOKEN is emptied, so an inherited one cannot decide the account.
+    expect(calls[1]!.githubToken).toBe("");
+    // The token is in the environment and nowhere else.
+    expect(calls[1]!.argv).not.toContain("ISSEI-BOT-token");
+    expect(result.stdout).not.toContain("ISSEI-BOT-token");
+    expect(result.stderr).not.toContain("ISSEI-BOT-token");
+  });
+
+  test("an account gh does not know fails the call instead of using the active one", async () => {
+    const stub = await ghAccountStub(["ISSEI-BOT"]);
+    const result = await withAccount(
+      {
+        OVERLORD_GH_ACCOUNT: "gone",
+        OVERLORD_GH_TOKEN: undefined,
+        PATH: `${stub.dir}:${process.env.PATH ?? ""}`,
+        GH_ACCOUNT_STUB_LOG: stub.log,
+      },
+      () => gh(["pr", "create", "--title", "t"]),
+    );
+
+    expect(result.code).toBe(RUN_FAILED);
+    expect(result.stderr).toContain("OVERLORD_GH_ACCOUNT=gone");
+    expect(result.stderr).toContain("no oauth token found");
+    // `pr create` was never run: a pull request under the user's name is the
+    // one outcome this must not produce.
+    expect((await stub.calls()).map((call) => call.argv)).toEqual([
+      "auth token --user gone",
+    ]);
+  });
+});
+
+describe("git push under the agent account", () => {
+  test("an https github remote is pushed with the agent account's credential", async () => {
+    const repo = await deliveryRepo();
+    // Fetch keeps using the local bare origin, so only the push is redirected.
+    await gitIn(
+      ["remote", "set-url", "--push", "origin", "https://github.com/o/r.git"],
+      repo.root,
+    );
+    const boardPath = await writeDeliveryBoard([MERGED_CHANGE]);
+    const ghStub = await deliverGhStub({ "view-50.json": VIEW_50_UNCHANGED });
+    const push = await gitPushStub();
+
+    const outcome = await withAccount(
+      {
+        OVERLORD_GH_ACCOUNT: undefined,
+        OVERLORD_GH_TOKEN: "ghp_agent",
+        PATH: `${push.dir}:${ghStub.dir}:${process.env.PATH ?? ""}`,
+        GIT_PUSH_STUB_LOG: push.log,
+      },
+      () =>
+        withGhStub(ghStub, () =>
+          deliverCard({
+            boardPath,
+            cardId: "OV-500",
+            cwd: repo.root,
+            head: "feature",
+          }),
+        ),
+    );
+
+    expect(outcome.status).toBe("failed");
+    const pushes = await push.pushes();
+    expect(pushes).toHaveLength(1);
+    const argv = pushes[0]!.argv;
+    // The helper list is emptied first, or the macOS keychain and the helper
+    // `gh auth setup-git` installs would answer with the user's account.
+    expect(argv.slice(0, 5)).toEqual([
+      "-c",
+      "credential.helper=",
+      "-c",
+      expect.stringContaining("credential.helper=!f()"),
+      "push",
+    ]);
+    expect(argv.join(" ")).not.toContain("ghp_agent");
+    expect(pushes[0]!.username).toBe("x-access-token");
+    expect(pushes[0]!.token).toBe("ghp_agent");
+  }, 20_000);
+
+  test("a remote the token does not belong to is warned about, not sent the token", async () => {
+    // `deliveryRepo` puts origin on a local path, which is every remote that
+    // is not an https GitHub URL: an ssh remote behaves the same way.
+    const repo = await deliveryRepo();
+    const boardPath = await writeDeliveryBoard([MERGED_CHANGE]);
+    const ghStub = await deliverGhStub({ "view-50.json": VIEW_50_UNCHANGED });
+    const push = await gitPushStub();
+
+    const outcome = await withAccount(
+      {
+        OVERLORD_GH_ACCOUNT: undefined,
+        OVERLORD_GH_TOKEN: "ghp_agent",
+        PATH: `${push.dir}:${ghStub.dir}:${process.env.PATH ?? ""}`,
+        GIT_PUSH_STUB_LOG: push.log,
+      },
+      () =>
+        withGhStub(ghStub, () =>
+          deliverCard({
+            boardPath,
+            cardId: "OV-500",
+            cwd: repo.root,
+            head: "feature",
+          }),
+        ),
+    );
+
+    expect(outcome.warnings.join("\n")).toContain("not an HTTPS URL");
+    const pushes = await push.pushes();
+    expect(pushes).toHaveLength(1);
+    expect(pushes[0]!.argv[0]).toBe("push");
+    expect(pushes[0]!.token).toBe("");
+  }, 20_000);
+
+  test("with no account configured the push is unchanged", async () => {
+    const repo = await deliveryRepo();
+    const boardPath = await writeDeliveryBoard([MERGED_CHANGE]);
+    const ghStub = await deliverGhStub({ "view-50.json": VIEW_50_UNCHANGED });
+    const push = await gitPushStub();
+
+    const outcome = await withAccount(
+      {
+        OVERLORD_GH_ACCOUNT: undefined,
+        OVERLORD_GH_TOKEN: undefined,
+        PATH: `${push.dir}:${ghStub.dir}:${process.env.PATH ?? ""}`,
+        GIT_PUSH_STUB_LOG: push.log,
+      },
+      () =>
+        withGhStub(ghStub, () =>
+          deliverCard({
+            boardPath,
+            cardId: "OV-500",
+            cwd: repo.root,
+            head: "feature",
+          }),
+        ),
+    );
+
+    expect(outcome.warnings).toEqual([]);
+    const pushes = await push.pushes();
+    expect(pushes[0]!.argv[0]).toBe("push");
+  }, 20_000);
+});
+
+describe("pr names the account it acts as", () => {
+  test("the account is on stdout and an unresolvable one stops the push", async () => {
+    const boardPath = await writeStartedBoard();
+    const before = await Bun.file(boardPath).text();
+    const stub = await ghAccountStub(["ISSEI-BOT"]);
+    const push = await gitPushStub();
+
+    const { code, stdout, stderr } = await withAccount(
+      {
+        OVERLORD_GH_ACCOUNT: "gone",
+        OVERLORD_GH_TOKEN: undefined,
+        PATH: `${push.dir}:${stub.dir}:${process.env.PATH ?? ""}`,
+        GH_ACCOUNT_STUB_LOG: stub.log,
+        GIT_PUSH_STUB_LOG: push.log,
+      },
+      () => capture(() => pr(["OV-103-C1", "--board", boardPath])),
+    );
+
+    expect(code).toBe(1);
+    expect(stdout).toContain("agent account:    (could not be resolved)");
+    expect(stderr).toContain("OVERLORD_GH_ACCOUNT=gone");
+    // Nothing was pushed and nothing was recorded: an account that cannot be
+    // resolved must not fall back to whoever git would have used.
+    expect(await push.pushes()).toEqual([]);
+    expect(await Bun.file(boardPath).text()).toBe(before);
+  });
+
+  test("a resolvable account is named by its account name", async () => {
+    const boardPath = await writeStartedBoard();
+    const stub = await ghAccountStub(["ISSEI-BOT"]);
+    const push = await gitPushStub();
+
+    const { stdout } = await withAccount(
+      {
+        OVERLORD_GH_ACCOUNT: "ISSEI-BOT",
+        OVERLORD_GH_TOKEN: undefined,
+        PATH: `${push.dir}:${stub.dir}:${process.env.PATH ?? ""}`,
+        GH_ACCOUNT_STUB_LOG: stub.log,
+        GIT_PUSH_STUB_LOG: push.log,
+      },
+      () => capture(() => pr(["OV-103-C1", "--board", boardPath])),
+    );
+
+    expect(stdout).toContain("agent account:    ISSEI-BOT");
+    expect(stdout).not.toContain("ISSEI-BOT-token");
+  });
+
+  test("no account configured says so instead of naming one", async () => {
+    const boardPath = await writeStartedBoard();
+    const push = await gitPushStub();
+
+    const { stdout } = await withAccount(
+      {
+        OVERLORD_GH_ACCOUNT: undefined,
+        OVERLORD_GH_TOKEN: undefined,
+        PATH: `${push.dir}:${process.env.PATH ?? ""}`,
+        GIT_PUSH_STUB_LOG: push.log,
+      },
+      () => capture(() => pr(["OV-103-C1", "--board", boardPath])),
+    );
+
+    expect(stdout).toContain(
+      "agent account:    (none configured, using the active gh account)",
+    );
+  });
+});
+
+describe("change identity", () => {
+  /** `identity` runs in the checkout it is called from, which is this one. */
+  const HERE = { PATH: process.env.PATH ?? "" };
+
+  test("no account configured reports it and exits 1", async () => {
+    const { code, stdout, stderr } = await withAccount(
+      { OVERLORD_GH_ACCOUNT: undefined, OVERLORD_GH_TOKEN: undefined, ...HERE },
+      () => capture(() => identity([])),
+    );
+
+    expect(code).toBe(1);
+    expect(stdout).toContain("agent account:    (none configured)");
+    expect(stderr).toContain("OVERLORD_GH_ACCOUNT");
+  });
+
+  test("an account gh does not know exits 1 and checks nothing else", async () => {
+    const stub = await ghAccountStub(["ISSEI-BOT"]);
+    const { code, stderr } = await withAccount(
+      {
+        OVERLORD_GH_ACCOUNT: "gone",
+        OVERLORD_GH_TOKEN: undefined,
+        PATH: `${stub.dir}:${process.env.PATH ?? ""}`,
+        GH_ACCOUNT_STUB_DIR: stub.dir,
+        GH_ACCOUNT_STUB_LOG: stub.log,
+      },
+      () => capture(() => identity([])),
+    );
+
+    expect(code).toBe(1);
+    expect(stderr).toContain("OVERLORD_GH_ACCOUNT=gone");
+    expect((await stub.calls()).map((call) => call.argv)).toEqual([
+      "auth token --user gone",
+    ]);
+  });
+
+  test("a token that authenticates as somebody else exits 1", async () => {
+    const stub = await ghAccountStub(["ISSEI-BOT"], {
+      "api-user": "ISSEI51\n",
+    });
+    const { code, stderr } = await withAccount(
+      {
+        OVERLORD_GH_ACCOUNT: "ISSEI-BOT",
+        OVERLORD_GH_TOKEN: undefined,
+        PATH: `${stub.dir}:${process.env.PATH ?? ""}`,
+        GH_ACCOUNT_STUB_DIR: stub.dir,
+        GH_ACCOUNT_STUB_LOG: stub.log,
+      },
+      () => capture(() => identity([])),
+    );
+
+    expect(code).toBe(1);
+    expect(stderr).toContain('authenticates as "ISSEI51"');
+  });
+
+  test("an account without write access exits 1 and says what to grant", async () => {
+    const stub = await ghAccountStub(["ISSEI-BOT"], {
+      "api-user": "ISSEI-BOT\n",
+      "repo-view": JSON.stringify({
+        nameWithOwner: "ISSEI51/overlord-skill",
+        viewerPermission: "READ",
+      }),
+    });
+    const { code, stdout, stderr } = await withAccount(
+      {
+        OVERLORD_GH_ACCOUNT: "ISSEI-BOT",
+        OVERLORD_GH_TOKEN: undefined,
+        PATH: `${stub.dir}:${process.env.PATH ?? ""}`,
+        GH_ACCOUNT_STUB_DIR: stub.dir,
+        GH_ACCOUNT_STUB_LOG: stub.log,
+      },
+      () => capture(() => identity([])),
+    );
+
+    expect(code).toBe(1);
+    expect(stdout).toContain("permission:       READ");
+    expect(stderr).toContain("collaborator with write access");
+  });
+
+  test("a write collaborator on an https remote reports the whole chain", async () => {
+    const stub = await ghAccountStub(["ISSEI-BOT"], {
+      "api-user": "ISSEI-BOT\n",
+      "repo-view": JSON.stringify({
+        nameWithOwner: "ISSEI51/overlord-skill",
+        viewerPermission: "WRITE",
+      }),
+    });
+    const { code, stdout } = await withAccount(
+      {
+        OVERLORD_GH_ACCOUNT: "ISSEI-BOT",
+        OVERLORD_GH_TOKEN: undefined,
+        PATH: `${stub.dir}:${process.env.PATH ?? ""}`,
+        GH_ACCOUNT_STUB_DIR: stub.dir,
+        GH_ACCOUNT_STUB_LOG: stub.log,
+      },
+      () => capture(() => identity([])),
+    );
+
+    expect(code).toBe(0);
+    expect(stdout).toContain("agent account:    ISSEI-BOT");
+    expect(stdout).toContain("token source:     gh auth token --user ISSEI-BOT");
+    expect(stdout).toContain("github login:     ISSEI-BOT");
+    expect(stdout).toContain("permission:       WRITE");
+    expect(stdout).toContain("push identity:    ISSEI-BOT");
+    // The report is the whole point of the command; it must not leak the token.
+    expect(stdout).not.toContain("ISSEI-BOT-token");
+  });
+
+  test("it takes no argument", async () => {
+    for (const argv of [["OV-103"], ["--board", "/tmp/board.yaml"]]) {
+      const { code, stderr } = await capture(() => identity(argv));
+      expect(code).toBe(2);
+      expect(stderr).toContain("change identity takes no argument");
+    }
+  });
 });
