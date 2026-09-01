@@ -4209,13 +4209,19 @@ async function ghAccountStub(
 ): Promise<{
   dir: string;
   log: string;
-  calls: () => Promise<{ argv: string; ghToken: string; githubToken: string }[]>;
+  calls: () => Promise<{
+    argv: string;
+    ghToken: string;
+    githubToken: string;
+    ghEnterpriseToken: string;
+    githubEnterpriseToken: string;
+  }[]>;
 }> {
   const dir = await scratch();
   const log = join(dir, "gh.log");
   const script = [
     "#!/bin/sh",
-    `printf 'argv=%s\\tGH_TOKEN=%s\\tGITHUB_TOKEN=%s\\n' "$*" "$GH_TOKEN" "$GITHUB_TOKEN" >> "$GH_ACCOUNT_STUB_LOG"`,
+    `printf 'argv=%s\\tGH_TOKEN=%s\\tGITHUB_TOKEN=%s\\tGH_ENTERPRISE_TOKEN=%s\\tGITHUB_ENTERPRISE_TOKEN=%s\\n' "$*" "$GH_TOKEN" "$GITHUB_TOKEN" "$GH_ENTERPRISE_TOKEN" "$GITHUB_ENTERPRISE_TOKEN" >> "$GH_ACCOUNT_STUB_LOG"`,
     'if [ "$1 $2" = "auth token" ]; then',
     `  for account in ${known.map((a) => JSON.stringify(a)).join(" ")}; do`,
     '    if [ "$4" = "$account" ]; then echo "$account-token"; exit 0; fi',
@@ -4249,11 +4255,16 @@ async function ghAccountStub(
         .split("\n")
         .filter(Boolean)
         .map((line) => {
-          const [argv, ghToken, githubToken] = line.split("\t");
+          const [argv, ghToken, githubToken, ghEnterprise, githubEnterprise] =
+            line.split("\t");
           return {
             argv: argv!.slice("argv=".length),
             ghToken: ghToken!.slice("GH_TOKEN=".length),
             githubToken: githubToken!.slice("GITHUB_TOKEN=".length),
+            ghEnterpriseToken: ghEnterprise!.slice("GH_ENTERPRISE_TOKEN=".length),
+            githubEnterpriseToken: githubEnterprise!.slice(
+              "GITHUB_ENTERPRISE_TOKEN=".length,
+            ),
           };
         });
     },
@@ -4358,6 +4369,54 @@ describe("gh under the agent account", () => {
     expect(calls[1]!.argv).not.toContain("ISSEI-BOT-token");
     expect(result.stdout).not.toContain("ISSEI-BOT-token");
     expect(result.stderr).not.toContain("ISSEI-BOT-token");
+  });
+
+  test("on a GitHub Enterprise Server host the token reaches gh as GH_ENTERPRISE_TOKEN", async () => {
+    // `gh` does not read GH_TOKEN for an Enterprise Server host, so without
+    // this the call runs on the stored credential — the user's — and
+    // `gh pr create` opens the pull request under their name.
+    const stub = await ghAccountStub(["ISSEI-BOT"]);
+    await withAccount(
+      {
+        OVERLORD_GH_ACCOUNT: "ISSEI-BOT",
+        OVERLORD_GH_TOKEN: undefined,
+        GH_HOST: "ghe.example.com",
+        PATH: `${stub.dir}:${process.env.PATH ?? ""}`,
+        GH_ACCOUNT_STUB_LOG: stub.log,
+      },
+      () => gh(["pr", "create", "--title", "t"]),
+    );
+
+    const created = (await stub.calls()).find((call) =>
+      call.argv.startsWith("pr create"),
+    )!;
+    expect(created.ghEnterpriseToken).toBe("ISSEI-BOT-token");
+    // The secondary variables stay empty, so an inherited one cannot decide
+    // the account if the one ahead of it were ever dropped.
+    expect(created.githubEnterpriseToken).toBe("");
+    expect(created.githubToken).toBe("");
+  });
+
+  test("on github.com the Enterprise variable is emptied, not given the token", async () => {
+    // A token for one host is not offered to another, which is the rule the
+    // git credential helper follows too.
+    const stub = await ghAccountStub(["ISSEI-BOT"]);
+    await withAccount(
+      {
+        OVERLORD_GH_ACCOUNT: "ISSEI-BOT",
+        OVERLORD_GH_TOKEN: undefined,
+        GH_HOST: undefined,
+        PATH: `${stub.dir}:${process.env.PATH ?? ""}`,
+        GH_ACCOUNT_STUB_LOG: stub.log,
+      },
+      () => gh(["pr", "create", "--title", "t"]),
+    );
+
+    const created = (await stub.calls()).find((call) =>
+      call.argv.startsWith("pr create"),
+    )!;
+    expect(created.ghToken).toBe("ISSEI-BOT-token");
+    expect(created.ghEnterpriseToken).toBe("");
   });
 
   test("an account gh does not know fails the call instead of using the active one", async () => {

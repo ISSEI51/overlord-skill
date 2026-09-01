@@ -181,9 +181,12 @@ export async function agentIdentity(): Promise<IdentityResolution> {
       // `gh auth token` reports the token in the environment when there is
       // one, which here would be a token left over from an outer Overlord run
       // and not the account that was asked for. Emptied so the keyring is the
-      // only source. `gh` treats an empty value as unset.
+      // only source. `gh` treats an empty value as unset. All four, because
+      // which pair `gh` reads depends on the host it is targeting.
       GH_TOKEN: "",
       GITHUB_TOKEN: "",
+      GH_ENTERPRISE_TOKEN: "",
+      GITHUB_ENTERPRISE_TOKEN: "",
     });
     if (read.code !== 0 || read.stdout.trim() === "") {
       return {
@@ -208,18 +211,53 @@ export async function agentIdentity(): Promise<IdentityResolution> {
 }
 
 /**
+ * Whether `gh` reads the Enterprise Server token variables for `host`.
+ *
+ * `gh help environment` (gh 2.89.0) defines the split: `GH_TOKEN` and
+ * `GITHUB_TOKEN` are used "when a command targets either github.com or a
+ * subdomain of ghe.com", and `GH_ENTERPRISE_TOKEN` and
+ * `GITHUB_ENTERPRISE_TOKEN` "when a command targets a GitHub Enterprise Server
+ * host". Everything that is not github.com and not a `ghe.com` subdomain is
+ * therefore an Enterprise Server host as far as `gh` is concerned.
+ *
+ * Measured on gh 2.89.0: with `GH_HOST=ghe.example.com` and `GH_TOKEN` set,
+ * `gh auth status` reports that host as authenticated by `(default)` — the
+ * stored credential — and names `(GH_TOKEN)` only for github.com.
+ */
+function isEnterpriseServerHost(host: string): boolean {
+  return host !== "github.com" && !host.endsWith(".ghe.com");
+}
+
+/**
  * Environment that makes one `gh` call run as the agent account.
  *
  * `GH_TOKEN` takes precedence over every other source `gh` consults, including
- * the active keyring account, so this needs no other setting. `GITHUB_TOKEN` is
- * emptied because `gh` also honours it and an inherited one would otherwise
- * decide which account is used when `GH_TOKEN` were ever dropped.
+ * the active keyring account. On a GitHub Enterprise Server host `gh` does not
+ * read it at all, so the token also goes into `GH_ENTERPRISE_TOKEN` there;
+ * without that, `gh` falls back to the stored credential, which is the user's,
+ * and `gh pr create` opens the pull request under their name — the one
+ * substitution this module exists to prevent, happening silently.
+ *
+ * `GITHUB_TOKEN` and `GITHUB_ENTERPRISE_TOKEN` are emptied because `gh` also
+ * honours them and an inherited one would otherwise decide which account is
+ * used if the variable ahead of it were ever dropped. `gh` treats an empty
+ * value as unset.
+ *
+ * `GH_ENTERPRISE_TOKEN` is emptied rather than set when the account belongs to
+ * github.com: a token for one host is not offered to another, which is the
+ * same rule the git credential helper follows.
  */
 export function ghEnvFor(
   resolution: IdentityResolution,
 ): Record<string, string> | undefined {
   if (resolution.status !== "resolved") return undefined;
-  return { GH_TOKEN: resolution.identity.token, GITHUB_TOKEN: "" };
+  const { token } = resolution.identity;
+  return {
+    GH_TOKEN: token,
+    GITHUB_TOKEN: "",
+    GH_ENTERPRISE_TOKEN: isEnterpriseServerHost(githubHost()) ? token : "",
+    GITHUB_ENTERPRISE_TOKEN: "",
+  };
 }
 
 /**

@@ -212,7 +212,7 @@ export OVERLORD_GH_ACCOUNT=<account>
 | 状態 | 挙動 |
 | --- | --- |
 | 未設定 | 従来どおり。`gh` のアクティブアカウントで push し、pull request を作る |
-| 設定済み・解決できる | `gh auth token --user <account>` でトークンを読み、`gh` には `GH_TOKEN` として、`git push` には credential helper として、**そのサブプロセスにだけ**渡す |
+| 設定済み・解決できる | `gh auth token --user <account>` でトークンを読み、`gh` には `GH_TOKEN`（GitHub Enterprise Server ホストでは `GH_ENTERPRISE_TOKEN` にも）として、`git push` には credential helper として、**そのサブプロセスにだけ**渡す |
 | 設定済み・解決できない | 該当コマンドは非0で終了する。アクティブアカウントへフォールバックしない |
 
 `OVERLORD_GH_TOKEN` にトークンを直接置くこともできる。`gh` の keyring にそのアカウントが無い環境向けで、設定されていれば `OVERLORD_GH_ACCOUNT` より優先される。
@@ -222,6 +222,7 @@ export OVERLORD_GH_ACCOUNT=<account>
 - **`gh auth switch` は使わない。** アクティブアカウントの切り替えはプロセス全体に永続的に効くため、並行して動く別の Overlord セッションと競合し、失敗したときに利用者のシェルが bot のままになる。トークンは各サブプロセスの環境変数として渡す。
 - **トークンは argv・標準出力・標準エラー・ファイルのいずれにも出さない。** `git -c http.extraheader=...` やリモート URL への埋め込みはコマンドラインに載るため使わない。`git push` には `-c credential.helper=`（既存の helper を空にする）と、環境変数から読む helper の2つを渡す。空にする指定が要るのは、macOS の osxkeychain と `gh auth setup-git` が入れる `credential.https://github.com.helper` が先に応答すると、利用者の資格情報で push されるためである。
 - **helper は要求されたホストを検査する。** git が標準入力に書く要求の `host=` が `GH_HOST`（既定は github.com）と一致し、かつ `protocol=https` のときだけ応答し、それ以外は何も出力せず exit 0 する。比較は大文字小文字を区別せず、`host` の末尾のポート（`:443`）は除く。git は `host=` と `protocol=` をリモート URL に書かれたままの表記で渡すため（`https://GitHub.com/o/r.git` は `host=GitHub.com`、`HTTPS://` は `protocol=HTTPS`）、区別すると大文字を含む URL のリモートで push が資格情報を得られなくなる。push リモートのホストは helper を入れる前に確認しているが、その確認では見えない経路（認証付きの `http.proxy`、別ホストへのリダイレクト）で、同じ `git push` の中から別ホストの資格情報が要求されうる。ホストが違えば「そのホストの資格情報は持っていない」と答えるのが正しい。helper は `store` と `erase` にも何も出力しない（トークンを macOS のキーチェーンに書き込ませないため）。
+- **GitHub Enterprise Server ホストでは `GH_ENTERPRISE_TOKEN` にも同じトークンを入れる。** `gh help environment`（gh 2.89.0）によれば、`GH_TOKEN` と `GITHUB_TOKEN` が読まれるのは「コマンドの対象が github.com または ghe.com のサブドメインのとき」で、Enterprise Server ホストが対象のときは `GH_ENTERPRISE_TOKEN` と `GITHUB_ENTERPRISE_TOKEN` が読まれる。実測（gh 2.89.0）: `GH_HOST=ghe.example.com GH_TOKEN=<値> gh auth status` は、そのホストについて `using token (default)`（保存済み資格情報＝利用者のもの）と表示し、`(GH_TOKEN)` と出るのは github.com だけである。`GH_TOKEN` だけを設定していると、Enterprise Server 環境では `gh pr create` が利用者名義で実行される。これはこの機構が防ぐために存在する silent fallback そのものなので、ホストに応じて設定する変数を変える。`GITHUB_TOKEN` と `GITHUB_ENTERPRISE_TOKEN` は常に空にする（継承した値が優先順位の先にある変数の代わりにアカウントを決めてしまわないように）。`GH_ENTERPRISE_TOKEN` は、アカウントが github.com のものであれば空にする（あるホストのトークンを別ホストへ渡さないという、credential helper と同じ規則）。
 - **読み取りだけの `gh` 呼び出しも同じアカウントで実行する。** 書き込みだけを切り替える設計にすると「どの `gh` サブコマンドが書き込みか」の一覧を持つことになり、その一覧から漏れたサブコマンドが利用者名義で pull request を作る。ここで避けたい事故はそれ1つなので、`sync` や `reviewed` の読み取りも含めて一律に切り替える。代わりに、**エージェント用アカウントは Overlord を使う各リポジトリで read 権限以上を持っている必要がある**（pull request を作るためにどのみち write が要る）。
 - push にこのアカウントが使われるのは、リモートが `https://github.com/...`（`GH_HOST` を設定している場合はそのホスト）のときだけである。それ以外のリモートの扱いは2つに分かれ、分かれ目は「利用者の資格情報に置き換わるかどうか」である。
   - **別ホストの https リモート（`https://gitlab.com/...`、`GH_HOST` が Enterprise ホストのときの `https://github.com/...` など）は push しない。** 非0で終了し、何も push せず board も書かない。トークンを他ホストへ送らないだけでは足りない。git は次の helper（macOS の osxkeychain、`gh auth setup-git` が入れたもの）に尋ね、それが利用者のアカウントで応答するため、push は利用者名義で成功してしまう。警告を出して push を通す形にすると、pull request が利用者名義で作られた後に stderr の1行が残るだけになり、ruleset の前提（作成者が利用者以外であること）が黙って崩れる。

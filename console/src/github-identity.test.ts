@@ -51,14 +51,21 @@ afterAll(async () => {
  * records every invocation, so both the token that comes back and the number of
  * times `gh` was run can be asserted.
  */
-async function ghStub(
-  tokens: Record<string, string>,
-): Promise<{ dir: string; log: string; calls: () => Promise<string[]> }> {
+async function ghStub(tokens: Record<string, string>): Promise<{
+  dir: string;
+  log: string;
+  calls: () => Promise<string[]>;
+  /** The four token variables of each invocation, as `NAME=[value]` text. */
+  tokenEnv: () => Promise<string[]>;
+}> {
   const dir = await scratch();
   const log = join(dir, "gh.log");
   const script = [
     "#!/bin/sh",
     'printf "%s\\n" "$*" >> "$GH_AUTH_STUB_LOG"',
+    'printf "GH_TOKEN=[%s] GITHUB_TOKEN=[%s] GH_ENTERPRISE_TOKEN=[%s] GITHUB_ENTERPRISE_TOKEN=[%s]\\n" ' +
+      '"$GH_TOKEN" "$GITHUB_TOKEN" "$GH_ENTERPRISE_TOKEN" "$GITHUB_ENTERPRISE_TOKEN" ' +
+      '>> "$GH_AUTH_STUB_DIR/env.log"',
     'if [ -f "$GH_AUTH_STUB_DIR/$4.token" ]; then',
     '  cat "$GH_AUTH_STUB_DIR/$4.token"',
     "  exit 0",
@@ -73,12 +80,17 @@ async function ghStub(
   for (const [account, token] of Object.entries(tokens)) {
     await Bun.write(join(dir, `${account}.token`), `${token}\n`);
   }
+  const envLog = join(dir, "env.log");
   return {
     dir,
     log,
     calls: async () =>
       (await Bun.file(log).exists())
         ? (await Bun.file(log).text()).split("\n").filter(Boolean)
+        : [],
+    tokenEnv: async () =>
+      (await Bun.file(envLog).exists())
+        ? (await Bun.file(envLog).text()).split("\n").filter(Boolean)
         : [],
   };
 }
@@ -88,6 +100,10 @@ const OWNED = [
   AGENT_ACCOUNT_ENV,
   AGENT_TOKEN_ENV,
   "GH_HOST",
+  "GH_TOKEN",
+  "GITHUB_TOKEN",
+  "GH_ENTERPRISE_TOKEN",
+  "GITHUB_ENTERPRISE_TOKEN",
   "PATH",
   "GH_AUTH_STUB_DIR",
   "GH_AUTH_STUB_LOG",
@@ -216,6 +232,29 @@ describe("resolving the agent account", () => {
     expect(await stub.calls()).toHaveLength(1);
   });
 
+  test("gh auth token is read with every inherited token emptied", async () => {
+    // A token in the environment is what `gh auth token` reports when there is
+    // one, and here that would be a token left over from an outer Overlord run
+    // rather than the account that was asked for. All four are emptied,
+    // because which pair `gh` reads depends on the host it targets.
+    const stub = await ghStub({ "ISSEI-BOT": "ghp_bot" });
+    const resolution = await withEnv(
+      {
+        ...withStub(stub),
+        [AGENT_ACCOUNT_ENV]: "ISSEI-BOT",
+        GH_TOKEN: "inherited-gh",
+        GITHUB_TOKEN: "inherited-github",
+        GH_ENTERPRISE_TOKEN: "inherited-ghe",
+        GITHUB_ENTERPRISE_TOKEN: "inherited-github-ghe",
+      },
+      () => agentIdentity(),
+    );
+    expect(resolution.status).toBe("resolved");
+    expect(await stub.tokenEnv()).toEqual([
+      "GH_TOKEN=[] GITHUB_TOKEN=[] GH_ENTERPRISE_TOKEN=[] GITHUB_ENTERPRISE_TOKEN=[]",
+    ]);
+  });
+
   test("changing the configured account resolves again", async () => {
     const stub = await ghStub({ one: "ghp_one", two: "ghp_two" });
     const tokens = await withEnv(
@@ -235,13 +274,75 @@ describe("resolving the agent account", () => {
 });
 
 describe("the environment a gh call runs with", () => {
-  test("a resolved account is handed to gh as GH_TOKEN", () => {
-    expect(
-      ghEnvFor({
-        status: "resolved",
-        identity: { account: "ISSEI-BOT", token: "ghp_bot", source: "test" },
-      }),
-    ).toEqual({ GH_TOKEN: "ghp_bot", GITHUB_TOKEN: "" });
+  const resolved = {
+    status: "resolved" as const,
+    identity: { account: "ISSEI-BOT", token: "ghp_bot", source: "test" },
+  };
+
+  test("a resolved account is handed to gh as GH_TOKEN", async () => {
+    await withEnv({ GH_HOST: undefined }, async () => {
+      expect(ghEnvFor(resolved)).toEqual({
+        GH_TOKEN: "ghp_bot",
+        GITHUB_TOKEN: "",
+        // Not the host this account belongs to, so it is emptied rather than
+        // given the token: a token for one host is not offered to another.
+        GH_ENTERPRISE_TOKEN: "",
+        GITHUB_ENTERPRISE_TOKEN: "",
+      });
+    });
+  });
+
+  test("on a GitHub Enterprise Server host the token is GH_ENTERPRISE_TOKEN", async () => {
+    // `gh help environment` (gh 2.89.0): GH_TOKEN and GITHUB_TOKEN are read
+    // only "when a command targets either github.com or a subdomain of
+    // ghe.com", and GH_ENTERPRISE_TOKEN "when a command targets a GitHub
+    // Enterprise Server host". Measured on 2.89.0: with GH_HOST set to such a
+    // host and GH_TOKEN set, `gh auth status` reports that host as
+    // authenticated by `(default)` — the stored credential, which is the
+    // user's — and names `(GH_TOKEN)` only for github.com. Without this,
+    // `gh pr create` opens the pull request under the user's name.
+    await withEnv({ GH_HOST: "ghe.example.com" }, async () => {
+      expect(ghEnvFor(resolved)).toEqual({
+        GH_TOKEN: "ghp_bot",
+        GITHUB_TOKEN: "",
+        GH_ENTERPRISE_TOKEN: "ghp_bot",
+        GITHUB_ENTERPRISE_TOKEN: "",
+      });
+    });
+  });
+
+  test("a ghe.com subdomain reads GH_TOKEN, so it is not given the Enterprise one", async () => {
+    // The one Enterprise host `gh` groups with github.com rather than with
+    // Enterprise Server.
+    await withEnv({ GH_HOST: "acme.ghe.com" }, async () => {
+      const env = ghEnvFor(resolved)!;
+      expect(env.GH_TOKEN).toBe("ghp_bot");
+      expect(env.GH_ENTERPRISE_TOKEN).toBe("");
+    });
+  });
+
+  test("the host is read without regard to case", async () => {
+    await withEnv({ GH_HOST: "GHE.Example.COM" }, async () => {
+      expect(ghEnvFor(resolved)!.GH_ENTERPRISE_TOKEN).toBe("ghp_bot");
+    });
+    await withEnv({ GH_HOST: "GitHub.com" }, async () => {
+      expect(ghEnvFor(resolved)!.GH_ENTERPRISE_TOKEN).toBe("");
+    });
+  });
+
+  test("every variable gh could read is set, so nothing inherited decides", async () => {
+    // The invariant: after this, no token that was already in the environment
+    // can choose the account, whichever host the call turns out to target.
+    for (const host of [undefined, "ghe.example.com", "acme.ghe.com"]) {
+      await withEnv({ GH_HOST: host }, async () => {
+        expect(Object.keys(ghEnvFor(resolved)!).sort()).toEqual([
+          "GH_ENTERPRISE_TOKEN",
+          "GH_TOKEN",
+          "GITHUB_ENTERPRISE_TOKEN",
+          "GITHUB_TOKEN",
+        ]);
+      });
+    }
   });
 
   test("no account configured changes nothing about the environment", () => {
