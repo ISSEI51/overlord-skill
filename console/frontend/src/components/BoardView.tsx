@@ -9,7 +9,16 @@ import {
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
 import { useConsole } from "@/console-context";
-import { changeProgress, decisionId, decisionIds, decisionText, hasSession, scoreOf } from "@/lib/board";
+import {
+  cardActivity,
+  changeProgress,
+  decisionId,
+  decisionIds,
+  decisionText,
+  hasSession,
+  scoreOf,
+  type CardActivity,
+} from "@/lib/board";
 import { deliveryTag } from "@/lib/delivery";
 import { STATES, type DeliveryEvent, type Item, type StateKey } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -87,28 +96,14 @@ export function BoardView() {
               </div>
               <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto p-2">
                 {columnItems.map((item) => {
-                  // Done/blocked cards never get the needs-user highlight,
-                  // even if owner === "user" or a decision entry still
-                  // references them (mirrors the exclusion on `running`).
-                  const needsUser =
-                    item.state !== "done" &&
-                    item.state !== "blocked" &&
-                    (item.state === "acceptance" ||
-                      item.owner === "user" ||
-                      needsUserIds.has(item.id));
-                  // AI is actively working on the card. The needs-user
-                  // highlight wins when both apply.
-                  const running =
-                    !needsUser &&
-                    item.owner === "claude" &&
-                    item.state !== "done" &&
-                    item.state !== "blocked";
+                  // Both highlights, their precedence, and why running wins
+                  // over needs-user live in cardActivity.
+                  const activity = cardActivity(item, needsUserIds);
                   return (
                     <BoardCard
                       key={item.id}
                       item={item}
-                      needsUser={needsUser}
-                      running={running}
+                      activity={activity}
                       delivery={deliveries[item.id] ?? null}
                       selected={item.id === selectedId}
                       onSelect={() => select(item.id)}
@@ -131,16 +126,15 @@ export function BoardView() {
 
 function BoardCard({
   item,
-  needsUser,
-  running,
+  activity,
   delivery,
   selected,
   onSelect,
   onDelete,
 }: {
   item: Item;
-  needsUser: boolean;
-  running: boolean;
+  /** Which of the two highlights this card gets, and why. */
+  activity: CardActivity;
   /** The delivery frame seen for this card this session, if any. */
   delivery: DeliveryEvent | null;
   selected: boolean;
@@ -149,8 +143,13 @@ function BoardCard({
   onDelete?: () => void;
 }) {
   const [dragging, setDragging] = useState(false);
+  const { needsUser, running } = activity;
   const score = scoreOf(item);
   const session = hasSession(item);
+  // 作業中 replaces 担当あり while the session is in flight: the border colour
+  // alone does not say which of the two highlights a card has, and a session
+  // recorded on a finished change is not work in progress.
+  const working = running ? activity.session : null;
   // Read-only progress of the card's engineering split; changes never
   // become cards of their own.
   const progress = changeProgress(item);
@@ -188,7 +187,13 @@ function BoardCard({
         <div className="mt-1.5 flex flex-wrap gap-1">
           {item.project && <CardTag>{item.project}</CardTag>}
           {item.owner && <CardTag>{item.owner}</CardTag>}
-          {session && <CardTag className="border-primary/40 text-primary">担当あり</CardTag>}
+          {working ? (
+            <CardTag className="border-running/40 text-running">
+              {working.changeId ? `作業中 ${working.changeId}` : "作業中"}
+            </CardTag>
+          ) : (
+            session && <CardTag className="border-primary/40 text-primary">担当あり</CardTag>
+          )}
           {progress && (
             <CardTag>
               変更 {progress.done}/{progress.total}

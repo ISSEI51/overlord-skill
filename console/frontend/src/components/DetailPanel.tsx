@@ -22,7 +22,9 @@ import { useConsole } from "@/console-context";
 import { errorMessage } from "@/lib/api";
 import {
   activeSession,
+  cardActivity,
   changesOf,
+  decisionIds,
   formatValue,
   stateLabel,
   surfaceLabel,
@@ -152,23 +154,32 @@ function AcceptDoneButton({ item }: { item: Item }) {
  * Fixed card actions: one press sends directly to the commander.
  * sendTemplate carries the in-flight guard, the not-connected error toast,
  * and the success toast.
+ *
+ * A button an unfinished worker session rules out (today only 進める) is
+ * disabled and the reason is printed under the row, so the card says why it
+ * cannot be pushed forward instead of accepting a press that changes nothing.
  */
 function CommandField({ item }: { item: Item }) {
-  const { sendTemplate } = useConsole();
+  const { data, sendTemplate } = useConsole();
+  const templates = cardInstructions(item, cardActivity(item, decisionIds(data.board)));
+  const blocked = templates.find((template) => template.blocked)?.blocked ?? null;
   return (
     <Field label="司令塔への指示">
       <div className="flex flex-wrap gap-1.5">
-        {cardInstructions(item).map((template) => (
+        {templates.map((template) => (
           <Button
             key={template.label}
             variant="outline"
             size="xs"
+            disabled={Boolean(template.blocked)}
+            title={template.blocked ?? undefined}
             onClick={() => void sendTemplate(template.text)}
           >
             {template.label}
           </Button>
         ))}
       </div>
+      {blocked && <div className="mt-1.5 text-[11px] text-running">{blocked}</div>}
       <div className="mt-1.5 text-[11px] text-faint">
         ボタンは司令塔へ直接送信します。
       </div>

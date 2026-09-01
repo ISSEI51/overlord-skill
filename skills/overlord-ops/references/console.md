@@ -111,9 +111,29 @@ unknown option instead, and `--help` exists only on `ensure`.
 - The user can change `state`, `owner`, `next_action`, `blocker`, and the `agent` link from the browser. Those edits are written back to the same file.
 - Card writes use the file's modification time as a revision token. A write from the console is rejected with HTTP 409 when an agent changed the file first, so an agent's write is never silently overwritten.
 
+### The two card highlights
+
+A card gets at most one of two borders. The console decides which from the board alone, in this order — the first line that matches wins:
+
+| Order | Border | Condition |
+| --- | --- | --- |
+| 1 | 作業中 (yellow) | A change whose state is neither `done` nor `blocked` has an `agent.surface_id` — or, on a card with no `changes`, the card-level `agent` has one |
+| 2 | 判断待ち (cyan) | The card's state is `acceptance`, or `owner` is `"user"`, or `decisions_required` names its id |
+| 3 | 作業中 (yellow) | `owner` is `"claude"` |
+
+Done and blocked cards get neither.
+
+**A recorded session is the only thing that takes 作業中 ahead of 判断待ち. `owner: "claude"` does not.** The two running signals are not equally reliable. `changes[].agent` is written when a session is actually started for that change, so it records the present; `owner` is written by hand and a card left at `owner: "claude"` after the work stopped is common, so letting it win would hide an acceptance or an open decision — which is why it is read last.
+
+What the session wins, it earns. It is a fact about the present, while the three 判断待ち sources say what should happen next and go stale on their own, `decisions_required` most of all — an entry stays until someone removes it. Marking a card 判断待ち while a session is working it invites the user to act on unfinished work. Marking it 作業中 keeps the decision visible elsewhere: an `acceptance` card is in the 完成確認待ち column with its 受け入れて完了 button, `owner` is a tag on the card, and a `decisions_required` entry is in the 今日の判断 bar when it is one of the three that bar shows. That last one is the weakest of the three, because the bar is capped at three entries.
+
+While a card has an unfinished session recorded, its 進める button is disabled and the modal says which change is being worked. The other buttons stay available. `owner: "claude"` alone does not disable it: `owner` is hand-written, and a card whose only 作業中 signal is a stale `owner` would otherwise be impossible to advance from the console.
+
+This is why leaving settled entries in `decisions_required`, or a stale `owner`, is a reporting error and not a cosmetic one. Remove an entry as soon as the decision is made.
+
 ## One commander, subagents behind it
 
-The console docks one session on the right: the commander. The user types only there. Cards have no session picker and no compose box; their buttons write an instruction into the commander's input box, and the user presses 送信.
+The console docks one session on the right: the commander. The user types only there. Cards have no session picker and no compose box; their buttons send an instruction to the commander directly, in one press.
 
 The commander is stored at the top level of the board:
 
