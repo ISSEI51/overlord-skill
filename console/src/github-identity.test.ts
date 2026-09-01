@@ -416,6 +416,151 @@ describe("the git credential of a push", () => {
 });
 
 /**
+ * The helper itself, as git would run it.
+ *
+ * A `!`-prefixed helper value is run by git as `sh -c '<body> "$@"' <name>
+ * <operation>`, with the request on stdin. Running it that way, rather than
+ * through `git credential`, is the only way to ask it about a host git would
+ * never ask it about here — which is the case the host check exists for.
+ *
+ * The body is read back out of `pushCredentialArgs`, so what is exercised is
+ * the value git is actually handed and not a second copy of it.
+ */
+async function runHelper(
+  operation: string,
+  request: string,
+  identity: AgentIdentity,
+  env: Record<string, string> = {},
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  const args = pushCredentialArgs();
+  const value = args[args.length - 1]!;
+  const body = value.slice(value.indexOf("=") + 1).replace(/^!/, "");
+  const proc = Bun.spawn(["sh", "-c", `${body} "$@"`, "credential-helper", operation], {
+    env: { ...process.env, ...pushCredentialEnv(identity), ...env },
+    stdin: new TextEncoder().encode(request),
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const stdout = await new Response(proc.stdout).text();
+  const stderr = await new Response(proc.stderr).text();
+  const code = await proc.exited;
+  return { code, stdout, stderr };
+}
+
+/** One credential request, as git writes it on the helper's stdin. */
+function request(fields: Record<string, string>): string {
+  return `${Object.entries(fields)
+    .map(([key, value]) => `${key}=${value}\n`)
+    .join("")}\n`;
+}
+
+describe("the host the credential helper answers for", () => {
+  const identity = { account: "ISSEI-BOT", token: "ghp_host", source: "test" };
+
+  test("the host it was given over https is answered", async () => {
+    const answered = await runHelper(
+      "get",
+      request({ protocol: "https", host: "github.com" }),
+      identity,
+    );
+    expect(answered.code).toBe(0);
+    expect(credentialShape(answered.stdout, identity)).toEqual({
+      username: CREDENTIAL_USERNAME,
+      password: "(the agent account's token)",
+    });
+  });
+
+  test("another host gets nothing, so the token does not leave its own host", async () => {
+    // The case `pushIdentity` cannot see: one `git push` that asks for a
+    // credential for somewhere else — an authenticated `http.proxy`, or a
+    // redirect — after the remote itself was checked and accepted.
+    for (const host of [
+      "gitlab.com",
+      "proxy.internal",
+      "github.com.evil.example",
+      "evil-github.com",
+      "GITHUB.COM.attacker.test",
+      "",
+    ]) {
+      const answered = await runHelper(
+        "get",
+        request({ protocol: "https", host }),
+        identity,
+      );
+      // `redacted` rather than the raw output: a case that starts failing must
+      // not print the credential it was not supposed to hand over.
+      expect(redacted(answered.stdout)).toBe("");
+      // Silence, not failure: a helper that exits non-zero makes git report an
+      // error for a request another helper may legitimately answer.
+      expect(answered.code).toBe(0);
+    }
+  });
+
+  test("the same host without https gets nothing", async () => {
+    // A token sent in the clear is a leaked token, whoever is listening.
+    for (const protocol of ["http", "ftp", ""]) {
+      const answered = await runHelper(
+        "get",
+        request({ protocol, host: "github.com" }),
+        identity,
+      );
+      expect(redacted(answered.stdout)).toBe("");
+      expect(answered.code).toBe(0);
+    }
+  });
+
+  test("a request that names no host at all gets nothing", async () => {
+    const answered = await runHelper("get", "\n", identity);
+    expect(redacted(answered.stdout)).toBe("");
+    expect(answered.code).toBe(0);
+  });
+
+  test("an Enterprise host is answered, with a port and without", async () => {
+    // `GH_HOST` moves the host the account belongs to, and a port does not
+    // change whose host it is.
+    await withEnv({ GH_HOST: "github.example.com" }, async () => {
+      for (const host of ["github.example.com", "github.example.com:8443"]) {
+        const answered = await runHelper(
+          "get",
+          request({ protocol: "https", host }),
+          identity,
+        );
+        expect(credentialShape(answered.stdout, identity)).toEqual({
+          username: CREDENTIAL_USERNAME,
+          password: "(the agent account's token)",
+        });
+      }
+      // github.com is the foreign host now, and gets nothing.
+      const other = await runHelper(
+        "get",
+        request({ protocol: "https", host: "github.com" }),
+        identity,
+      );
+      expect(redacted(other.stdout)).toBe("");
+      expect(other.code).toBe(0);
+    });
+  });
+
+  test("store and erase print nothing and succeed, for its own host too", async () => {
+    for (const operation of ["store", "erase"]) {
+      const answered = await runHelper(
+        operation,
+        request({
+          protocol: "https",
+          host: "github.com",
+          username: "x-access-token",
+          password: identity.token,
+        }),
+        identity,
+      );
+      expect(redacted(answered.stdout)).toBe("");
+      expect(redacted(answered.stderr)).toBe("");
+      expect(answered.code).toBe(0);
+    }
+  });
+});
+
+/**
  * Run git's credential machinery for github.com with `args` applied.
  *
  * `git credential fill` and `git credential approve` are that machinery on its

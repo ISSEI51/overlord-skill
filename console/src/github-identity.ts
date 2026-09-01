@@ -50,6 +50,15 @@ export const CREDENTIAL_USERNAME_ENV = "OVERLORD_GIT_CREDENTIAL_USERNAME";
 export const CREDENTIAL_TOKEN_ENV = "OVERLORD_GIT_CREDENTIAL_TOKEN";
 
 /**
+ * The only host the helper answers for.
+ *
+ * It is here rather than baked into the helper text so that the helper stays
+ * one constant, and so that `GH_HOST` decides it the same way it decides every
+ * other host question in this module.
+ */
+export const CREDENTIAL_HOST_ENV = "OVERLORD_GIT_CREDENTIAL_HOST";
+
+/**
  * Username sent with the token over HTTPS.
  *
  * GitHub authenticates the token and ignores the username, so this is only a
@@ -58,20 +67,43 @@ export const CREDENTIAL_TOKEN_ENV = "OVERLORD_GIT_CREDENTIAL_TOKEN";
 const CREDENTIAL_USERNAME = "x-access-token";
 
 /**
- * A git credential helper that answers from the environment.
+ * A git credential helper that answers from the environment, for one host.
  *
  * Git runs a helper whose value starts with `!` through `sh -c`, appending the
  * operation, so `$1` is `get`, `store` or `erase`. Only `get` is answered:
  * `store` must stay a no-op, or the agent's token would be written into the
  * user's macOS keychain, where every later push — including the user's own —
- * would pick it up. The `if` also keeps the exit status 0 for the operations
- * that produce no output, which a bare `test ... &&` would not.
+ * would pick it up. Every path returns 0, because a non-zero helper makes git
+ * report an error for an operation that was fine.
+ *
+ * A `get` is answered only when the request git wrote on stdin names
+ * `$OVERLORD_GIT_CREDENTIAL_HOST` over https. `pushIdentity` already checks
+ * the push remote before installing this helper, so that check is what
+ * normally keeps the token on its own host; this one closes the paths that
+ * check cannot see, where a single `git push` asks for a credential for
+ * somewhere else — an authenticated `http.proxy`, or a redirect to another
+ * host — and the helper, having no opinion about the host, handed over the
+ * agent account's token. Failing to answer is the safe direction: git reports
+ * that it has no credential for that host, which is true.
+ *
+ * The request is `key=value` lines terminated by a blank line, so `IFS='='`
+ * splits each one and the value keeps any further `=`. A `host` may carry a
+ * port (`ghe.example.com:8443`), which is stripped: a port does not change
+ * whose host it is.
  */
 const CREDENTIAL_HELPER =
-  `!f() { if [ "$1" = get ]; then ` +
+  `!f() { ` +
+  `[ "$1" = get ] || return 0; ` +
+  `h=; p=; ` +
+  `while IFS='=' read -r k v; do ` +
+  `[ -n "$k" ] || break; ` +
+  `case "$k" in host) h=$v ;; protocol) p=$v ;; esac; ` +
+  `done; ` +
+  `[ "$p" = https ] || return 0; ` +
+  `[ "\${h%%:*}" = "$${CREDENTIAL_HOST_ENV}" ] || return 0; ` +
   `printf 'username=%s\\npassword=%s\\n' ` +
   `"$${CREDENTIAL_USERNAME_ENV}" "$${CREDENTIAL_TOKEN_ENV}"; ` +
-  `fi; }; f`;
+  `}; f`;
 
 /** The agent account, once it has been resolved to a usable token. */
 export type AgentIdentity = {
@@ -199,17 +231,26 @@ export function pushCredentialArgs(): string[] {
   ];
 }
 
-/** Environment carrying the credential the helper above prints. */
+/**
+ * Environment carrying the credential the helper above prints, and the one
+ * host it prints it for.
+ *
+ * The host is `githubHost()`, which is the host the agent account's token
+ * belongs to and, by the time `pushIdentity` installs the helper, the host of
+ * the push remote as well.
+ */
 export function pushCredentialEnv(
   identity: AgentIdentity,
 ): Record<string, string> {
   return {
     [CREDENTIAL_USERNAME_ENV]: CREDENTIAL_USERNAME,
     [CREDENTIAL_TOKEN_ENV]: identity.token,
-    // The helper always answers, so a prompt here would mean the token was
-    // rejected. Without this, git would ask on the terminal and the command
-    // would hang or fail with a confusing error instead of reporting the
-    // rejection.
+    [CREDENTIAL_HOST_ENV]: githubHost(),
+    // The helper answers for the host the push goes to, so a prompt here means
+    // either that the token was rejected or that something asked for a
+    // credential for another host. Without this, git would ask on the terminal
+    // and the command would hang or fail with a confusing error instead of
+    // reporting it.
     GIT_TERMINAL_PROMPT: "0",
   };
 }
