@@ -62,6 +62,24 @@ Use ISO 8601 timestamps in UTC. Do not store credentials, user code, full logs, 
 
 `project` names the product a card belongs to. Overlord Console shows it as a tag on the card and in the card detail header. The server writes it: `POST /api/items` takes the board's project when the board names exactly one and leaves it null when the board names none or more than one, so the "気づきを追加" dialog does not ask for it. A card id never encodes the project; a new id follows the prefix the board's other cards already use. Correct either afterwards with `PATCH /api/items/<id>` or by editing this file.
 
+`owner` says who the card is waiting on. It takes one of three values, and nothing else:
+
+| Value | Meaning |
+| --- | --- |
+| `"claude"` | An AI is working the card |
+| `"user"` | The card is waiting on the user: a decision, an approval, or an acceptance |
+| `null` | Neither. Nobody is holding the card right now |
+
+| Written by | When |
+| --- | --- |
+| This skill (the commander) | Whenever it moves a card and knows who holds it next. It writes the file directly |
+| The user, in Overlord Console | The 担当 field of the card modal is free text and is written through `PATCH /api/items/<id>`, so a value outside the three above can reach the file by hand |
+| Overlord Console | `null` on a card created with 気づきを追加 (`POST /api/items`), and `null` again when 受け入れて完了 moves a card to `done` |
+
+Nothing else writes it, and in particular no part of the delivery machinery does: `owner` is a statement about who acts next, not a record of what ran.
+
+`owner` is not what tells the console a card is being worked on. The console reads that from `changes[].agent`: a card with an `agent.surface_id` on a change whose state is neither `done` nor `blocked` is shown as 作業中 whatever `owner` says, and its 進める button is disabled while that session is unfinished. `owner: "claude"` still lights the same highlight on a card that records no session, so a board that only sets `owner` keeps working, but it is the weaker of the two signals: it is written by hand and a stale value is not detectable. Keep it accurate, and do not rely on it to represent a running session.
+
 `changes` is the engineering split of one card, in dependency order. A card is a product outcome and a change is one delivery unit: 1 change = 1 worktree = 1 branch = 1 pull request = 1 agent execution unit. Splitting work into changes never adds cards to the kanban, and the console shows changes read-only inside the card.
 
 | Field | Meaning |

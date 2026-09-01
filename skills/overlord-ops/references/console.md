@@ -111,9 +111,26 @@ unknown option instead, and `--help` exists only on `ensure`.
 - The user can change `state`, `owner`, `next_action`, `blocker`, and the `agent` link from the browser. Those edits are written back to the same file.
 - Card writes use the file's modification time as a revision token. A write from the console is rejected with HTTP 409 when an agent changed the file first, so an agent's write is never silently overwritten.
 
+### The two card highlights
+
+A card gets at most one of two borders, and the console decides which from the board alone:
+
+| Border | Condition |
+| --- | --- |
+| 作業中 (yellow) | A change whose state is neither `done` nor `blocked` has an `agent.surface_id` — or, on a card with no `changes`, the card-level `agent` has one — or `owner` is `"claude"` |
+| 判断待ち (cyan) | The card is not 作業中, and its state is `acceptance`, or `owner` is `"user"`, or `decisions_required` names its id |
+
+Done and blocked cards get neither.
+
+**作業中 wins when both conditions hold.** A recorded session is a fact about the present; the three 判断待ち sources are statements about what should happen next and go stale on their own, `decisions_required` most of all — an entry stays until someone removes it. Marking a card 判断待ち while a session is working it invites the user to act on unfinished work, whereas a card marked 作業中 still shows its decision: `decisions_required` entries are always in the 今日の判断 bar, an `acceptance` card is in the 完成確認待ち column with its 受け入れて完了 button, and `owner` is a tag on the card.
+
+While a card has an unfinished session recorded, its 進める button is disabled and the modal says which change is being worked. The other buttons stay available. `owner: "claude"` alone does not disable it: `owner` is hand-written, and a card whose only 作業中 signal is a stale `owner` would otherwise be impossible to advance from the console.
+
+This is why leaving settled entries in `decisions_required`, or a stale `owner`, is a reporting error and not a cosmetic one. Remove an entry as soon as the decision is made.
+
 ## One commander, subagents behind it
 
-The console docks one session on the right: the commander. The user types only there. Cards have no session picker and no compose box; their buttons write an instruction into the commander's input box, and the user presses 送信.
+The console docks one session on the right: the commander. The user types only there. Cards have no session picker and no compose box; their buttons send an instruction to the commander directly, in one press.
 
 The commander is stored at the top level of the board:
 

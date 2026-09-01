@@ -110,3 +110,82 @@ export function activeSession(
 export function hasSession(item: Item): boolean {
   return activeSession(item) !== null;
 }
+
+/**
+ * The session of a change that is still in flight: the first change that is
+ * neither done nor blocked and that has an `agent.surface_id` recorded.
+ *
+ * This is the strict half of `activeSession`. `activeSession` answers "which
+ * session should the card show", so it falls back to a finished change and
+ * then to the card-level `agent`; this one answers "is work running right
+ * now", so it accepts neither. The card-level `agent` is accepted only on a
+ * card that has no `changes` at all - it is the compatibility field for
+ * boards written before `changes` existed, and on such a card the card's own
+ * state (checked by `cardActivity`) is the only liveness signal there is.
+ */
+export function liveSession(
+  item: Item,
+): { agent: SessionLink; changeId: string | null } | null {
+  const changes = changesOf(item);
+  for (const change of changes) {
+    if (change.state === "done" || change.state === "blocked") continue;
+    if (change.agent?.surface_id) return { agent: change.agent, changeId: change.id };
+  }
+  if (changes.length === 0 && item.agent?.surface_id) {
+    return { agent: item.agent, changeId: null };
+  }
+  return null;
+}
+
+/** How a card is highlighted, and whether it can take another instruction. */
+export type CardActivity = {
+  /** An AI is working on this card right now. */
+  running: boolean;
+  /** The in-flight session that makes it running, or null when there is none. */
+  session: { agent: SessionLink; changeId: string | null } | null;
+  /** The user has something to decide or accept on this card. */
+  needsUser: boolean;
+};
+
+/**
+ * Decide the two card highlights from the board.
+ *
+ * `running` is decided by the recorded session first and by `owner` second.
+ * The two are not equally reliable: `changes[].agent` is written when a
+ * session is actually started for that change, while `owner` is a free-text
+ * field an agent writes by hand and can forget to update. `owner: "claude"`
+ * is still accepted, so a board that records no session keeps the highlight
+ * it had, but it is not required: a card with a live session is 作業中
+ * whatever `owner` says, or does not say.
+ *
+ * **When both apply, running wins over needsUser.** Two reasons:
+ *
+ *  - The signals do not describe the same kind of thing. A live session is a
+ *    recorded fact about the present. All three needs-user sources are
+ *    statements about what should happen next, and they go stale on their
+ *    own: `decisions_required` keeps entries after the decision is settled,
+ *    and `owner: "user"` outlives the moment it was written. That is the
+ *    reported failure of 2026-09-01: three settled entries in
+ *    `decisions_required` kept a card that had been implementing for 29
+ *    minutes out of the 作業中 highlight, and the user pressed 進める on it
+ *    three times.
+ *  - Losing the running highlight costs more than losing the needs-user one.
+ *    A card marked 判断待ち while an agent works on it invites the user to
+ *    act on unfinished work, which is what happened. A card marked 作業中
+ *    that also needs a decision hides nothing: `decisions_required` entries
+ *    are always in the 今日の判断 bar, an `acceptance` card sits in the
+ *    完成確認待ち column and keeps its 受け入れて完了 button, and `owner` is
+ *    shown as a tag on the card and as a field in the modal.
+ *
+ * Done and blocked cards get neither highlight, whatever the rest says.
+ */
+export function cardActivity(item: Item, needsUserIds: Set<string>): CardActivity {
+  const settled = item.state === "done" || item.state === "blocked";
+  const session = settled ? null : liveSession(item);
+  const running = !settled && (session !== null || item.owner === "claude");
+  const needsUser =
+    !settled &&
+    !running &&
+    (item.state === "acceptance" || item.owner === "user" || needsUserIds.has(item.id));
+  return { running, session, needsUser };
+}

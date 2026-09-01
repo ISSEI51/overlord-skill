@@ -122,8 +122,9 @@ A local dashboard built with React + shadcn/ui. Changes to `board.yaml` appear o
 
 - An eight-column kanban with drag & drop. The columns are labelled in Japanese; their board keys are the words in parentheses:
   受信箱 (inbox) / 調査中 (discovery) / 実装準備完了 (specified) / 実装中 (implementing) / 確認中 (reviewing) / 完成確認待ち (acceptance) / 完了 (done) / 停止中 (blocked)
-- **Cyan border** = a card that needs you (awaiting acceptance, owned by you, or listed in today's decisions)
-- **Yellow border** = a card the AI is actively working on
+- **Yellow border** = a card the AI is actively working on (an unfinished change has a worker session recorded, or `owner` is `claude`)
+- **Cyan border** = a card that needs you (awaiting acceptance, owned by you, or listed in today's decisions). A card being worked on takes the yellow border instead
+- The 進める (advance) button is disabled on a card being worked on, and the modal names the change that session is working
 - The "decisions today" bar shows at most three things only you can decide
 - A completed card carries the number of its delivery pull request (the one targeting `main`) as a tag; a delivery in flight and a failed one show in the same place
 - Done cards can be deleted from the right-click menu

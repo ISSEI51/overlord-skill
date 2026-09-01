@@ -150,9 +150,11 @@ cmux              connected
 
 | 枠の色 | カード | そうなる条件 |
 | --- | --- | --- |
-| 水色（あなたの判断待ち） | `NOTE-009`, `BILL-008` | `state` が `acceptance`、または `owner` が `user`、または `decisions_required` がその ID を参照している（完了・停止中は除く） |
-| 黄色（AI が作業中） | `BILL-021`, `BILL-013`, `NOTE-022` | `owner` が `claude` で、状態が完了・停止中以外（水色の条件を満たす場合は水色が優先される） |
+| 黄色（AI が作業中） | `BILL-021`, `BILL-013`, `NOTE-022` | 完了でも停止中でもない `change` に `agent.surface_id` がある、または `owner` が `claude`（いずれも状態が完了・停止中以外のとき） |
+| 水色（あなたの判断待ち） | `NOTE-009`, `BILL-008` | 黄色の条件を満たさず、`state` が `acceptance`、または `owner` が `user`、または `decisions_required` がその ID を参照している（完了・停止中は除く） |
 | 色なし | `NOTE-014`, `NOTE-003`, `BILL-005` | 上のどちらにも当てはまらない |
+
+`board.example.yaml` の `changes` はすべて `agent: null` なので、3枚の黄色枠はいずれも `owner: "claude"` によるものです。担当セッションが記録されたカードには、カード上に `作業中 <change-id>` のタグが出て「進める」ボタンが押せなくなりますが、この board にはその状態のカードはありません。
 
 `board.example.yaml` は `changes`（PR単位の変更）を4枚のカードに持たせてあります。カードのタグは `state が done の change 数 / change の総数` で、`BILL-013` が `変更 1/3`、`NOTE-022` が `変更 1/2`、`BILL-008` が `変更 2/2`、`NOTE-003` が `変更 1/1` です。
 
