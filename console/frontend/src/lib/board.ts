@@ -148,44 +148,55 @@ export type CardActivity = {
 };
 
 /**
- * Decide the two card highlights from the board.
+ * Decide the two card highlights from the board. A card gets at most one of
+ * them: they are mutually exclusive, decided in this order.
  *
- * `running` is decided by the recorded session first and by `owner` second.
- * The two are not equally reliable: `changes[].agent` is written when a
- * session is actually started for that change, while `owner` is a free-text
- * field an agent writes by hand and can forget to update. `owner: "claude"`
- * is still accepted, so a board that records no session keeps the highlight
- * it had, but it is not required: a card with a live session is 作業中
- * whatever `owner` says, or does not say.
+ *   1. An unfinished worker session is recorded -> 作業中.
+ *   2. Otherwise a needs-user signal - state `acceptance`, `owner: "user"`,
+ *      or an entry in `decisions_required` naming the card -> 判断待ち.
+ *   3. Otherwise `owner: "claude"` -> 作業中.
  *
- * **When both apply, running wins over needsUser.** Two reasons:
+ * The session sits above the needs-user signals and `owner` sits below them,
+ * because the two running signals are not equally reliable. `changes[].agent`
+ * is written when a session is actually started for that change, so it
+ * records the present. `owner` is free text an agent writes by hand and can
+ * forget to update, so it only claims the present. `owner: "claude"` is still
+ * read - a board that records no session keeps the highlight it had - but it
+ * may not cancel a needs-user signal: a card left at `owner: "claude"` after
+ * the work stopped would otherwise hide an acceptance or an open decision.
  *
- *  - The signals do not describe the same kind of thing. A live session is a
- *    recorded fact about the present. All three needs-user sources are
- *    statements about what should happen next, and they go stale on their
- *    own: `decisions_required` keeps entries after the decision is settled,
- *    and `owner: "user"` outlives the moment it was written. That is the
- *    reported failure of 2026-09-01: three settled entries in
- *    `decisions_required` kept a card that had been implementing for 29
- *    minutes out of the 作業中 highlight, and the user pressed 進める on it
- *    three times.
- *  - Losing the running highlight costs more than losing the needs-user one.
- *    A card marked 判断待ち while an agent works on it invites the user to
- *    act on unfinished work, which is what happened. A card marked 作業中
- *    that also needs a decision hides nothing: `decisions_required` entries
- *    are always in the 今日の判断 bar, an `acceptance` card sits in the
- *    完成確認待ち column and keeps its 受け入れて完了 button, and `owner` is
- *    shown as a tag on the card and as a field in the modal.
+ * **A recorded session does cancel them, and that is the one place 作業中
+ * wins over 判断待ち.** Two reasons, both specific to the session:
+ *
+ *  - It is a different kind of statement. A session that is running now is a
+ *    fact about the present. All three needs-user sources say what should
+ *    happen next, and they go stale on their own: `decisions_required` keeps
+ *    an entry until someone removes it, and `owner: "user"` outlives the
+ *    moment it was written. That is the reported failure of 2026-09-01:
+ *    three settled entries in `decisions_required` kept a card that had been
+ *    implementing for 29 minutes out of the 作業中 highlight, and the user
+ *    pressed 進める on it three times.
+ *  - The two mistakes do not cost the same. A card marked 判断待ち while a
+ *    session works it invites the user to act on unfinished work, which is
+ *    what happened. A card marked 作業中 while a decision is open keeps the
+ *    decision visible elsewhere: an `acceptance` card sits in the 完成確認待ち
+ *    column with its 受け入れて完了 button, `owner` is a tag on the card and
+ *    a field in the modal, and a `decisions_required` entry is in the
+ *    今日の判断 bar when it is one of the three that bar shows. That last one
+ *    is the weakest of the three - the bar is capped at three entries - which
+ *    is one more reason to remove an entry once the decision is made.
  *
  * Done and blocked cards get neither highlight, whatever the rest says.
  */
 export function cardActivity(item: Item, needsUserIds: Set<string>): CardActivity {
   const settled = item.state === "done" || item.state === "blocked";
   const session = settled ? null : liveSession(item);
-  const running = !settled && (session !== null || item.owner === "claude");
+  // Only the session suppresses the needs-user highlight. Deciding this
+  // before `running` is what keeps `owner: "claude"` from suppressing it.
   const needsUser =
     !settled &&
-    !running &&
+    session === null &&
     (item.state === "acceptance" || item.owner === "user" || needsUserIds.has(item.id));
+  const running = !settled && !needsUser && (session !== null || item.owner === "claude");
   return { running, session, needsUser };
 }

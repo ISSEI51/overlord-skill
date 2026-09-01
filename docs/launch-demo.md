@@ -150,8 +150,8 @@ cmux              connected
 
 | 枠の色 | カード | そうなる条件 |
 | --- | --- | --- |
-| 黄色（AI が作業中） | `BILL-021`, `BILL-013`, `NOTE-022` | 完了でも停止中でもない `change` に `agent.surface_id` がある、または `owner` が `claude`（いずれも状態が完了・停止中以外のとき） |
-| 水色（あなたの判断待ち） | `NOTE-009`, `BILL-008` | 黄色の条件を満たさず、`state` が `acceptance`、または `owner` が `user`、または `decisions_required` がその ID を参照している（完了・停止中は除く） |
+| 黄色（AI が作業中） | `BILL-021`, `BILL-013`, `NOTE-022` | 完了でも停止中でもない `change` に `agent.surface_id` がある。または、水色の条件をどれも満たさないカードで `owner` が `claude`（いずれも状態が完了・停止中以外のとき） |
+| 水色（あなたの判断待ち） | `NOTE-009`, `BILL-008` | 担当セッションが記録されておらず、`state` が `acceptance`、または `owner` が `user`、または `decisions_required` がその ID を参照している（完了・停止中は除く）。`owner` が `claude` でもこの条件が優先される |
 | 色なし | `NOTE-014`, `NOTE-003`, `BILL-005` | 上のどちらにも当てはまらない |
 
 `board.example.yaml` の `changes` はすべて `agent: null` なので、3枚の黄色枠はいずれも `owner: "claude"` によるものです。担当セッションが記録されたカードには、カード上に `作業中 <change-id>` のタグが出て「進める」ボタンが押せなくなりますが、この board にはその状態のカードはありません。
