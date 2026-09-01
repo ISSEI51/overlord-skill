@@ -1434,12 +1434,59 @@ export type DeliverOutcome = {
 };
 
 /**
+ * The default branch as the local checkout records it, or null.
+ *
+ * `refs/remotes/origin/HEAD` is a local symbolic ref that only exists once
+ * something set it (`git clone` does, `git init` does not), and nothing
+ * verifies it afterwards: it can name a branch that does not exist, and any
+ * process that can write to the checkout can point it anywhere.
+ */
+async function localDefaultBranch(
+  root: string,
+  timeoutMs?: number,
+): Promise<string | null> {
+  const symbolic = await git(
+    ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+    root,
+    timeoutMs,
+  );
+  if (symbolic.code !== 0) return null;
+  // `origin/main` -> `main`: the remote name is a prefix of the short form.
+  const value = symbolic.stdout.trim();
+  const slash = value.indexOf("/");
+  const branch = slash >= 0 ? value.slice(slash + 1) : value;
+  return branch || null;
+}
+
+/** The default branch as GitHub reports it for this repository, or null. */
+async function githubDefaultBranch(
+  root: string,
+  timeoutMs?: number,
+): Promise<string | null> {
+  const viewed = await gh(
+    ["repo", "view", "--json", "defaultBranchRef"],
+    root,
+    timeoutMs,
+  );
+  if (viewed.code !== 0) return null;
+  const parsed = parseJson<{ defaultBranchRef?: { name?: unknown } }>(
+    viewed.stdout,
+  );
+  const name = parsed?.defaultBranchRef?.name;
+  return typeof name === "string" && name.trim() ? name.trim() : null;
+}
+
+/**
  * The repository default branch, or null when neither source could name it.
  *
  * `origin/HEAD` is what the repository itself says the default branch is, so
- * it is asked first and costs no network call. It is a local symbolic ref that
- * only exists once something set it (`git clone` does, `git init` does not), so
- * GitHub is asked next.
+ * it is asked first and costs no network call; GitHub is asked when the local
+ * ref is not set.
+ *
+ * This is the order for choosing the base of a delivery, where a wrong answer
+ * costs a pull request against the wrong branch and is caught by the
+ * `baseRefName` check before anything is written. The merge guard asks the
+ * other way round; see `authoritativeDefaultBranch`.
  *
  * Null is a real answer and not an error, because the two callers need
  * different things from it: a delivery falls back to `main` and is caught by
@@ -1451,33 +1498,39 @@ export async function resolveDefaultBranch(
   root: string,
   timeoutMs?: number,
 ): Promise<string | null> {
-  const symbolic = await git(
-    ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
-    root,
-    timeoutMs,
+  return (
+    (await localDefaultBranch(root, timeoutMs)) ??
+    (await githubDefaultBranch(root, timeoutMs))
   );
-  if (symbolic.code === 0) {
-    // `origin/main` -> `main`: the remote name is a prefix of the short form.
-    const value = symbolic.stdout.trim();
-    const slash = value.indexOf("/");
-    const branch = slash >= 0 ? value.slice(slash + 1) : value;
-    if (branch) return branch;
-  }
+}
 
-  const viewed = await gh(
-    ["repo", "view", "--json", "defaultBranchRef"],
-    root,
-    timeoutMs,
+/**
+ * The repository default branch for a decision that must not be wrong: GitHub
+ * first, the local ref only when GitHub could not answer.
+ *
+ * `merge` refuses a pull request whose base is the default branch, because
+ * merging into it releases the work and that is the user's decision. The two
+ * sources of the name are not equally trustworthy for that decision:
+ * `refs/remotes/origin/HEAD` is local, unverified and writable by anything
+ * with the checkout, so a wrong one would name a branch that is not the
+ * default and the guard would let a release through. GitHub is where the pull
+ * request itself comes from, and `baseRefName` is already read from there, so
+ * both halves of the comparison come from the same place.
+ *
+ * The local ref stays as the fallback rather than the command refusing every
+ * merge when `gh` cannot reach GitHub. What is left in that case is the
+ * pre-existing behaviour, and `main` and `master` are refused by name
+ * regardless of either source, so a stale local ref can only matter in a
+ * repository whose default branch is neither.
+ */
+async function authoritativeDefaultBranch(
+  root: string,
+  timeoutMs?: number,
+): Promise<string | null> {
+  return (
+    (await githubDefaultBranch(root, timeoutMs)) ??
+    (await localDefaultBranch(root, timeoutMs))
   );
-  if (viewed.code === 0) {
-    const parsed = parseJson<{ defaultBranchRef?: { name?: unknown } }>(
-      viewed.stdout,
-    );
-    const name = parsed?.defaultBranchRef?.name;
-    if (typeof name === "string" && name.trim()) return name.trim();
-  }
-
-  return null;
 }
 
 /**
@@ -2585,7 +2638,9 @@ export async function mergeChange(
     };
   }
 
-  const defaultBranch = await resolveDefaultBranch(root, timeoutMs);
+  // GitHub is the authority here, not the local `origin/HEAD`; see
+  // `authoritativeDefaultBranch`.
+  const defaultBranch = await authoritativeDefaultBranch(root, timeoutMs);
   const checks = checkRollup(view.statusCheckRollup);
   // The head every gate below is decided on, and the head the merge is made
   // conditional on. `mergeRefusal` refuses an empty one, so by the time it is

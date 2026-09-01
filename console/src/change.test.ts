@@ -3607,6 +3607,48 @@ describe("mergeChange", () => {
     expect(await mergedPullRequests(stub)).toEqual([]);
   }, 60_000);
 
+  test("a local origin/HEAD that disagrees with GitHub does not decide the base", async () => {
+    const repo = await deliveryRepo();
+    // `refs/remotes/origin/HEAD` still names main, as `deliveryRepo` left it,
+    // while GitHub says the default branch is develop. The ref is local,
+    // unverified, and writable by anything with the checkout, so a merge into
+    // the real default branch must not become allowed by pointing it
+    // elsewhere.
+    const boardPath = await writeMergeBoard();
+    const before = await Bun.file(boardPath).text();
+    const stub = await mergeGhStub(
+      mergeAnswers({
+        "check-60.json": mergeView({ baseRefName: "develop" }),
+        "repo-view.json": { defaultBranchRef: { name: "develop" } },
+      }),
+    );
+
+    const outcome = await withGhStub(stub, () =>
+      mergeChange({ boardPath, changeId: "OV-600-C1", cwd: repo.root }),
+    );
+
+    expect(outcome.status).toBe("refused");
+    expect(outcome.reason).toContain("the repository default branch");
+    expect(await mergedPullRequests(stub)).toEqual([]);
+    expect(await Bun.file(boardPath).text()).toBe(before);
+  }, 60_000);
+
+  test("the local origin/HEAD still answers when gh cannot", async () => {
+    const repo = await deliveryRepo();
+    // No repo-view.json, so `gh repo view` fails. `deliveryRepo` left
+    // origin/HEAD naming main, and a base of main is refused either way — the
+    // point here is that a merge into another branch still goes through, so a
+    // machine that cannot reach GitHub is not left unable to merge anything.
+    const boardPath = await writeMergeBoard();
+    const stub = await mergeGhStub(mergeAnswers());
+
+    const outcome = await withGhStub(stub, () =>
+      mergeChange({ boardPath, changeId: "OV-600-C1", cwd: repo.root }),
+    );
+
+    expect(outcome.status).toBe("merged");
+  }, 60_000);
+
   test("a default branch that cannot be determined refuses rather than merges", async () => {
     const repo = await deliveryRepo();
     await gitIn(["symbolic-ref", "-d", "refs/remotes/origin/HEAD"], repo.root);

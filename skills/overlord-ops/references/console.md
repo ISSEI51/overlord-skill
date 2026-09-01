@@ -267,7 +267,10 @@ cd <project-directory>
 
 マージの前に次を順に検査し、1つでも該当すれば **`gh pr merge` を呼ばず、`board.yaml` を1バイトも変更せず** exit 1 で終了する。判断材料は board の記録ではなく `gh pr view` で読んだ現在の pull request である。
 
-1. **base ブランチ** — `baseRefName` が `main` または `master`（大小文字を区別しない）、あるいはリポジトリのデフォルトブランチと一致すれば拒否する。デフォルトブランチを特定できない場合（`git symbolic-ref --short refs/remotes/origin/HEAD` と `gh repo view --json defaultBranchRef` のどちらも答えない場合）も、判定できないので拒否する。base が空の pull request も拒否する。
+1. **base ブランチ** — `baseRefName` が `main` または `master`（大小文字を区別しない）、あるいはリポジトリのデフォルトブランチと一致すれば拒否する。デフォルトブランチを特定できない場合も、判定できないので拒否する。base が空の pull request も拒否する。
+
+   この検査でのデフォルトブランチは `gh repo view --json defaultBranchRef` を権威とし、`gh` が答えられない場合にだけ `git symbolic-ref --short refs/remotes/origin/HEAD` を使う（`deliver` の base 解決とは逆の順序である。「カードを配送する」の節を参照）。`refs/remotes/origin/HEAD` はローカルの symbolic ref で、検証されず、チェックアウトに書ける処理なら何にでも書き換えられる。存在しないブランチを指すこともできる。比較の片方（`baseRefName`）は GitHub から読んでいるので、もう片方も同じ出所にする。なお `main` と `master` はどちらの出所にもよらず名前で拒否するため、ローカルの ref が古いことが問題になりうるのは、デフォルトブランチが `main` でも `master` でもないリポジトリだけである。
+
 2. **pull request の同一性** — `headRefName` が `changes[].branch` と一致しなければ拒否する。`pr --number` と `sync` が適用するのと同じ規則で、`pr.number` の誤りが無関係な pull request をマージすることを防ぐ。
 3. **pull request の状態** — `state` が open でなければ拒否する。既にマージ済み、またはクローズ済みの pull request にはマージするものが無い。
 4. **レビュー** — `changes[].pr.reviewed_sha` が記録されていない、または pull request の `headRefOid` と一致しなければ拒否する。短縮 SHA は前方一致で同一とみなすので、`reviewed --sha <7桁以上>` で記録した値もそのまま使える。
@@ -342,7 +345,7 @@ cd <project-directory>
 既定値:
 
 - `--head` は main checkout の現在のブランチ。detached HEAD の場合はブランチが決まらないので、`--head <branch>` を明示しない限り失敗する。
-- `--base` は「リポジトリのデフォルトブランチ」を次の順で解決する: `git symbolic-ref --short refs/remotes/origin/HEAD` からリモート名を取り除いた名前 → `gh repo view --json defaultBranchRef` → `main`。
+- `--base` は「リポジトリのデフォルトブランチ」を次の順で解決する: `git symbolic-ref --short refs/remotes/origin/HEAD` からリモート名を取り除いた名前 → `gh repo view --json defaultBranchRef` → `main`。ここでローカルの ref を先に見るのは、ネットワーク呼び出しが要らず、誤った base は board へ書く前の `baseRefName` の確認で捕まるためである。`merge` の base ガードは誤りを見逃せないので逆の順序で解決する（「何を検査するか」の 1. を参照）。
 
 同期が先、未マージならブロック:
 
