@@ -25,7 +25,7 @@ Overlord は、Claude Code や Codex のコーディングエージェントを1
 
 - [Claude Code](https://claude.com/claude-code)（または Codex）
 - [Bun](https://bun.sh) — Overlord Console の実行に必要です
-- `git` と [GitHub CLI](https://cli.github.com/)（`gh`）— `scripts/change.sh` は `git` と `gh` を直接起動します（`start` / `pr` / `reviewed` / `sync` / `merge` / `deliver` の6つすべて）。`start` は `git worktree add` と `git rev-parse`、`pr` は `git push` と `gh pr list` / `gh pr create` / `gh pr view`、`reviewed` は `git worktree list` と worktree での `git rev-parse HEAD`（worktree が残っていない場合は `gh pr view --json headRefOid`）、`sync` は `gh pr view`、`merge` は `git rev-parse` / `git symbolic-ref` と `gh pr view` / `gh repo view` / `gh pr merge`、`deliver` は `git fetch` / `git diff` と `gh repo view` / `gh pr view` / `gh pr create` / `gh pr edit` を使います。`gh auth login` で認証済みである必要があります。`change.sh` は司令塔が自動で実行するコマンドで、あなたが直接打つ場面はありません
+- `git` と [GitHub CLI](https://cli.github.com/)（`gh`）— `scripts/change.sh` は `git` と `gh` を直接起動します（`start` / `pr` / `reviewed` / `sync` / `merge` / `deliver` / `identity` の7つすべて）。`start` は `git worktree add` と `git rev-parse`、`pr` は `git push` と `gh pr list` / `gh pr create` / `gh pr view`、`reviewed` は `git worktree list` と worktree での `git rev-parse HEAD`（worktree が残っていない場合は `gh pr view --json headRefOid`）、`sync` は `gh pr view`、`merge` は `git rev-parse` / `git symbolic-ref` と `gh pr view` / `gh repo view` / `gh pr merge`、`deliver` は `git fetch` / `git diff` と `gh repo view` / `gh pr view` / `gh pr create` / `gh pr edit`、`identity` は `git rev-parse` / `git remote get-url` と `gh api user` / `gh repo view` を使います。`gh auth login` で認証済みである必要があります。`change.sh` は司令塔が自動で実行するコマンドで、あなたが直接打つ場面はありません
 - [cmux](https://cmux.com/ja) — 複数の AI セッションを1画面のワークスペースとして扱う macOS 用のターミナルです。Overlord は司令塔セッションの画面の読み取りと入力の送信をこれ経由で行うため、司令塔サイドバーとカードの指示ボタンに必要です
 
 動作環境: コンソールとスキルは macOS 固有の処理を持たないため、Bun が動く環境（macOS / Linux）で動作します。cmux は macOS アプリで、コンソールは `cmux` コマンドが PATH に無いときは `/Applications/cmux.app/Contents/Resources/bin/cmux` を参照します。cmux が使えない環境でも、カンバンの閲覧・編集、「気づきを追加」、`scripts/change.sh` の各コマンドは動きます。使えないのは司令塔サイドバーとカードの指示ボタン、`console.sh --open`、および `console.sh ensure` による司令塔の自動登録です（`ensure` のそれ以外の処理は cmux が無くても動き、サーバーは detached プロセスとして起動して出力を `<プロジェクト>/.overlord/console.log` に書きます）。
@@ -122,7 +122,7 @@ React + shadcn/ui 製のローカルダッシュボードです。`board.yaml` �
 - **水色枠** = あなたのアクションが必要なカード（完成確認待ち、担当があなた、今日の判断に掲載）
 - **黄色枠** = AIが作業中のカード
 - 「今日の判断」バーには、あなたが決める必要があることだけが最大3件表示されます
-- 完了したカードには成果PR（main 向けのPR）の番号がタグとして出ます。配送中と配送失敗も同じ場所に出ます
+- 完了したカードには成果PR（main 向けのPR）の番号がタグとして出ます。同じ場所に、配送中は `配送中`、未マージの変更が残っていた場合は `未マージあり`、失敗した場合は `配送失敗` と出ます
 - 完了カードは右クリックから削除できます
 
 ### カードのモーダル
@@ -134,7 +134,7 @@ React + shadcn/ui 製のローカルダッシュボードです。`board.yaml` �
 - **指示ボタン**（状況を聞く / 進める / 実装ブリーフ / 独立レビュー / 完了の可否）: 1回押すだけで司令塔へ直接送信されます。スキルのコマンド文は画面に出ません
 - **詳細指示**: 自由文で書いた指示が、カードIDを添えて司令塔へ送られます
 - **受け入れて完了**: 完成確認待ちのカードに表示され、1クリックで完了になります。このとき、そのカードの成果を main へ出す pull request が自動で提案されます
-- **成果の配送**: 作られた成果PRの番号・状態・リンクがカードに残ります。配送するものが無かった場合、未マージの変更が残っていた場合、失敗した場合はその理由が出て、後の2つでは「配送をやり直す」から再実行できます
+- **成果の配送**: 作られた成果PRの番号・状態・リンクがカードに残ります。配送するものが無かった場合、未マージの変更が残っていた場合、失敗した場合はその理由が出て、後の2つでは「配送をやり直す」から再実行できます。ブラウザを開き直した後も、カードに記録された失敗が残っていれば同じボタンが出ます
 - 状態・次にすること・担当・止まっている理由はその場で編集できます（Escape で取り消し）
 
 ### 司令塔サイドバー
@@ -364,7 +364,7 @@ merge commit なら配送のたびに merge-base が前進するため、この�
 
 PR #10 の squash で生じた分岐は、PR #16 を merge commit でマージした時点で解消しました。
 
-この決まりは main 向けのPRについてのものです。変更（change）単位のPRは作業ブランチに向けたもので、ここでは対象外です。なお `scripts/change.sh merge` は変更単位のPRも `gh pr merge --merge` でマージします。squash と rebase を選ぶ引数はありません。
+この決まりは main 向けのPRについてのものです。変更（change）単位のPRは作業ブランチに向けたもので、ここでは対象外です。なお `scripts/change.sh merge` は変更単位のPRも `gh pr merge --merge --match-head-commit <レビュー済みの commit>` でマージします。squash と rebase を選ぶ引数はありません。
 
 現在の設定は次で確認できます。
 

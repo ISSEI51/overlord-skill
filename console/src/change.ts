@@ -2119,6 +2119,10 @@ export async function deliver(argv: string[]): Promise<number> {
   for (const warning of outcome.warnings) process.stderr.write(`${warning}\n`);
 
   process.stdout.write(`card:             ${cardId}\n`);
+  // The delivery pull request is opened by whichever account `gh` ran as, and
+  // that is only visible on GitHub afterwards, so the run names it — the same
+  // line `pr` and `identity` print.
+  process.stdout.write(`agent account:    ${await agentAccountLine()}\n`);
   process.stdout.write(`delivery:         ${outcome.status}\n`);
   if (outcome.status === "skipped" && outcome.reason) {
     process.stdout.write(`reason:           ${outcome.reason}\n`);
@@ -2511,7 +2515,9 @@ export type MergeOutcome = {
  *  3. the merge is a merge commit (`--merge`). Squash and rebase are not used
  *     and cannot be selected: a squash does not advance the merge base, which
  *     made later pull requests conflict on the same lines (README, "なぜ merge
- *     commit なのか");
+ *     commit なのか"). It also carries `--match-head-commit`, so GitHub merges
+ *     only while the head is the commit the gates were decided on and a commit
+ *     pushed after step 1 cannot be merged unreviewed;
  *  4. the board is written from a second `gh pr view`, through
  *     `applyPullRequestView` - the function `sync` writes with - so a merge
  *     records exactly what a later `sync` would have recorded, and `done` has
@@ -2581,6 +2587,10 @@ export async function mergeChange(
 
   const defaultBranch = await resolveDefaultBranch(root, timeoutMs);
   const checks = checkRollup(view.statusCheckRollup);
+  // The head every gate below is decided on, and the head the merge is made
+  // conditional on. `mergeRefusal` refuses an empty one, so by the time it is
+  // used it names a commit.
+  const headSha = typeof view.headRefOid === "string" ? view.headRefOid.trim() : "";
   const checked: MergeCheckedPullRequest = {
     number: view.number,
     state: normalizePrState(view.state),
@@ -2608,8 +2618,14 @@ export async function mergeChange(
     };
   }
 
+  // `--match-head-commit` is the same commit every gate above was decided on:
+  // GitHub performs the merge only while the pull request head is still that
+  // commit. Without it there is a window between the `gh pr view` the gates
+  // read and this call in which a commit can be pushed to the branch, and that
+  // commit would be merged although no review has read it — the one outcome
+  // the review gate exists to prevent.
   const merged = await gh(
-    ["pr", "merge", String(view.number), "--merge"],
+    ["pr", "merge", String(view.number), "--merge", "--match-head-commit", headSha],
     root,
     timeoutMs,
   );
@@ -2617,7 +2633,10 @@ export async function mergeChange(
     return {
       status: "failed",
       reason:
-        `gh pr merge ${view.number} --merge failed: ${failureMessage(merged)}`,
+        `gh pr merge ${view.number} --merge failed: ${failureMessage(merged)}` +
+        `\nThe merge was asked for only while the head was ${headSha}, the ` +
+        `commit the checks above were made on, so a commit pushed since then ` +
+        `is one reason gh can refuse it.`,
       checked,
       warnings,
     };
@@ -2687,19 +2706,36 @@ export async function mergeChange(
   };
 }
 
+/** The one usage line `change merge` prints for every argument error. */
+const MERGE_USAGE = "usage: change merge <change-id> [--board <path>]\n";
+
 /**
  * CLI wrapper around `mergeChange`: it only formats the outcome.
  *
  * `--board` is the only option it takes. Every other option is a usage error
  * rather than an ignored argument, so that a `--force`, a `--base` or an
  * `--admin` copied from `gh` fails loudly instead of looking as though it
- * relaxed a gate that it did not.
+ * relaxed a gate that it did not. A second positional argument is a usage
+ * error for the same reason: `change merge OV-1-C1 OV-1-C2` would otherwise
+ * merge the first of the two and say nothing about the second.
+ *
+ * Every argument error exits 2, including an option left without a value.
+ * `parseArgs` throws for that one, and an uncaught throw leaves `main` to exit
+ * 1, which is the code a refused merge uses — so `change merge OV-1-C1
+ * --admin` would have been indistinguishable from a gate saying no.
  */
 export async function merge(argv: string[]): Promise<number> {
-  const { positional, options } = parseArgs(argv);
+  let parsed: ParsedArgs;
+  try {
+    parsed = parseArgs(argv);
+  } catch (error) {
+    process.stderr.write(`${(error as Error).message}\n${MERGE_USAGE}`);
+    return 2;
+  }
+  const { positional, options } = parsed;
   const changeId = positional[0];
   if (!changeId) {
-    process.stderr.write("usage: change merge <change-id> [--board <path>]\n");
+    process.stderr.write(MERGE_USAGE);
     return 2;
   }
 
@@ -2709,6 +2745,16 @@ export async function merge(argv: string[]): Promise<number> {
       `change merge takes no option other than --board: ` +
         `${unknown.map((name) => `--${name}`).join(", ")}\n` +
         "The base, review and CI checks cannot be turned off.\n",
+    );
+    return 2;
+  }
+
+  if (positional.length > 1) {
+    process.stderr.write(
+      `change merge takes one change id, and was given ${positional.length}: ` +
+        `${positional.join(", ")}\n` +
+        "Nothing was merged. Run it once per change.\n" +
+        MERGE_USAGE,
     );
     return 2;
   }

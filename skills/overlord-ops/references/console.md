@@ -242,7 +242,7 @@ push identity:    ISSEI-BOT
 
 順に、トークンが解決できること、そのトークンが名乗るアカウントが指定したアカウントと一致すること、そのアカウントがこのリポジトリで write を持つこと、push リモートがそのトークンで認証できるホストであることを確認する。どれかを満たさない場合は exit 1 で、満たさなかった項目を stderr に出す。アカウントが未設定の場合も exit 1 になる（この設問に対する答えが「いいえ」であるため）。アカウントの設定は全プロジェクト共通だが、リポジトリへのアクセス権はリポジトリごとに与えるものなので、新しいプロジェクトで Overlord を使い始めるときはこのコマンドで確認する。
 
-`pr` は実行のたびに使用したアカウントを `agent account:` の行に出す。
+`pr` と `deliver` は実行のたびに使用したアカウントを `agent account:` の行に出す。pull request を作るのはこの2つで、どちらの pull request も作成者が誰になったかは GitHub 上でしか確認できないため、実行時に名前を出す。値は解決できたアカウント名、`(none configured, using the active gh account)`、`(could not be resolved)` のいずれかである。
 
 対象外: commit の author は変わらない。commit は各 change の worktree で利用者の git 設定のまま作られる。ruleset が見るのは pull request の作成者なので、この change の目的には commit の author は関係しない。
 
@@ -255,7 +255,13 @@ cd <project-directory>
 /path/to/overlord/scripts/change.sh merge <change-id> [--board <path>]
 ```
 
-引数は `<change-id>` と `--board <path>` だけである。検査を外す引数は無い。`--base` / `--force` / `--admin` / `--squash` のような他の引数を渡すと、マージせず exit 2 で終了する（`change merge takes no option other than --board`）。検査を外す環境変数も無い。
+引数は `<change-id>` 1つと `--board <path>` だけである。検査を外す引数は無い。次のいずれもマージを行わず exit 2 で終了する。
+
+- `--base` / `--force` / `--admin` / `--squash` のような `--board` 以外のオプション（`change merge takes no option other than --board`）
+- change id を2つ以上渡した場合（`change merge takes one change id, and was given 2`）。1つ目だけをマージして残りを無視することはしない
+- 値を伴わないオプション（`change merge OV-1-C1 --board` など。`option --board needs a value`）
+
+検査を外す環境変数も無い。
 
 ### 何を検査するか
 
@@ -281,7 +287,9 @@ change 単位の pull request（作業ブランチ向け）と、カードの配
 
 ### マージと board への記録
 
-マージは `gh pr merge <n> --merge` だけを呼ぶ。merge commit のみで、squash と rebase は使わない（README「なぜ merge commit なのか」）。squash / rebase を選ぶ引数は無い。
+マージは `gh pr merge <n> --merge --match-head-commit <headRefOid>` だけを呼ぶ。merge commit のみで、squash と rebase は使わない（README「なぜ merge commit なのか」）。squash / rebase を選ぶ引数は無い。
+
+`--match-head-commit` に渡すのは、上の検査を行った `gh pr view` が返した `headRefOid`、つまり `reviewed_sha` と一致することを確認した commit そのものである。検査とマージは別の `gh` 呼び出しなので、その間にブランチへ commit が push されうる。この引数があると、head がその commit でなくなっていれば GitHub 側がマージを拒否し、レビューされていない commit がマージされることはない。この理由でマージが失敗した場合は exit 1 で、stderr に `gh pr merge <n> --merge failed:` に続けて gh の理由と、どの commit を前提にしていたかを出す。
 
 マージ後に `gh pr view <n> --json number,url,state,headRefOid,headRefName` をもう一度読み、**`sync` と同じ経路（`applyPullRequestView`）** で board に書く。したがって `changes[].pr` と `changes[].state: done` は、後から `sync` を実行した場合とまったく同じ値になり、`reviewed_sha` はそのまま保たれる。board への書き込みは1回だけで、カードの `state` は動かさない（カードを進めるのは司令塔の判断である）。
 
@@ -373,7 +381,7 @@ exit code: 配送した (`created` / `updated`) と配送するものが無か�
 
 - **契機は 1 つだけ**: `PATCH /api/items/:id` が `state: "done"` を書き、かつ直前の状態が `acceptance` だったときに起動する。カードのモーダルの「受け入れて完了」がこの遷移を作る操作で、完成確認待ち 列から 完了 列へのドラッグも同じ PATCH になる。それ以外の列から 完了 列へドラッグした場合と、既に `done` のカードへの PATCH（2 回目のクリック、別のタブ）は board を書くだけで配送しない。
 - **PATCH は配送を待たない**: 配送は `git fetch` / `git push` と複数の `gh` 呼び出しを行い数秒かかる。サーバーは board を書いた時点で応答し、配送の結果はイベントストリームで報告する。git と `gh` の 1 コマンドあたりのタイムアウトは 120 秒。
-- **同一カードで多重起動しない**: そのカードの配送が走っている間に来た起動要求は、新しい実行を始めない。走っている実行が結果を報告する。リポジトリ単位の直列化は `deliverCard` 側にある。
+- **同一カードで多重起動しない**: そのカードの配送が走っている間に来た起動要求は、新しい実行を始めない。走っている実行が結果を報告する。ただし `running` フレームはこの場合も送る（下の表を参照）。リポジトリ単位の直列化は `deliverCard` 側にある。
 - **失敗してもカードは戻らない**: 配送が失敗してもカードは `done` のままで、失敗は `items[].delivery.error` に記録される。ブラウザを閉じた後やイベントストリームが切れた後でも、PR が作られなかった理由がカードに残る。`branch` / `base` / `pr` は今回分かった値と前回の記録で埋めるので、失敗が過去に記録した pull request を消すことはない。
 - **配送先が無いリポジトリは失敗ではない**: git リポジトリでない、またはリモートが無い場合は `skipped` (`no-repository` / `no-remote`) として報告する。それ以外の `git remote` の失敗は `failed`。
 
@@ -388,7 +396,7 @@ exit code: 配送した (`created` / `updated`) と配送するものが無か�
 
 | `status` | 意味 | 一緒に来るもの |
 | --- | --- | --- |
-| `running` | 実行を開始した | なし（このフレームだけが `DeliverOutcome` ではない） |
+| `running` | そのカードの配送を要求された。既に走っている配送があってこの要求が新しい実行を始めなかった場合にも送る（配送中であることを、要求した画面にも伝えるため） | なし（このフレームだけが `DeliverOutcome` ではない） |
 | `created` / `updated` | 成果 pull request がある | `pr` |
 | `skipped` | 配送するものが無い | `reason`: `no-diff` / `same-branch` / `no-remote` / `no-repository` |
 | `blocked` | 未マージの change が残っている | `unmerged`: `"<change-id>  <title>"` の配列 |
@@ -410,7 +418,11 @@ body は不要。応答は `{"ok":true,"card":"<id>","started":true}` で、`sta
 - カードの状態は問わない。`change deliver` と同じ扱いで、未マージの change が残っていれば `deliverCard` が `blocked` で拒否する。
 - 結果は上と同じ `delivery` フレームで届き、失敗は `delivery.error` に残る。
 - 404: 不明なカード、または board が見つからない。409: そのサーバーで配送が無効化されている。
-- 画面では、カードのモーダルの「成果の配送」に `配送をやり直す` として出る（配送が `failed` または `blocked` のときだけ）。
+- 画面では、カードのモーダルの「成果の配送」に `配送をやり直す` として出る。出るのは次の2つの場合で、それ以外では出ない。
+  - この画面が見ていた最後のフレームが `failed` または `blocked` だった
+  - この画面が配送のフレームを1つも見ておらず、カードの `items[].delivery.error` に失敗が記録されている（前のセッションで失敗した配送。ブラウザを開き直しても復帰経路が残る）
+
+  この画面が見た最後のフレームが結果（`running` 以外）であれば、それが board の記録より優先する。やり直しが成功すれば、失敗の記録が出していたボタンは消える。
 
 ### 配送を止める
 
