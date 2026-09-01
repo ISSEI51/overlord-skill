@@ -4517,6 +4517,82 @@ describe("git push under the agent account", () => {
     expect(pushes[0]!.token).toBe("");
   }, 60_000);
 
+  test("an https remote on another host is not pushed at all", async () => {
+    const repo = await deliveryRepo();
+    await gitIn(
+      ["remote", "set-url", "--push", "origin", "https://gitlab.com/o/r.git"],
+      repo.root,
+    );
+    const boardPath = await writeDeliveryBoard([MERGED_CHANGE]);
+    const before = await Bun.file(boardPath).text();
+    const ghStub = await deliverGhStub({ "view-50.json": VIEW_50_UNCHANGED });
+    const push = await gitPushStub();
+
+    const outcome = await withAccount(
+      {
+        OVERLORD_GH_ACCOUNT: undefined,
+        OVERLORD_GH_TOKEN: "ghp_agent",
+        GH_HOST: undefined,
+        PATH: `${push.dir}:${ghStub.dir}:${process.env.PATH ?? ""}`,
+        GIT_PUSH_STUB_LOG: push.log,
+      },
+      () =>
+        withGhStub(ghStub, () =>
+          deliverCard({
+            boardPath,
+            cardId: "OV-500",
+            cwd: repo.root,
+            head: "feature",
+          }),
+        ),
+    );
+
+    // The token is not sent to gitlab.com, so the push would have been
+    // authenticated by whatever credential the machine has for it — the
+    // user's — and the branch would be theirs. Nothing is pushed instead.
+    expect(outcome.status).toBe("failed");
+    expect(outcome.reason).toContain("gitlab.com");
+    expect(outcome.reason).toContain("Nothing was pushed");
+    expect(await push.pushes()).toEqual([]);
+    expect(await Bun.file(boardPath).text()).toBe(before);
+  }, 60_000);
+
+  test("with an Enterprise GH_HOST it is a github.com remote that is not pushed", async () => {
+    const repo = await deliveryRepo();
+    await gitIn(
+      ["remote", "set-url", "--push", "origin", "https://github.com/o/r.git"],
+      repo.root,
+    );
+    const boardPath = await writeDeliveryBoard([MERGED_CHANGE]);
+    const ghStub = await deliverGhStub({ "view-50.json": VIEW_50_UNCHANGED });
+    const push = await gitPushStub();
+
+    const outcome = await withAccount(
+      {
+        OVERLORD_GH_ACCOUNT: undefined,
+        OVERLORD_GH_TOKEN: "ghp_agent",
+        GH_HOST: "github.example.com",
+        PATH: `${push.dir}:${ghStub.dir}:${process.env.PATH ?? ""}`,
+        GIT_PUSH_STUB_LOG: push.log,
+      },
+      () =>
+        withGhStub(ghStub, () =>
+          deliverCard({
+            boardPath,
+            cardId: "OV-500",
+            cwd: repo.root,
+            head: "feature",
+          }),
+        ),
+    );
+
+    // The account lives on the Enterprise host, so github.com is the foreign
+    // one here and gets the same answer, in the direction the other way round.
+    expect(outcome.status).toBe("failed");
+    expect(outcome.reason).toContain("github.example.com");
+    expect(await push.pushes()).toEqual([]);
+  }, 60_000);
+
   test("with no account configured the push is unchanged", async () => {
     const repo = await deliveryRepo();
     const boardPath = await writeDeliveryBoard([MERGED_CHANGE]);

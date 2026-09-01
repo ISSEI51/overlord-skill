@@ -88,19 +88,29 @@ const CREDENTIAL_USERNAME = "x-access-token";
  *
  * The request is `key=value` lines terminated by a blank line, so `IFS='='`
  * splits each one and the value keeps any further `=`. A `host` may carry a
- * port (`ghe.example.com:8443`), which is stripped: a port does not change
- * whose host it is.
+ * port (`ghe.example.com:8443`), which is stripped from the last colon so an
+ * `[::1]` keeps its own: a port does not change whose host it is.
+ *
+ * `host` and `protocol` are compared without regard to case, because git
+ * passes both through from the remote URL exactly as it is written there:
+ * `https://GitHub.com/o/r.git` produces `host=GitHub.com`, and
+ * `HTTPS://…` produces `protocol=HTTPS`. Every other host comparison in this
+ * module folds case (`httpsHostOf`, `githubHost`), so a remote written that
+ * way passes `pushIdentity` and reaches this helper; a case-sensitive
+ * comparison here would refuse it and break the push.
  */
 const CREDENTIAL_HELPER =
   `!f() { ` +
   `[ "$1" = get ] || return 0; ` +
+  `[ -n "$${CREDENTIAL_HOST_ENV}" ] || return 0; ` +
   `h=; p=; ` +
   `while IFS='=' read -r k v; do ` +
   `[ -n "$k" ] || break; ` +
   `case "$k" in host) h=$v ;; protocol) p=$v ;; esac; ` +
   `done; ` +
-  `[ "$p" = https ] || return 0; ` +
-  `[ "\${h%%:*}" = "$${CREDENTIAL_HOST_ENV}" ] || return 0; ` +
+  `lc() { printf '%s' "$1" | LC_ALL=C tr 'A-Z' 'a-z'; }; ` +
+  `[ "$(lc "$p")" = https ] || return 0; ` +
+  `[ "$(lc "\${h%:*}")" = "$${CREDENTIAL_HOST_ENV}" ] || return 0; ` +
   `printf 'username=%s\\npassword=%s\\n' ` +
   `"$${CREDENTIAL_USERNAME_ENV}" "$${CREDENTIAL_TOKEN_ENV}"; ` +
   `}; f`;
@@ -297,12 +307,57 @@ export function httpsHostOf(url: string): string | null {
 }
 
 /**
+ * Why a push to `url` must not be made at all, or null when it may be.
+ *
+ * An HTTPS remote on a host the agent account does not own is the one case
+ * that is refused rather than reported. The token is not sent there — a token
+ * for one host must never be handed to another — but git does not stop at
+ * that: it asks the next credential helper, which on a developer's machine is
+ * the macOS keychain or the one `gh auth setup-git` installed, and both answer
+ * with the user's own account. The push would then succeed under the user's
+ * name, which is the substitution the separate account exists to prevent, and
+ * it would succeed quietly: a warning on stderr is not a thing anyone reads
+ * after the pull request is already open under the wrong name.
+ *
+ * A non-HTTPS remote (ssh, or a local path) is not refused; see
+ * `pushAttributionWarning`. The two are different because of who ends up
+ * owning the push: over ssh there is no credential to substitute — the key of
+ * the machine is the only thing that can authenticate, on a repository that is
+ * otherwise configured correctly and working — while over HTTPS to a foreign
+ * host there is a credential, and it is the user's.
+ *
+ * This costs nothing when nothing is configured: with no agent account,
+ * `pushIdentity` never asks.
+ */
+export function pushAttributionRefusal(
+  identity: AgentIdentity,
+  url: string,
+): string | null {
+  const host = httpsHostOf(url);
+  const expected = githubHost();
+  if (host === null || host === expected) return null;
+  const who = identity.account ?? `the token in $${AGENT_TOKEN_ENV}`;
+  return (
+    `the push remote is "${url}", on "${host}" rather than "${expected}", ` +
+    `where ${who} is. The agent account's token is not sent to another host, ` +
+    `so this push would be authenticated by whatever credential this machine ` +
+    `has for "${host}" — the user's — and the branch and its pull request ` +
+    `would be attributed to them. Nothing was pushed. Point origin at ` +
+    `https://${expected}/<owner>/<repo>.git, or set GH_HOST to the host the ` +
+    `agent account belongs to.`
+  );
+}
+
+/**
  * Why a push to `url` cannot be attributed to the agent account, or null when
  * it can.
  *
  * Reported rather than enforced: a repository on an SSH remote still works,
  * and refusing to push at all would be a worse answer than pushing under the
- * key that is configured and saying so.
+ * key that is configured and saying so. An HTTPS remote on another host is
+ * refused instead of reported, by `pushAttributionRefusal`; this function
+ * still describes it, for `identity`, which reports every reason it finds
+ * rather than performing a push.
  */
 export function pushAttributionWarning(
   identity: AgentIdentity,

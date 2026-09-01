@@ -7,11 +7,13 @@ import { join } from "node:path";
 import {
   AGENT_ACCOUNT_ENV,
   AGENT_TOKEN_ENV,
+  CREDENTIAL_HOST_ENV,
   agentIdentity,
   describeAccount,
   ghEnvFor,
   githubHost,
   httpsHostOf,
+  pushAttributionRefusal,
   pushAttributionWarning,
   pushCredentialArgs,
   pushCredentialEnv,
@@ -402,6 +404,24 @@ describe("the git credential of a push", () => {
     expect(await Bun.file(file).exists()).toBe(false);
   });
 
+  test("a remote URL written with capitals still gets the credential", async () => {
+    // What a push to `https://GitHub.com/o/r.git` produces: git parses the
+    // remote URL and passes `host=GitHub.com` through unchanged. `httpsHostOf`
+    // folds case, so `pushIdentity` accepts that remote and installs this
+    // helper — and the helper has to answer it, or the push of a checkout
+    // whose remote is written that way fails with no credential at all.
+    const filled = await credentialForUrl(
+      "https://GitHub.com/ISSEI51/overlord-skill.git",
+      pushCredentialArgs(),
+      identity,
+    );
+    expect(filled.code).toBe(0);
+    expect(credentialShape(filled.stdout, identity)).toEqual({
+      username: CREDENTIAL_USERNAME,
+      password: "(the agent account's token)",
+    });
+  });
+
   test("nothing git is told carries the token except the environment", async () => {
     const filled = await credential("fill", pushCredentialArgs(), identity);
     expect(filled.stderr.includes(identity.token)).toBe(false);
@@ -541,6 +561,60 @@ describe("the host the credential helper answers for", () => {
     });
   });
 
+  test("the host and the protocol are matched without regard to case", async () => {
+    // git passes both through from the remote URL exactly as it is written:
+    // `https://GitHub.com/o/r.git` produces `host=GitHub.com`, and an
+    // uppercase scheme produces `protocol=HTTPS`. `httpsHostOf` folds case, so
+    // such a remote passes `pushIdentity` and reaches this helper; refusing it
+    // here would break the push of a checkout whose remote is written that way.
+    for (const fields of [
+      { protocol: "https", host: "GitHub.com" },
+      { protocol: "https", host: "GITHUB.COM" },
+      { protocol: "HTTPS", host: "github.com" },
+      { protocol: "Https", host: "GitHub.COM:443" },
+    ]) {
+      const answered = await runHelper("get", request(fields), identity);
+      expect(credentialShape(answered.stdout, identity)).toEqual({
+        username: CREDENTIAL_USERNAME,
+        password: "(the agent account's token)",
+      });
+    }
+  });
+
+  test("a port is stripped from the last colon, so a bracketed address keeps its own", async () => {
+    const answered = await runHelper(
+      "get",
+      request({ protocol: "https", host: "github.com:443" }),
+      identity,
+    );
+    expect(credentialShape(answered.stdout, identity)).toEqual({
+      username: CREDENTIAL_USERNAME,
+      password: "(the agent account's token)",
+    });
+    // `[::1]` is not this host, and the strip must not turn it into something
+    // that could be: a greedy strip would leave "[".
+    const bracketed = await runHelper(
+      "get",
+      request({ protocol: "https", host: "[::1]:8443" }),
+      identity,
+    );
+    expect(redacted(bracketed.stdout)).toBe("");
+    expect(bracketed.code).toBe(0);
+  });
+
+  test("no expected host in the environment answers nothing", async () => {
+    // A helper left in a git config with the environment gone must not answer
+    // a request whose host happens to be empty too.
+    const answered = await runHelper(
+      "get",
+      request({ protocol: "https", host: "" }),
+      identity,
+      { [CREDENTIAL_HOST_ENV]: "" },
+    );
+    expect(redacted(answered.stdout)).toBe("");
+    expect(answered.code).toBe(0);
+  });
+
   test("store and erase print nothing and succeed, for its own host too", async () => {
     for (const operation of ["store", "erase"]) {
       const answered = await runHelper(
@@ -580,6 +654,28 @@ async function credential(
   const proc = Bun.spawn(["git", ...args, "credential", operation], {
     env: { ...process.env, ...pushCredentialEnv(identity) },
     stdin: new TextEncoder().encode(input),
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const stdout = await new Response(proc.stdout).text();
+  const stderr = await new Response(proc.stderr).text();
+  const code = await proc.exited;
+  return { code, stdout, stderr };
+}
+
+/**
+ * `git credential fill` for a whole URL, which is how a push reaches a helper:
+ * git parses the remote URL and hands the parts to the helpers itself, rather
+ * than being told `protocol` and `host` separately.
+ */
+async function credentialForUrl(
+  url: string,
+  args: string[],
+  identity: AgentIdentity,
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  const proc = Bun.spawn(["git", ...args, "credential", "fill"], {
+    env: { ...process.env, ...pushCredentialEnv(identity) },
+    stdin: new TextEncoder().encode(`url=${url}\n\n`),
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -630,6 +726,71 @@ describe("which remotes the agent account can be used on", () => {
       expect(
         pushAttributionWarning(identity, "https://github.com/team/project.git"),
       ).toContain("github.com");
+    });
+  });
+
+  test("an https remote on another host is refused, not pushed under the user", async () => {
+    // The token is not sent to a host it does not belong to, but git does not
+    // stop there: the next helper — the macOS keychain, or the one
+    // `gh auth setup-git` installed — answers with the user's account, and the
+    // push lands under their name. Refusing is the only outcome that does not
+    // silently attribute the agent's work to a person.
+    await withEnv({ GH_HOST: undefined }, async () => {
+      const refusal = pushAttributionRefusal(
+        identity,
+        "https://gitlab.com/someone/project.git",
+      );
+      expect(refusal).toContain("gitlab.com");
+      expect(refusal).toContain("Nothing was pushed");
+      expect(refusal).toContain("attributed to them");
+    });
+  });
+
+  test("on an Enterprise host it is github.com that is refused", async () => {
+    await withEnv({ GH_HOST: "github.example.com" }, async () => {
+      expect(
+        pushAttributionRefusal(
+          identity,
+          "https://github.example.com/team/project.git",
+        ),
+      ).toBeNull();
+      const refusal = pushAttributionRefusal(
+        identity,
+        "https://github.com/team/project.git",
+      );
+      expect(refusal).toContain("github.com");
+      expect(refusal).toContain("github.example.com");
+    });
+  });
+
+  test("an ssh remote is not refused, because no credential can be substituted", async () => {
+    // Over ssh the key of the machine is what authenticates the push, and
+    // there is no credential helper for anything to fall back to. Refusing
+    // would stop a repository that works, so this one stays a warning.
+    await withEnv({ GH_HOST: undefined }, async () => {
+      expect(
+        pushAttributionRefusal(
+          identity,
+          "git@github.com:ISSEI51/overlord-skill.git",
+        ),
+      ).toBeNull();
+      expect(
+        pushAttributionWarning(
+          identity,
+          "git@github.com:ISSEI51/overlord-skill.git",
+        ),
+      ).toContain("not an HTTPS URL");
+    });
+  });
+
+  test("the host the account belongs to is not refused", async () => {
+    await withEnv({ GH_HOST: undefined }, async () => {
+      expect(
+        pushAttributionRefusal(
+          identity,
+          "https://github.com/ISSEI51/overlord-skill.git",
+        ),
+      ).toBeNull();
     });
   });
 

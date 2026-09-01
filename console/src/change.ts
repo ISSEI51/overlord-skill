@@ -40,6 +40,7 @@ import {
   agentIdentity,
   describeAccount,
   ghEnvFor,
+  pushAttributionRefusal,
   pushAttributionWarning,
   pushCredentialArgs,
   pushCredentialEnv,
@@ -618,10 +619,16 @@ async function pushIdentity(
       ],
     };
   }
+  // An HTTPS remote on another host is refused rather than pushed: the token
+  // is not sent there, so git would fall back to the credential the machine
+  // has for that host, and the push would land under the user's name.
+  const refusal = pushAttributionRefusal(resolution.identity, url);
+  if (refusal) return { ok: false, error: refusal };
   const warning = pushAttributionWarning(resolution.identity, url);
   if (warning) {
-    // No credential is injected: a token for github.com must not be sent to a
-    // host it does not belong to, and an SSH remote never asks for one.
+    // No credential is injected, and the push goes ahead: an SSH remote asks
+    // for none, and there is no credential of the user's for it to fall back
+    // to either — the key of the machine is what authenticates it.
     return { ok: true, args: [], warnings: [warning] };
   }
   return {
@@ -2980,9 +2987,14 @@ export async function identity(argv: string[]): Promise<number> {
     );
     return 1;
   }
-  const warning = pushAttributionWarning(account, url);
+  // The refusal first, when there is one: it says what would happen to a push
+  // from here, which is more than "not the agent account".
+  const refusal = pushAttributionRefusal(account, url);
+  const warning = refusal ?? pushAttributionWarning(account, url);
   if (warning) {
-    process.stdout.write(`push identity:    (not the agent account)\n`);
+    process.stdout.write(
+      `push identity:    ${refusal ? "(refused: another host)" : "(not the agent account)"}\n`,
+    );
     process.stderr.write(`${warning}\n`);
     return 1;
   }
