@@ -2635,6 +2635,35 @@ describe("deliverCard", () => {
     expect(await ghCalls(stub)).toEqual([]);
   }, 60_000);
 
+  test("(e) a skipped run still records what the synchronization found", async () => {
+    // The synchronization is step 1, before the outcome is decided, so
+    // `changes[]` can be written whatever the outcome turns out to be — here
+    // a run that had nothing to deliver and wrote no `delivery` at all. The
+    // documentation used to say a delivery touches neither `state` nor
+    // `changes`, and that only a blocked run could write `changes[].pr`.
+    const boardPath = await writeDeliveryBoard([OPEN_CHANGE]);
+    const repo = await deliveryRepo();
+    const stub = await deliverGhStub({
+      // GitHub says the change was merged since the board last looked.
+      "view-51.json": { ...VIEW_51_OPEN, state: "MERGED" },
+    });
+
+    const outcome = await withGhStub(stub, () =>
+      deliverCard({ boardPath, cardId: "OV-500", cwd: repo.root, head: "same" }),
+    );
+
+    expect(outcome.status).toBe("skipped");
+    expect(outcome.reason).toBe("no-diff");
+
+    const { board } = await loadBoard(boardPath);
+    const change = findChange(board, "OV-500-C2")!.change;
+    expect(change.state).toBe("done");
+    expect(change.pr!.state).toBe("merged");
+    // The card itself is untouched: no delivery record, and the state stays.
+    expect(board.items[0]!.delivery ?? null).toBeNull();
+    expect(board.items[0]!.state).toBe("acceptance");
+  }, 60_000);
+
   test("(f) a pull request on another head branch fails and the board is untouched", async () => {
     const repo = await deliveryRepo();
     const boardPath = await writeDeliveryBoard([MERGED_CHANGE]);

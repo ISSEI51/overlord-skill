@@ -363,9 +363,9 @@ cd <project-directory>
 - 本文はカードごとに `<!-- overlord:card <card-id> -->` … `<!-- /overlord:card <card-id> -->` で囲んだ節として差し込まれる。同じカードの節があれば置換し、無ければ末尾に追記するので、人が書いた説明文と他のカードの節はそのまま残る。
 - `--head` が `--base` と同じブランチなら `skipped` (`same-branch`)。`git fetch origin <base>` の後 `git diff --quiet origin/<base> <head>` が exit 0（差分なし）なら `skipped` (`no-diff`)。どちらも pull request を作らない。`refs/remotes/origin/<base>` が無いリポジトリではローカルの `<base>` と比較する。`git fetch` の失敗は警告として stderr に出したうえで、その時点の ref と比較して続行する。
 
-書き込みの順序は `pr` と同じで、`gh pr view <ref> --json number,url,state,headRefOid,headRefName,baseRefName` が `headRefName` と `baseRefName` の両方を確認した後にだけ board を書く。どちらかが違えば `failed` で終了し、`board.yaml` は 1 バイトも変わらない。
+書き込みの順序は `pr` と同じで、`gh pr view <ref> --json number,url,state,headRefOid,headRefName,baseRefName` が `headRefName` と `baseRefName` の両方を確認した後にだけ `items[].delivery` を書く。どちらかが違えば `failed` で終了し、`items[].delivery` は書かない（手順 1 の同期が change の状態を書き換えていなければ、`board.yaml` は 1 バイトも変わらない）。
 
-成功したときにカードへ書かれるのは `delivery` だけで、`state` や `changes` は動かない:
+成功したときにカードへ書かれる `delivery` は次の形になる。カードの `state` は動かない（カードを進めるのは司令塔の判断である）。`changes` は動きうる: 配送の手順 1 は `change sync <card-id>` と同じ同期なので、GitHub の報告が board の記録と違えば `changes[].pr` が書き直され、merged と報告された change は `changes[].state: done` にもなる（動いた change が 1 つも無ければ board は書かない）。これは結果によらず起きる（下の「配送のイベント」を参照）。
 
 ```yaml
     delivery:
@@ -412,7 +412,7 @@ exit code: 配送した (`created` / `updated`) と配送するものが無か�
 
 `warnings`（実行を止めなかった問題）は `running` 以外のフレームに必ず配列で付く。`head` と `base` は、失敗したがブランチまでは解決できた実行に付く。
 
-`skipped` と `blocked` は `items[].delivery` を書かない（`blocked` は配送の手順 1 の同期で `changes[].pr` を書くことはある）。したがってこの 2 つの結果はこのフレームにしか残らない。コンソールの画面はフレームをカード単位で保持し、カードのモーダルの「成果の配送」に出す。
+`skipped` と `blocked` は `items[].delivery` を書かない。したがってこの 2 つの結果はこのフレームにしか残らない。ただし `changes[].pr` と `changes[].state` は、`created` / `updated` / `skipped` / `blocked` / `failed` のどの結果でも書かれうる。配送の手順 1 の同期が、結果を決める前に必ず走るためである。コンソールの画面はフレームをカード単位で保持し、カードのモーダルの「成果の配送」に出す。
 
 ### 手動で配送し直す
 
@@ -439,6 +439,6 @@ body は不要。応答は `{"ok":true,"card":"<id>","started":true}` で、`sta
 OVERLORD_DELIVER=0 /path/to/overlord/scripts/console.sh <project-directory>
 ```
 
-`OVERLORD_DELIVER` は `0` / `false` / `off` / `no`（大文字小文字を問わない）で無効になる。起動時の 4 行目に `deliver on done   off` と出る。`console.sh ensure` は `--no-deliver` をサーバーへ渡さないので、そちらでは `OVERLORD_DELIVER` を使う（環境変数はサーバープロセスへ引き継がれる）。
+`OVERLORD_DELIVER` は `0` / `false` / `off` / `no`（大文字小文字を問わない）で無効になる。起動時の 4 行目に `deliver on done   off` と出る。`console.sh ensure` は `--no-deliver` を受け付けない。渡すと `unknown option: --no-deliver (see: console.sh ensure --help)` を出して exit 1 で終了し、サーバーは起動しない。`ensure` 経由で無効にするには `OVERLORD_DELIVER` を使う（環境変数はサーバープロセスへ引き継がれる）。
 
 無効なサーバーでは、`acceptance` -> `done` で配送は起動せず、`POST /api/items/:id/deliver` は 409 と理由を返す。画面はこの応答をエラーとして表示する。
