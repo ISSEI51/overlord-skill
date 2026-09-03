@@ -232,7 +232,7 @@ export OVERLORD_GH_ACCOUNT=<account>
 | 状態 | 挙動 |
 | --- | --- |
 | 未設定 | 従来どおり。`gh` のアクティブアカウントで push し、pull request を作る |
-| 設定済み・解決できる | `gh auth token --user <account>` でトークンを読み、`gh` には `GH_TOKEN` として、`git push` には credential helper として、**そのサブプロセスにだけ**渡す |
+| 設定済み・解決できる | `gh auth token --user <account>` でトークンを読み、`gh` には `GH_TOKEN`（GitHub Enterprise Server ホストでは `GH_ENTERPRISE_TOKEN` にも）として、`git push` には credential helper として、**そのサブプロセスにだけ**渡す |
 | 設定済み・解決できない | 該当コマンドは非0で終了する。アクティブアカウントへフォールバックしない |
 
 `OVERLORD_GH_TOKEN` にトークンを直接置くこともできる。`gh` の keyring にそのアカウントが無い環境向けで、設定されていれば `OVERLORD_GH_ACCOUNT` より優先される。
@@ -241,8 +241,13 @@ export OVERLORD_GH_ACCOUNT=<account>
 
 - **`gh auth switch` は使わない。** アクティブアカウントの切り替えはプロセス全体に永続的に効くため、並行して動く別の Overlord セッションと競合し、失敗したときに利用者のシェルが bot のままになる。トークンは各サブプロセスの環境変数として渡す。
 - **トークンは argv・標準出力・標準エラー・ファイルのいずれにも出さない。** `git -c http.extraheader=...` やリモート URL への埋め込みはコマンドラインに載るため使わない。`git push` には `-c credential.helper=`（既存の helper を空にする）と、環境変数から読む helper の2つを渡す。空にする指定が要るのは、macOS の osxkeychain と `gh auth setup-git` が入れる `credential.https://github.com.helper` が先に応答すると、利用者の資格情報で push されるためである。
+- **helper は要求されたホストを検査する。** git が標準入力に書く要求の `host=` が `GH_HOST`（既定は github.com）と一致し、かつ `protocol=https` のときだけ応答し、それ以外は何も出力せず exit 0 する。比較は大文字小文字を区別せず、`host` の末尾のポート（`:443`）は除く。git は `host=` と `protocol=` をリモート URL に書かれたままの表記で渡すため（`https://GitHub.com/o/r.git` は `host=GitHub.com`、`HTTPS://` は `protocol=HTTPS`）、区別すると大文字を含む URL のリモートで push が資格情報を得られなくなる。push リモートのホストは helper を入れる前に確認しているが、その確認では見えない経路（認証付きの `http.proxy`、別ホストへのリダイレクト）で、同じ `git push` の中から別ホストの資格情報が要求されうる。ホストが違えば「そのホストの資格情報は持っていない」と答えるのが正しい。helper は `store` と `erase` にも何も出力しない（トークンを macOS のキーチェーンに書き込ませないため）。
+- **GitHub Enterprise Server ホストでは `GH_ENTERPRISE_TOKEN` にも同じトークンを入れる。** `gh help environment`（gh 2.89.0）によれば、`GH_TOKEN` と `GITHUB_TOKEN` が読まれるのは「コマンドの対象が github.com または ghe.com のサブドメインのとき」で、Enterprise Server ホストが対象のときは `GH_ENTERPRISE_TOKEN` と `GITHUB_ENTERPRISE_TOKEN` が読まれる。実測（gh 2.89.0）: `GH_HOST=ghe.example.com GH_TOKEN=<値> gh auth status` は、そのホストについて `using token (default)`（保存済み資格情報＝利用者のもの）と表示し、`(GH_TOKEN)` と出るのは github.com だけである。`GH_TOKEN` だけを設定していると、Enterprise Server 環境では `gh pr create` が利用者名義で実行される。これはこの機構が防ぐために存在する silent fallback そのものなので、ホストに応じて設定する変数を変える。`GITHUB_TOKEN` と `GITHUB_ENTERPRISE_TOKEN` は常に空にする（継承した値が優先順位の先にある変数の代わりにアカウントを決めてしまわないように）。`GH_ENTERPRISE_TOKEN` は、アカウントが github.com のものであれば空にする（あるホストのトークンを別ホストへ渡さないという、credential helper と同じ規則）。
 - **読み取りだけの `gh` 呼び出しも同じアカウントで実行する。** 書き込みだけを切り替える設計にすると「どの `gh` サブコマンドが書き込みか」の一覧を持つことになり、その一覧から漏れたサブコマンドが利用者名義で pull request を作る。ここで避けたい事故はそれ1つなので、`sync` や `reviewed` の読み取りも含めて一律に切り替える。代わりに、**エージェント用アカウントは Overlord を使う各リポジトリで read 権限以上を持っている必要がある**（pull request を作るためにどのみち write が要る）。
-- push にこのアカウントが使われるのは、リモートが `https://github.com/...`（`GH_HOST` を設定している場合はそのホスト）のときだけである。ssh リモートや別ホストのリモートには、トークンを送らずに警告を出して push する。
+- push にこのアカウントが使われるのは、リモートが `https://github.com/...`（`GH_HOST` を設定している場合はそのホスト）のときだけである。それ以外のリモートの扱いは2つに分かれ、分かれ目は「利用者の資格情報に置き換わるかどうか」である。
+  - **別ホストの https リモート（`https://gitlab.com/...`、`GH_HOST` が Enterprise ホストのときの `https://github.com/...` など）は push しない。** 非0で終了し、何も push せず board も書かない。トークンを他ホストへ送らないだけでは足りない。git は次の helper（macOS の osxkeychain、`gh auth setup-git` が入れたもの）に尋ね、それが利用者のアカウントで応答するため、push は利用者名義で成功してしまう。警告を出して push を通す形にすると、pull request が利用者名義で作られた後に stderr の1行が残るだけになり、ruleset の前提（作成者が利用者以外であること）が黙って崩れる。
+  - **ssh リモート（`git@github.com:...`）とローカルパスのリモートは、トークンを送らずに警告を出して push する。** ここには置き換わる資格情報が無い。認証するのはその機械の鍵だけで、credential helper は呼ばれない。拒否すると、正しく動いているリポジトリを止めることになる。
+  - `change identity` はどちらの場合も exit 1 で理由を出す。`push identity:` の行は前者で `(refused: another host)`、後者で `(not the agent account)` になる。
 
 `change identity` はこの設定がこのリポジトリで機能するかを確認する。
 
@@ -262,7 +267,7 @@ push identity:    ISSEI-BOT
 
 順に、トークンが解決できること、そのトークンが名乗るアカウントが指定したアカウントと一致すること、そのアカウントがこのリポジトリで write を持つこと、push リモートがそのトークンで認証できるホストであることを確認する。どれかを満たさない場合は exit 1 で、満たさなかった項目を stderr に出す。アカウントが未設定の場合も exit 1 になる（この設問に対する答えが「いいえ」であるため）。アカウントの設定は全プロジェクト共通だが、リポジトリへのアクセス権はリポジトリごとに与えるものなので、新しいプロジェクトで Overlord を使い始めるときはこのコマンドで確認する。
 
-`pr` は実行のたびに使用したアカウントを `agent account:` の行に出す。
+`pr` と `deliver` は実行のたびに使用したアカウントを `agent account:` の行に出す。pull request を作るのはこの2つで、どちらの pull request も作成者が誰になったかは GitHub 上でしか確認できないため、実行時に名前を出す。値は解決できたアカウント名、`(none configured, using the active gh account)`、`(could not be resolved)` のいずれかである。
 
 対象外: commit の author は変わらない。commit は各 change の worktree で利用者の git 設定のまま作られる。ruleset が見るのは pull request の作成者なので、この change の目的には commit の author は関係しない。
 
@@ -275,13 +280,22 @@ cd <project-directory>
 /path/to/overlord/scripts/change.sh merge <change-id> [--board <path>]
 ```
 
-引数は `<change-id>` と `--board <path>` だけである。検査を外す引数は無い。`--base` / `--force` / `--admin` / `--squash` のような他の引数を渡すと、マージせず exit 2 で終了する（`change merge takes no option other than --board`）。検査を外す環境変数も無い。
+引数は `<change-id>` 1つと `--board <path>` だけである。検査を外す引数は無い。次のいずれもマージを行わず exit 2 で終了する。
+
+- `--base` / `--force` / `--admin` / `--squash` のような `--board` 以外のオプション（`change merge takes no option other than --board`）
+- change id を2つ以上渡した場合（`change merge takes one change id, and was given 2`）。1つ目だけをマージして残りを無視することはしない
+- 値を伴わないオプション（`change merge OV-1-C1 --board` など。`option --board needs a value`）
+
+検査を外す環境変数も無い。
 
 ### 何を検査するか
 
 マージの前に次を順に検査し、1つでも該当すれば **`gh pr merge` を呼ばず、`board.yaml` を1バイトも変更せず** exit 1 で終了する。判断材料は board の記録ではなく `gh pr view` で読んだ現在の pull request である。
 
-1. **base ブランチ** — `baseRefName` が `main` または `master`（大小文字を区別しない）、あるいはリポジトリのデフォルトブランチと一致すれば拒否する。デフォルトブランチを特定できない場合（`git symbolic-ref --short refs/remotes/origin/HEAD` と `gh repo view --json defaultBranchRef` のどちらも答えない場合）も、判定できないので拒否する。base が空の pull request も拒否する。
+1. **base ブランチ** — `baseRefName` が `main` または `master`（大小文字を区別しない）、あるいはリポジトリのデフォルトブランチと一致すれば拒否する。デフォルトブランチを特定できない場合も、判定できないので拒否する。base が空の pull request も拒否する。
+
+   この検査でのデフォルトブランチは `gh repo view --json defaultBranchRef` を権威とし、`gh` が答えられない場合にだけ `git symbolic-ref --short refs/remotes/origin/HEAD` を使う（`deliver` の base 解決とは逆の順序である。「カードを配送する」の節を参照）。`refs/remotes/origin/HEAD` はローカルの symbolic ref で、検証されず、チェックアウトに書ける処理なら何にでも書き換えられる。存在しないブランチを指すこともできる。比較の片方（`baseRefName`）は GitHub から読んでいるので、もう片方も同じ出所にする。なお `main` と `master` はどちらの出所にもよらず名前で拒否するため、ローカルの ref が古いことが問題になりうるのは、デフォルトブランチが `main` でも `master` でもないリポジトリだけである。
+
 2. **pull request の同一性** — `headRefName` が `changes[].branch` と一致しなければ拒否する。`pr --number` と `sync` が適用するのと同じ規則で、`pr.number` の誤りが無関係な pull request をマージすることを防ぐ。
 3. **pull request の状態** — `state` が open でなければ拒否する。既にマージ済み、またはクローズ済みの pull request にはマージするものが無い。
 4. **レビュー** — `changes[].pr.reviewed_sha` が記録されていない、または pull request の `headRefOid` と一致しなければ拒否する。短縮 SHA は前方一致で同一とみなすので、`reviewed --sha <7桁以上>` で記録した値もそのまま使える。
@@ -301,7 +315,9 @@ change 単位の pull request（作業ブランチ向け）と、カードの配
 
 ### マージと board への記録
 
-マージは `gh pr merge <n> --merge` だけを呼ぶ。merge commit のみで、squash と rebase は使わない（README「なぜ merge commit なのか」）。squash / rebase を選ぶ引数は無い。
+マージは `gh pr merge <n> --merge --match-head-commit <headRefOid>` だけを呼ぶ。merge commit のみで、squash と rebase は使わない（README「なぜ merge commit なのか」）。squash / rebase を選ぶ引数は無い。
+
+`--match-head-commit` に渡すのは、上の検査を行った `gh pr view` が返した `headRefOid`、つまり `reviewed_sha` と一致することを確認した commit そのものである。検査とマージは別の `gh` 呼び出しなので、その間にブランチへ commit が push されうる。この引数があると、head がその commit でなくなっていれば GitHub 側がマージを拒否し、レビューされていない commit がマージされることはない。この理由でマージが失敗した場合は exit 1 で、stderr に `gh pr merge <n> --merge failed:` に続けて gh の理由と、どの commit を前提にしていたかを出す。
 
 マージ後に `gh pr view <n> --json number,url,state,headRefOid,headRefName` をもう一度読み、**`sync` と同じ経路（`applyPullRequestView`）** で board に書く。したがって `changes[].pr` と `changes[].state: done` は、後から `sync` を実行した場合とまったく同じ値になり、`reviewed_sha` はそのまま保たれる。board への書き込みは1回だけで、カードの `state` は動かさない（カードを進めるのは司令塔の判断である）。
 
@@ -354,7 +370,7 @@ cd <project-directory>
 既定値:
 
 - `--head` は main checkout の現在のブランチ。detached HEAD の場合はブランチが決まらないので、`--head <branch>` を明示しない限り失敗する。
-- `--base` は「リポジトリのデフォルトブランチ」を次の順で解決する: `git symbolic-ref --short refs/remotes/origin/HEAD` からリモート名を取り除いた名前 → `gh repo view --json defaultBranchRef` → `main`。
+- `--base` は「リポジトリのデフォルトブランチ」を次の順で解決する: `git symbolic-ref --short refs/remotes/origin/HEAD` からリモート名を取り除いた名前 → `gh repo view --json defaultBranchRef` → `main`。ここでローカルの ref を先に見るのは、ネットワーク呼び出しが要らず、誤った base は board へ書く前の `baseRefName` の確認で捕まるためである。`merge` の base ガードは誤りを見逃せないので逆の順序で解決する（「何を検査するか」の 1. を参照）。
 
 同期が先、未マージならブロック:
 
@@ -367,9 +383,9 @@ cd <project-directory>
 - 本文はカードごとに `<!-- overlord:card <card-id> -->` … `<!-- /overlord:card <card-id> -->` で囲んだ節として差し込まれる。同じカードの節があれば置換し、無ければ末尾に追記するので、人が書いた説明文と他のカードの節はそのまま残る。
 - `--head` が `--base` と同じブランチなら `skipped` (`same-branch`)。`git fetch origin <base>` の後 `git diff --quiet origin/<base> <head>` が exit 0（差分なし）なら `skipped` (`no-diff`)。どちらも pull request を作らない。`refs/remotes/origin/<base>` が無いリポジトリではローカルの `<base>` と比較する。`git fetch` の失敗は警告として stderr に出したうえで、その時点の ref と比較して続行する。
 
-書き込みの順序は `pr` と同じで、`gh pr view <ref> --json number,url,state,headRefOid,headRefName,baseRefName` が `headRefName` と `baseRefName` の両方を確認した後にだけ board を書く。どちらかが違えば `failed` で終了し、`board.yaml` は 1 バイトも変わらない。
+書き込みの順序は `pr` と同じで、`gh pr view <ref> --json number,url,state,headRefOid,headRefName,baseRefName` が `headRefName` と `baseRefName` の両方を確認した後にだけ `items[].delivery` を書く。どちらかが違えば `failed` で終了し、`items[].delivery` は書かない（手順 1 の同期が change の状態を書き換えていなければ、`board.yaml` は 1 バイトも変わらない）。
 
-成功したときにカードへ書かれるのは `delivery` だけで、`state` や `changes` は動かない:
+成功したときにカードへ書かれる `delivery` は次の形になる。カードの `state` は動かない（カードを進めるのは司令塔の判断である）。`changes` は動きうる: 配送の手順 1 は `change sync <card-id>` と同じ同期なので、GitHub の報告が board の記録と違えば `changes[].pr` が書き直され、merged と報告された change は `changes[].state: done` にもなる（動いた change が 1 つも無ければ board は書かない）。これは結果によらず起きる（下の「配送のイベント」を参照）。
 
 ```yaml
     delivery:
@@ -393,7 +409,7 @@ exit code: 配送した (`created` / `updated`) と配送するものが無か�
 
 - **契機は 1 つだけ**: `PATCH /api/items/:id` が `state: "done"` を書き、かつ直前の状態が `acceptance` だったときに起動する。カードのモーダルの「受け入れて完了」がこの遷移を作る操作で、完成確認待ち 列から 完了 列へのドラッグも同じ PATCH になる。それ以外の列から 完了 列へドラッグした場合と、既に `done` のカードへの PATCH（2 回目のクリック、別のタブ）は board を書くだけで配送しない。
 - **PATCH は配送を待たない**: 配送は `git fetch` / `git push` と複数の `gh` 呼び出しを行い数秒かかる。サーバーは board を書いた時点で応答し、配送の結果はイベントストリームで報告する。git と `gh` の 1 コマンドあたりのタイムアウトは 120 秒。
-- **同一カードで多重起動しない**: そのカードの配送が走っている間に来た起動要求は、新しい実行を始めない。走っている実行が結果を報告する。リポジトリ単位の直列化は `deliverCard` 側にある。
+- **同一カードで多重起動しない**: そのカードの配送が走っている間に来た起動要求は、新しい実行を始めない。走っている実行が結果を報告する。ただし `running` フレームはこの場合も送る（下の表を参照）。リポジトリ単位の直列化は `deliverCard` 側にある。
 - **失敗してもカードは戻らない**: 配送が失敗してもカードは `done` のままで、失敗は `items[].delivery.error` に記録される。ブラウザを閉じた後やイベントストリームが切れた後でも、PR が作られなかった理由がカードに残る。`branch` / `base` / `pr` は今回分かった値と前回の記録で埋めるので、失敗が過去に記録した pull request を消すことはない。
 - **配送先が無いリポジトリは失敗ではない**: git リポジトリでない、またはリモートが無い場合は `skipped` (`no-repository` / `no-remote`) として報告する。それ以外の `git remote` の失敗は `failed`。
 
@@ -408,7 +424,7 @@ exit code: 配送した (`created` / `updated`) と配送するものが無か�
 
 | `status` | 意味 | 一緒に来るもの |
 | --- | --- | --- |
-| `running` | 実行を開始した | なし（このフレームだけが `DeliverOutcome` ではない） |
+| `running` | そのカードの配送を要求された。既に走っている配送があってこの要求が新しい実行を始めなかった場合にも送る（配送中であることを、要求した画面にも伝えるため） | なし（このフレームだけが `DeliverOutcome` ではない） |
 | `created` / `updated` | 成果 pull request がある | `pr` |
 | `skipped` | 配送するものが無い | `reason`: `no-diff` / `same-branch` / `no-remote` / `no-repository` |
 | `blocked` | 未マージの change が残っている | `unmerged`: `"<change-id>  <title>"` の配列 |
@@ -416,7 +432,7 @@ exit code: 配送した (`created` / `updated`) と配送するものが無か�
 
 `warnings`（実行を止めなかった問題）は `running` 以外のフレームに必ず配列で付く。`head` と `base` は、失敗したがブランチまでは解決できた実行に付く。
 
-`skipped` と `blocked` は `items[].delivery` を書かない（`blocked` は配送の手順 1 の同期で `changes[].pr` を書くことはある）。したがってこの 2 つの結果はこのフレームにしか残らない。コンソールの画面はフレームをカード単位で保持し、カードのモーダルの「成果の配送」に出す。
+`skipped` と `blocked` は `items[].delivery` を書かない。したがってこの 2 つの結果はこのフレームにしか残らない。ただし `changes[].pr` と `changes[].state` は、`created` / `updated` / `skipped` / `blocked` / `failed` のどの結果でも書かれうる。配送の手順 1 の同期が、結果を決める前に必ず走るためである。コンソールの画面はフレームをカード単位で保持し、カードのモーダルの「成果の配送」に出す。
 
 ### 手動で配送し直す
 
@@ -430,7 +446,11 @@ body は不要。応答は `{"ok":true,"card":"<id>","started":true}` で、`sta
 - カードの状態は問わない。`change deliver` と同じ扱いで、未マージの change が残っていれば `deliverCard` が `blocked` で拒否する。
 - 結果は上と同じ `delivery` フレームで届き、失敗は `delivery.error` に残る。
 - 404: 不明なカード、または board が見つからない。409: そのサーバーで配送が無効化されている。
-- 画面では、カードのモーダルの「成果の配送」に `配送をやり直す` として出る（配送が `failed` または `blocked` のときだけ）。
+- 画面では、カードのモーダルの「成果の配送」に `配送をやり直す` として出る。出るのは次の2つの場合で、それ以外では出ない。
+  - この画面が見ていた最後のフレームが `failed` または `blocked` だった
+  - この画面が配送のフレームを1つも見ておらず、カードの `items[].delivery.error` に失敗が記録されている（前のセッションで失敗した配送。ブラウザを開き直しても復帰経路が残る）
+
+  この画面が見た最後のフレームが結果（`running` 以外）であれば、それが board の記録より優先する。やり直しが成功すれば、失敗の記録が出していたボタンは消える。
 
 ### 配送を止める
 
@@ -439,6 +459,6 @@ body は不要。応答は `{"ok":true,"card":"<id>","started":true}` で、`sta
 OVERLORD_DELIVER=0 /path/to/overlord/scripts/console.sh <project-directory>
 ```
 
-`OVERLORD_DELIVER` は `0` / `false` / `off` / `no`（大文字小文字を問わない）で無効になる。起動時の 4 行目に `deliver on done   off` と出る。`console.sh ensure` は `--no-deliver` をサーバーへ渡さないので、そちらでは `OVERLORD_DELIVER` を使う（環境変数はサーバープロセスへ引き継がれる）。
+`OVERLORD_DELIVER` は `0` / `false` / `off` / `no`（大文字小文字を問わない）で無効になる。起動時の 4 行目に `deliver on done   off` と出る。`console.sh ensure` は `--no-deliver` を受け付けない。渡すと `unknown option: --no-deliver (see: console.sh ensure --help)` を出して exit 1 で終了し、サーバーは起動しない。`ensure` 経由で無効にするには `OVERLORD_DELIVER` を使う（環境変数はサーバープロセスへ引き継がれる）。
 
 無効なサーバーでは、`acceptance` -> `done` で配送は起動せず、`POST /api/items/:id/deliver` は 409 と理由を返す。画面はこの応答をエラーとして表示する。

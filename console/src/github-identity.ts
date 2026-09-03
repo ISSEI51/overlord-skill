@@ -50,6 +50,15 @@ export const CREDENTIAL_USERNAME_ENV = "OVERLORD_GIT_CREDENTIAL_USERNAME";
 export const CREDENTIAL_TOKEN_ENV = "OVERLORD_GIT_CREDENTIAL_TOKEN";
 
 /**
+ * The only host the helper answers for.
+ *
+ * It is here rather than baked into the helper text so that the helper stays
+ * one constant, and so that `GH_HOST` decides it the same way it decides every
+ * other host question in this module.
+ */
+export const CREDENTIAL_HOST_ENV = "OVERLORD_GIT_CREDENTIAL_HOST";
+
+/**
  * Username sent with the token over HTTPS.
  *
  * GitHub authenticates the token and ignores the username, so this is only a
@@ -58,20 +67,53 @@ export const CREDENTIAL_TOKEN_ENV = "OVERLORD_GIT_CREDENTIAL_TOKEN";
 const CREDENTIAL_USERNAME = "x-access-token";
 
 /**
- * A git credential helper that answers from the environment.
+ * A git credential helper that answers from the environment, for one host.
  *
  * Git runs a helper whose value starts with `!` through `sh -c`, appending the
  * operation, so `$1` is `get`, `store` or `erase`. Only `get` is answered:
  * `store` must stay a no-op, or the agent's token would be written into the
  * user's macOS keychain, where every later push — including the user's own —
- * would pick it up. The `if` also keeps the exit status 0 for the operations
- * that produce no output, which a bare `test ... &&` would not.
+ * would pick it up. Every path returns 0, because a non-zero helper makes git
+ * report an error for an operation that was fine.
+ *
+ * A `get` is answered only when the request git wrote on stdin names
+ * `$OVERLORD_GIT_CREDENTIAL_HOST` over https. `pushIdentity` already checks
+ * the push remote before installing this helper, so that check is what
+ * normally keeps the token on its own host; this one closes the paths that
+ * check cannot see, where a single `git push` asks for a credential for
+ * somewhere else — an authenticated `http.proxy`, or a redirect to another
+ * host — and the helper, having no opinion about the host, handed over the
+ * agent account's token. Failing to answer is the safe direction: git reports
+ * that it has no credential for that host, which is true.
+ *
+ * The request is `key=value` lines terminated by a blank line, so `IFS='='`
+ * splits each one and the value keeps any further `=`. A `host` may carry a
+ * port (`ghe.example.com:8443`), which is stripped from the last colon so an
+ * `[::1]` keeps its own: a port does not change whose host it is.
+ *
+ * `host` and `protocol` are compared without regard to case, because git
+ * passes both through from the remote URL exactly as it is written there:
+ * `https://GitHub.com/o/r.git` produces `host=GitHub.com`, and
+ * `HTTPS://…` produces `protocol=HTTPS`. Every other host comparison in this
+ * module folds case (`httpsHostOf`, `githubHost`), so a remote written that
+ * way passes `pushIdentity` and reaches this helper; a case-sensitive
+ * comparison here would refuse it and break the push.
  */
 const CREDENTIAL_HELPER =
-  `!f() { if [ "$1" = get ]; then ` +
+  `!f() { ` +
+  `[ "$1" = get ] || return 0; ` +
+  `[ -n "$${CREDENTIAL_HOST_ENV}" ] || return 0; ` +
+  `h=; p=; ` +
+  `while IFS='=' read -r k v; do ` +
+  `[ -n "$k" ] || break; ` +
+  `case "$k" in host) h=$v ;; protocol) p=$v ;; esac; ` +
+  `done; ` +
+  `lc() { printf '%s' "$1" | LC_ALL=C tr 'A-Z' 'a-z'; }; ` +
+  `[ "$(lc "$p")" = https ] || return 0; ` +
+  `[ "$(lc "\${h%:*}")" = "$${CREDENTIAL_HOST_ENV}" ] || return 0; ` +
   `printf 'username=%s\\npassword=%s\\n' ` +
   `"$${CREDENTIAL_USERNAME_ENV}" "$${CREDENTIAL_TOKEN_ENV}"; ` +
-  `fi; }; f`;
+  `}; f`;
 
 /** The agent account, once it has been resolved to a usable token. */
 export type AgentIdentity = {
@@ -139,9 +181,12 @@ export async function agentIdentity(): Promise<IdentityResolution> {
       // `gh auth token` reports the token in the environment when there is
       // one, which here would be a token left over from an outer Overlord run
       // and not the account that was asked for. Emptied so the keyring is the
-      // only source. `gh` treats an empty value as unset.
+      // only source. `gh` treats an empty value as unset. All four, because
+      // which pair `gh` reads depends on the host it is targeting.
       GH_TOKEN: "",
       GITHUB_TOKEN: "",
+      GH_ENTERPRISE_TOKEN: "",
+      GITHUB_ENTERPRISE_TOKEN: "",
     });
     if (read.code !== 0 || read.stdout.trim() === "") {
       return {
@@ -166,18 +211,53 @@ export async function agentIdentity(): Promise<IdentityResolution> {
 }
 
 /**
+ * Whether `gh` reads the Enterprise Server token variables for `host`.
+ *
+ * `gh help environment` (gh 2.89.0) defines the split: `GH_TOKEN` and
+ * `GITHUB_TOKEN` are used "when a command targets either github.com or a
+ * subdomain of ghe.com", and `GH_ENTERPRISE_TOKEN` and
+ * `GITHUB_ENTERPRISE_TOKEN` "when a command targets a GitHub Enterprise Server
+ * host". Everything that is not github.com and not a `ghe.com` subdomain is
+ * therefore an Enterprise Server host as far as `gh` is concerned.
+ *
+ * Measured on gh 2.89.0: with `GH_HOST=ghe.example.com` and `GH_TOKEN` set,
+ * `gh auth status` reports that host as authenticated by `(default)` — the
+ * stored credential — and names `(GH_TOKEN)` only for github.com.
+ */
+function isEnterpriseServerHost(host: string): boolean {
+  return host !== "github.com" && !host.endsWith(".ghe.com");
+}
+
+/**
  * Environment that makes one `gh` call run as the agent account.
  *
  * `GH_TOKEN` takes precedence over every other source `gh` consults, including
- * the active keyring account, so this needs no other setting. `GITHUB_TOKEN` is
- * emptied because `gh` also honours it and an inherited one would otherwise
- * decide which account is used when `GH_TOKEN` were ever dropped.
+ * the active keyring account. On a GitHub Enterprise Server host `gh` does not
+ * read it at all, so the token also goes into `GH_ENTERPRISE_TOKEN` there;
+ * without that, `gh` falls back to the stored credential, which is the user's,
+ * and `gh pr create` opens the pull request under their name — the one
+ * substitution this module exists to prevent, happening silently.
+ *
+ * `GITHUB_TOKEN` and `GITHUB_ENTERPRISE_TOKEN` are emptied because `gh` also
+ * honours them and an inherited one would otherwise decide which account is
+ * used if the variable ahead of it were ever dropped. `gh` treats an empty
+ * value as unset.
+ *
+ * `GH_ENTERPRISE_TOKEN` is emptied rather than set when the account belongs to
+ * github.com: a token for one host is not offered to another, which is the
+ * same rule the git credential helper follows.
  */
 export function ghEnvFor(
   resolution: IdentityResolution,
 ): Record<string, string> | undefined {
   if (resolution.status !== "resolved") return undefined;
-  return { GH_TOKEN: resolution.identity.token, GITHUB_TOKEN: "" };
+  const { token } = resolution.identity;
+  return {
+    GH_TOKEN: token,
+    GITHUB_TOKEN: "",
+    GH_ENTERPRISE_TOKEN: isEnterpriseServerHost(githubHost()) ? token : "",
+    GITHUB_ENTERPRISE_TOKEN: "",
+  };
 }
 
 /**
@@ -199,17 +279,26 @@ export function pushCredentialArgs(): string[] {
   ];
 }
 
-/** Environment carrying the credential the helper above prints. */
+/**
+ * Environment carrying the credential the helper above prints, and the one
+ * host it prints it for.
+ *
+ * The host is `githubHost()`, which is the host the agent account's token
+ * belongs to and, by the time `pushIdentity` installs the helper, the host of
+ * the push remote as well.
+ */
 export function pushCredentialEnv(
   identity: AgentIdentity,
 ): Record<string, string> {
   return {
     [CREDENTIAL_USERNAME_ENV]: CREDENTIAL_USERNAME,
     [CREDENTIAL_TOKEN_ENV]: identity.token,
-    // The helper always answers, so a prompt here would mean the token was
-    // rejected. Without this, git would ask on the terminal and the command
-    // would hang or fail with a confusing error instead of reporting the
-    // rejection.
+    [CREDENTIAL_HOST_ENV]: githubHost(),
+    // The helper answers for the host the push goes to, so a prompt here means
+    // either that the token was rejected or that something asked for a
+    // credential for another host. Without this, git would ask on the terminal
+    // and the command would hang or fail with a confusing error instead of
+    // reporting it.
     GIT_TERMINAL_PROMPT: "0",
   };
 }
@@ -256,12 +345,57 @@ export function httpsHostOf(url: string): string | null {
 }
 
 /**
+ * Why a push to `url` must not be made at all, or null when it may be.
+ *
+ * An HTTPS remote on a host the agent account does not own is the one case
+ * that is refused rather than reported. The token is not sent there — a token
+ * for one host must never be handed to another — but git does not stop at
+ * that: it asks the next credential helper, which on a developer's machine is
+ * the macOS keychain or the one `gh auth setup-git` installed, and both answer
+ * with the user's own account. The push would then succeed under the user's
+ * name, which is the substitution the separate account exists to prevent, and
+ * it would succeed quietly: a warning on stderr is not a thing anyone reads
+ * after the pull request is already open under the wrong name.
+ *
+ * A non-HTTPS remote (ssh, or a local path) is not refused; see
+ * `pushAttributionWarning`. The two are different because of who ends up
+ * owning the push: over ssh there is no credential to substitute — the key of
+ * the machine is the only thing that can authenticate, on a repository that is
+ * otherwise configured correctly and working — while over HTTPS to a foreign
+ * host there is a credential, and it is the user's.
+ *
+ * This costs nothing when nothing is configured: with no agent account,
+ * `pushIdentity` never asks.
+ */
+export function pushAttributionRefusal(
+  identity: AgentIdentity,
+  url: string,
+): string | null {
+  const host = httpsHostOf(url);
+  const expected = githubHost();
+  if (host === null || host === expected) return null;
+  const who = identity.account ?? `the token in $${AGENT_TOKEN_ENV}`;
+  return (
+    `the push remote is "${url}", on "${host}" rather than "${expected}", ` +
+    `where ${who} is. The agent account's token is not sent to another host, ` +
+    `so this push would be authenticated by whatever credential this machine ` +
+    `has for "${host}" — the user's — and the branch and its pull request ` +
+    `would be attributed to them. Nothing was pushed. Point origin at ` +
+    `https://${expected}/<owner>/<repo>.git, or set GH_HOST to the host the ` +
+    `agent account belongs to.`
+  );
+}
+
+/**
  * Why a push to `url` cannot be attributed to the agent account, or null when
  * it can.
  *
  * Reported rather than enforced: a repository on an SSH remote still works,
  * and refusing to push at all would be a worse answer than pushing under the
- * key that is configured and saying so.
+ * key that is configured and saying so. An HTTPS remote on another host is
+ * refused instead of reported, by `pushAttributionRefusal`; this function
+ * still describes it, for `identity`, which reports every reason it finds
+ * rather than performing a push.
  */
 export function pushAttributionWarning(
   identity: AgentIdentity,

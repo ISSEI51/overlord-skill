@@ -27,7 +27,7 @@ You need:
 
 - [Claude Code](https://claude.com/claude-code) (or Codex)
 - [Bun](https://bun.sh) — required to run Overlord Console
-- `git` and the [GitHub CLI](https://cli.github.com/) (`gh`) — `scripts/change.sh` invokes `git` and `gh` directly, in all five subcommands (`start`, `pr`, `reviewed`, `sync`, `deliver`): `start` runs `git worktree add` and `git rev-parse`; `pr` runs `git push` plus `gh pr list` / `gh pr create` / `gh pr view`; `reviewed` runs `git worktree list` and `git rev-parse HEAD` inside the worktree, falling back to `gh pr view --json headRefOid` when the worktree is gone; `sync` runs `gh pr view`; `deliver` runs `git fetch` / `git diff` plus `gh repo view` / `gh pr view` / `gh pr create` / `gh pr edit`. So `gh` has to be authenticated with `gh auth login`. The commander runs `change.sh` for you — there is no point where you type it yourself
+- `git` and the [GitHub CLI](https://cli.github.com/) (`gh`) — `scripts/change.sh` invokes `git` and `gh` directly, in all seven subcommands (`start`, `pr`, `reviewed`, `sync`, `merge`, `deliver`, `identity`): `start` runs `git worktree add` and `git rev-parse`; `pr` runs `git push` plus `gh pr list` / `gh pr create` / `gh pr view`; `reviewed` runs `git worktree list` and `git rev-parse HEAD` inside the worktree, falling back to `gh pr view --json headRefOid` when the worktree is gone; `sync` runs `gh pr view`; `merge` runs `git rev-parse` / `git symbolic-ref` plus `gh pr view` / `gh repo view` / `gh pr merge`; `deliver` runs `git fetch` / `git diff` plus `gh repo view` / `gh pr view` / `gh pr create` / `gh pr edit`; `identity` runs `git rev-parse` / `git remote get-url` plus `gh api user` / `gh repo view`. So `gh` has to be authenticated with `gh auth login`. The commander runs `change.sh` for you — there is no point where you type it yourself
 - [cmux](https://cmux.com/) — a macOS terminal that holds several AI sessions as workspaces on one screen. Overlord reads the commander session's screen and sends its input through cmux, which is why it is required for the commander sidebar and the card instruction buttons
 
 Platform: the console and the skills contain no macOS-specific code, so they run anywhere Bun runs (macOS and Linux). cmux is a macOS app; when `cmux` is not on `PATH` the console falls back to `/Applications/cmux.app/Contents/Resources/bin/cmux`. Without cmux you can still browse and edit the kanban, add observations, and run every `scripts/change.sh` command. What you lose is the commander sidebar, the card instruction buttons, `console.sh --open`, and the automatic commander registration `console.sh ensure` performs (everything else `ensure` does works without cmux: the server is started as a detached process with its output in `<project>/.overlord/console.log`).
@@ -127,7 +127,7 @@ A local dashboard built with React + shadcn/ui. Changes to `board.yaml` appear o
 - The border is decided in that order: a card with a worker session recorded takes the yellow border, a card without one that needs you takes the cyan border, and `owner: "claude"` gives the yellow border only to what is left. `owner` alone never cancels the cyan border
 - The 進める (advance) button is disabled **on a card with a worker session recorded**, and the modal names the change that session is working. A card that is only `owner: "claude"` keeps the button
 - The "decisions today" bar shows at most three things only you can decide
-- A completed card carries the number of its delivery pull request (the one targeting `main`) as a tag; a delivery in flight and a failed one show in the same place
+- A completed card carries the number of its delivery pull request (the one targeting `main`) as a tag; the same place reads `配送中` while a delivery is in flight, `未マージあり` when unmerged changes blocked it, and `配送失敗` when it failed
 - Done cards can be deleted from the right-click menu
 
 ### Card modal
@@ -139,7 +139,7 @@ Clicking a card opens a centered modal.
 - **Instruction buttons** under 司令塔への指示 — 状況を聞く (ask status) / 進める (advance) / 実装ブリーフ (implementation brief) / 独立レビュー (independent review) / 完了の可否 (ready to close?) — send to the commander with a single press; skill command strings never appear on screen
 - **このカードへの詳細指示** (detailed instruction): free-form text is sent to the commander prefixed with the card ID
 - **受け入れて完了** (accept & complete): shown on cards awaiting acceptance; one click marks them done, and the card's work is proposed to `main` as a pull request
-- **成果の配送** (delivery): the delivery pull request's number, state, and link stay on the card. When there was nothing to deliver, when unmerged changes remain, or when the delivery failed, the reason is shown; the last two offer 配送をやり直す (deliver again)
+- **成果の配送** (delivery): the delivery pull request's number, state, and link stay on the card. When there was nothing to deliver, when unmerged changes remain, or when the delivery failed, the reason is shown; the last two offer 配送をやり直す (deliver again). The same button is there after a browser restart whenever the card still records a failed delivery
 - State, next action, owner, and blocker are editable in place (Escape cancels)
 
 ### Commander sidebar

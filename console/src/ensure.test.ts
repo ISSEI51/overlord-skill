@@ -359,6 +359,20 @@ describe("parseArgs", () => {
     expect(() => parseArgs(["-p", "7420"])).toThrow("unknown option: -p");
   });
 
+  test("--no-deliver is a server option, and ensure refuses it rather than dropping it", () => {
+    // `ensure` does not forward it, so the way to turn delivery off through
+    // `ensure` is OVERLORD_DELIVER. What it does with the flag matters,
+    // though: the reference used to say it was not passed to the server,
+    // which reads as "it is accepted and ignored". It is refused, and no
+    // server is started.
+    expect(() => parseArgs(["--no-deliver"])).toThrow(
+      "unknown option: --no-deliver (see: console.sh ensure --help)",
+    );
+    expect(() => parseArgs(["/project", "--no-deliver"])).toThrow(
+      "unknown option: --no-deliver",
+    );
+  });
+
   test("still parses a help line rather than throwing on it", () => {
     expect(parseArgs(["--help"]).port).toBe(7377);
     expect(parseArgs(["-h"]).port).toBe(7377);

@@ -108,10 +108,12 @@ export type Change = {
  *
  * `pr` is the delivery pull request, in the same shape as a change's; its
  * `reviewed_sha` stays null, because the review happened on the changes.
- * `error` is reserved for a recorded failure and is null today: the delivery
- * command writes this record only after `gh pr view` confirmed the pull
- * request, so a failed attempt leaves board.yaml untouched instead of
- * recording itself.
+ * `error` is null when the last attempt recorded a pull request, and carries
+ * the diagnostic when it failed. The two writers differ: `change deliver`
+ * writes this record only after `gh pr view` confirmed the pull request, so a
+ * failure from the command line leaves board.yaml untouched, while the console
+ * server records one (`recordDeliveryFailure`) — the event stream alone left a
+ * card in `done` with no pull request and nothing anywhere saying why.
  */
 export type Delivery = {
   /** Head branch the delivery pull request was opened from. */

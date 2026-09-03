@@ -40,6 +40,7 @@ import {
   agentIdentity,
   describeAccount,
   ghEnvFor,
+  pushAttributionRefusal,
   pushAttributionWarning,
   pushCredentialArgs,
   pushCredentialEnv,
@@ -618,10 +619,16 @@ async function pushIdentity(
       ],
     };
   }
+  // An HTTPS remote on another host is refused rather than pushed: the token
+  // is not sent there, so git would fall back to the credential the machine
+  // has for that host, and the push would land under the user's name.
+  const refusal = pushAttributionRefusal(resolution.identity, url);
+  if (refusal) return { ok: false, error: refusal };
   const warning = pushAttributionWarning(resolution.identity, url);
   if (warning) {
-    // No credential is injected: a token for github.com must not be sent to a
-    // host it does not belong to, and an SSH remote never asks for one.
+    // No credential is injected, and the push goes ahead: an SSH remote asks
+    // for none, and there is no credential of the user's for it to fall back
+    // to either — the key of the machine is what authenticates it.
     return { ok: true, args: [], warnings: [warning] };
   }
   return {
@@ -1434,12 +1441,59 @@ export type DeliverOutcome = {
 };
 
 /**
+ * The default branch as the local checkout records it, or null.
+ *
+ * `refs/remotes/origin/HEAD` is a local symbolic ref that only exists once
+ * something set it (`git clone` does, `git init` does not), and nothing
+ * verifies it afterwards: it can name a branch that does not exist, and any
+ * process that can write to the checkout can point it anywhere.
+ */
+async function localDefaultBranch(
+  root: string,
+  timeoutMs?: number,
+): Promise<string | null> {
+  const symbolic = await git(
+    ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+    root,
+    timeoutMs,
+  );
+  if (symbolic.code !== 0) return null;
+  // `origin/main` -> `main`: the remote name is a prefix of the short form.
+  const value = symbolic.stdout.trim();
+  const slash = value.indexOf("/");
+  const branch = slash >= 0 ? value.slice(slash + 1) : value;
+  return branch || null;
+}
+
+/** The default branch as GitHub reports it for this repository, or null. */
+async function githubDefaultBranch(
+  root: string,
+  timeoutMs?: number,
+): Promise<string | null> {
+  const viewed = await gh(
+    ["repo", "view", "--json", "defaultBranchRef"],
+    root,
+    timeoutMs,
+  );
+  if (viewed.code !== 0) return null;
+  const parsed = parseJson<{ defaultBranchRef?: { name?: unknown } }>(
+    viewed.stdout,
+  );
+  const name = parsed?.defaultBranchRef?.name;
+  return typeof name === "string" && name.trim() ? name.trim() : null;
+}
+
+/**
  * The repository default branch, or null when neither source could name it.
  *
  * `origin/HEAD` is what the repository itself says the default branch is, so
- * it is asked first and costs no network call. It is a local symbolic ref that
- * only exists once something set it (`git clone` does, `git init` does not), so
- * GitHub is asked next.
+ * it is asked first and costs no network call; GitHub is asked when the local
+ * ref is not set.
+ *
+ * This is the order for choosing the base of a delivery, where a wrong answer
+ * costs a pull request against the wrong branch and is caught by the
+ * `baseRefName` check before anything is written. The merge guard asks the
+ * other way round; see `authoritativeDefaultBranch`.
  *
  * Null is a real answer and not an error, because the two callers need
  * different things from it: a delivery falls back to `main` and is caught by
@@ -1451,33 +1505,39 @@ export async function resolveDefaultBranch(
   root: string,
   timeoutMs?: number,
 ): Promise<string | null> {
-  const symbolic = await git(
-    ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
-    root,
-    timeoutMs,
+  return (
+    (await localDefaultBranch(root, timeoutMs)) ??
+    (await githubDefaultBranch(root, timeoutMs))
   );
-  if (symbolic.code === 0) {
-    // `origin/main` -> `main`: the remote name is a prefix of the short form.
-    const value = symbolic.stdout.trim();
-    const slash = value.indexOf("/");
-    const branch = slash >= 0 ? value.slice(slash + 1) : value;
-    if (branch) return branch;
-  }
+}
 
-  const viewed = await gh(
-    ["repo", "view", "--json", "defaultBranchRef"],
-    root,
-    timeoutMs,
+/**
+ * The repository default branch for a decision that must not be wrong: GitHub
+ * first, the local ref only when GitHub could not answer.
+ *
+ * `merge` refuses a pull request whose base is the default branch, because
+ * merging into it releases the work and that is the user's decision. The two
+ * sources of the name are not equally trustworthy for that decision:
+ * `refs/remotes/origin/HEAD` is local, unverified and writable by anything
+ * with the checkout, so a wrong one would name a branch that is not the
+ * default and the guard would let a release through. GitHub is where the pull
+ * request itself comes from, and `baseRefName` is already read from there, so
+ * both halves of the comparison come from the same place.
+ *
+ * The local ref stays as the fallback rather than the command refusing every
+ * merge when `gh` cannot reach GitHub. What is left in that case is the
+ * pre-existing behaviour, and `main` and `master` are refused by name
+ * regardless of either source, so a stale local ref can only matter in a
+ * repository whose default branch is neither.
+ */
+async function authoritativeDefaultBranch(
+  root: string,
+  timeoutMs?: number,
+): Promise<string | null> {
+  return (
+    (await githubDefaultBranch(root, timeoutMs)) ??
+    (await localDefaultBranch(root, timeoutMs))
   );
-  if (viewed.code === 0) {
-    const parsed = parseJson<{ defaultBranchRef?: { name?: unknown } }>(
-      viewed.stdout,
-    );
-    const name = parsed?.defaultBranchRef?.name;
-    if (typeof name === "string" && name.trim()) return name.trim();
-  }
-
-  return null;
 }
 
 /**
@@ -2119,6 +2179,10 @@ export async function deliver(argv: string[]): Promise<number> {
   for (const warning of outcome.warnings) process.stderr.write(`${warning}\n`);
 
   process.stdout.write(`card:             ${cardId}\n`);
+  // The delivery pull request is opened by whichever account `gh` ran as, and
+  // that is only visible on GitHub afterwards, so the run names it — the same
+  // line `pr` and `identity` print.
+  process.stdout.write(`agent account:    ${await agentAccountLine()}\n`);
   process.stdout.write(`delivery:         ${outcome.status}\n`);
   if (outcome.status === "skipped" && outcome.reason) {
     process.stdout.write(`reason:           ${outcome.reason}\n`);
@@ -2511,7 +2575,9 @@ export type MergeOutcome = {
  *  3. the merge is a merge commit (`--merge`). Squash and rebase are not used
  *     and cannot be selected: a squash does not advance the merge base, which
  *     made later pull requests conflict on the same lines (README, "なぜ merge
- *     commit なのか");
+ *     commit なのか"). It also carries `--match-head-commit`, so GitHub merges
+ *     only while the head is the commit the gates were decided on and a commit
+ *     pushed after step 1 cannot be merged unreviewed;
  *  4. the board is written from a second `gh pr view`, through
  *     `applyPullRequestView` - the function `sync` writes with - so a merge
  *     records exactly what a later `sync` would have recorded, and `done` has
@@ -2579,8 +2645,14 @@ export async function mergeChange(
     };
   }
 
-  const defaultBranch = await resolveDefaultBranch(root, timeoutMs);
+  // GitHub is the authority here, not the local `origin/HEAD`; see
+  // `authoritativeDefaultBranch`.
+  const defaultBranch = await authoritativeDefaultBranch(root, timeoutMs);
   const checks = checkRollup(view.statusCheckRollup);
+  // The head every gate below is decided on, and the head the merge is made
+  // conditional on. `mergeRefusal` refuses an empty one, so by the time it is
+  // used it names a commit.
+  const headSha = typeof view.headRefOid === "string" ? view.headRefOid.trim() : "";
   const checked: MergeCheckedPullRequest = {
     number: view.number,
     state: normalizePrState(view.state),
@@ -2608,8 +2680,14 @@ export async function mergeChange(
     };
   }
 
+  // `--match-head-commit` is the same commit every gate above was decided on:
+  // GitHub performs the merge only while the pull request head is still that
+  // commit. Without it there is a window between the `gh pr view` the gates
+  // read and this call in which a commit can be pushed to the branch, and that
+  // commit would be merged although no review has read it — the one outcome
+  // the review gate exists to prevent.
   const merged = await gh(
-    ["pr", "merge", String(view.number), "--merge"],
+    ["pr", "merge", String(view.number), "--merge", "--match-head-commit", headSha],
     root,
     timeoutMs,
   );
@@ -2617,7 +2695,10 @@ export async function mergeChange(
     return {
       status: "failed",
       reason:
-        `gh pr merge ${view.number} --merge failed: ${failureMessage(merged)}`,
+        `gh pr merge ${view.number} --merge failed: ${failureMessage(merged)}` +
+        `\nThe merge was asked for only while the head was ${headSha}, the ` +
+        `commit the checks above were made on, so a commit pushed since then ` +
+        `is one reason gh can refuse it.`,
       checked,
       warnings,
     };
@@ -2687,19 +2768,36 @@ export async function mergeChange(
   };
 }
 
+/** The one usage line `change merge` prints for every argument error. */
+const MERGE_USAGE = "usage: change merge <change-id> [--board <path>]\n";
+
 /**
  * CLI wrapper around `mergeChange`: it only formats the outcome.
  *
  * `--board` is the only option it takes. Every other option is a usage error
  * rather than an ignored argument, so that a `--force`, a `--base` or an
  * `--admin` copied from `gh` fails loudly instead of looking as though it
- * relaxed a gate that it did not.
+ * relaxed a gate that it did not. A second positional argument is a usage
+ * error for the same reason: `change merge OV-1-C1 OV-1-C2` would otherwise
+ * merge the first of the two and say nothing about the second.
+ *
+ * Every argument error exits 2, including an option left without a value.
+ * `parseArgs` throws for that one, and an uncaught throw leaves `main` to exit
+ * 1, which is the code a refused merge uses — so `change merge OV-1-C1
+ * --admin` would have been indistinguishable from a gate saying no.
  */
 export async function merge(argv: string[]): Promise<number> {
-  const { positional, options } = parseArgs(argv);
+  let parsed: ParsedArgs;
+  try {
+    parsed = parseArgs(argv);
+  } catch (error) {
+    process.stderr.write(`${(error as Error).message}\n${MERGE_USAGE}`);
+    return 2;
+  }
+  const { positional, options } = parsed;
   const changeId = positional[0];
   if (!changeId) {
-    process.stderr.write("usage: change merge <change-id> [--board <path>]\n");
+    process.stderr.write(MERGE_USAGE);
     return 2;
   }
 
@@ -2709,6 +2807,16 @@ export async function merge(argv: string[]): Promise<number> {
       `change merge takes no option other than --board: ` +
         `${unknown.map((name) => `--${name}`).join(", ")}\n` +
         "The base, review and CI checks cannot be turned off.\n",
+    );
+    return 2;
+  }
+
+  if (positional.length > 1) {
+    process.stderr.write(
+      `change merge takes one change id, and was given ${positional.length}: ` +
+        `${positional.join(", ")}\n` +
+        "Nothing was merged. Run it once per change.\n" +
+        MERGE_USAGE,
     );
     return 2;
   }
@@ -2879,9 +2987,14 @@ export async function identity(argv: string[]): Promise<number> {
     );
     return 1;
   }
-  const warning = pushAttributionWarning(account, url);
+  // The refusal first, when there is one: it says what would happen to a push
+  // from here, which is more than "not the agent account".
+  const refusal = pushAttributionRefusal(account, url);
+  const warning = refusal ?? pushAttributionWarning(account, url);
   if (warning) {
-    process.stdout.write(`push identity:    (not the agent account)\n`);
+    process.stdout.write(
+      `push identity:    ${refusal ? "(refused: another host)" : "(not the agent account)"}\n`,
+    );
     process.stderr.write(`${warning}\n`);
     return 1;
   }

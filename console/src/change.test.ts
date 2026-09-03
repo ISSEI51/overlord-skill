@@ -64,6 +64,24 @@ delete process.env.OVERLORD_GH_ACCOUNT;
 delete process.env.OVERLORD_GH_TOKEN;
 
 /**
+ * The same for `GH_HOST`, which names the host the agent account belongs to.
+ * A developer whose `gh` is logged in to a GitHub Enterprise host exports it,
+ * and the cases below are about github.com remotes: with an Enterprise
+ * `GH_HOST` inherited they would read those remotes as a foreign host, and the
+ * push and `identity` cases would fail on a machine where nothing is wrong.
+ */
+delete process.env.GH_HOST;
+
+// Every case below that runs git or `gh` as real subprocesses carries a
+// 60_000 ms timeout. Those cases take about a second each on an idle machine,
+// so the bound is not a budget: it exists only to stop a hung subprocess from
+// hanging the whole run. It was 20_000 ms, which was doing a second job it was
+// not suited for — five of the `deliverCard` (g) cases failed on it during a
+// run that took 451 seconds instead of the usual 92, with no change to the
+// code or to the cases, purely because the machine was loaded. A timeout that
+// fails on a loaded machine reports a defect that is not there.
+
+/**
  * Count board writes.
  *
  * `sync` must write `board.yaml` once per run, whatever number of pull
@@ -2452,7 +2470,7 @@ describe("deliverCard", () => {
     // The changes and the other card are untouched by the delivery.
     expect(findChange(after.board, "OV-500-C1")!.change).toEqual(MERGED_CHANGE);
     expect(after.board.items[1]!.delivery).toBeUndefined();
-  }, 20_000);
+  }, 60_000);
 
   test("(a) the head defaults to the current branch of the main checkout", async () => {
     const repo = await deliveryRepo();
@@ -2472,7 +2490,7 @@ describe("deliverCard", () => {
     expect((await loadBoard(boardPath)).board.items[0]!.delivery!.branch).toBe(
       "feature",
     );
-  }, 20_000);
+  }, 60_000);
 
   test("(b) an open pull request is edited, never created, and keeps its title", async () => {
     const repo = await deliveryRepo();
@@ -2514,7 +2532,7 @@ describe("deliverCard", () => {
     expect((await loadBoard(boardPath)).board.items[0]!.delivery!.pr!.number).toBe(
       99,
     );
-  }, 20_000);
+  }, 60_000);
 
   test("(c) a card with an unmerged change is blocked, and nothing is created or written", async () => {
     const repo = await deliveryRepo();
@@ -2551,7 +2569,7 @@ describe("deliverCard", () => {
         .code,
     ).not.toBe(0);
     expect(await Bun.file(boardPath).text()).toBe(before);
-  }, 20_000);
+  }, 60_000);
 
   test("(d) a change the synchronization finds merged does not block the delivery", async () => {
     const repo = await deliveryRepo();
@@ -2579,7 +2597,7 @@ describe("deliverCard", () => {
     expect(change.state).toBe("done");
     expect(change.pr!.state).toBe("merged");
     expect(after.board.items[0]!.delivery!.pr!.number).toBe(99);
-  }, 20_000);
+  }, 60_000);
 
   test("(e) a head with nothing to propose is skipped without calling gh", async () => {
     const repo = await deliveryRepo();
@@ -2599,7 +2617,7 @@ describe("deliverCard", () => {
     expect(outcome.warnings).toEqual([]);
     expect(await ghCalls(stub)).toEqual([]);
     expect(await Bun.file(boardPath).text()).toBe(before);
-  }, 20_000);
+  }, 60_000);
 
   test("(e) delivering the base branch into itself is skipped", async () => {
     const repo = await deliveryRepo();
@@ -2615,7 +2633,36 @@ describe("deliverCard", () => {
     expect(outcome.status).toBe("skipped");
     expect(outcome.reason).toBe("same-branch");
     expect(await ghCalls(stub)).toEqual([]);
-  }, 20_000);
+  }, 60_000);
+
+  test("(e) a skipped run still records what the synchronization found", async () => {
+    // The synchronization is step 1, before the outcome is decided, so
+    // `changes[]` can be written whatever the outcome turns out to be — here
+    // a run that had nothing to deliver and wrote no `delivery` at all. The
+    // documentation used to say a delivery touches neither `state` nor
+    // `changes`, and that only a blocked run could write `changes[].pr`.
+    const boardPath = await writeDeliveryBoard([OPEN_CHANGE]);
+    const repo = await deliveryRepo();
+    const stub = await deliverGhStub({
+      // GitHub says the change was merged since the board last looked.
+      "view-51.json": { ...VIEW_51_OPEN, state: "MERGED" },
+    });
+
+    const outcome = await withGhStub(stub, () =>
+      deliverCard({ boardPath, cardId: "OV-500", cwd: repo.root, head: "same" }),
+    );
+
+    expect(outcome.status).toBe("skipped");
+    expect(outcome.reason).toBe("no-diff");
+
+    const { board } = await loadBoard(boardPath);
+    const change = findChange(board, "OV-500-C2")!.change;
+    expect(change.state).toBe("done");
+    expect(change.pr!.state).toBe("merged");
+    // The card itself is untouched: no delivery record, and the state stays.
+    expect(board.items[0]!.delivery ?? null).toBeNull();
+    expect(board.items[0]!.state).toBe("acceptance");
+  }, 60_000);
 
   test("(f) a pull request on another head branch fails and the board is untouched", async () => {
     const repo = await deliveryRepo();
@@ -2637,7 +2684,7 @@ describe("deliverCard", () => {
     expect(outcome.reason).toContain('not "feature" -> "main"');
     expect(outcome.pr).toBeUndefined();
     expect(await Bun.file(boardPath).text()).toBe(before);
-  }, 20_000);
+  }, 60_000);
 
   test("(f) a pull request against another base fails and the board is untouched", async () => {
     const repo = await deliveryRepo();
@@ -2657,7 +2704,7 @@ describe("deliverCard", () => {
     expect(outcome.status).toBe("failed");
     expect(outcome.reason).toContain('"feature" -> "some-release"');
     expect(await Bun.file(boardPath).text()).toBe(before);
-  }, 20_000);
+  }, 60_000);
 
   test("(g) a base the head does not contain is warned about, and the delivery completes", async () => {
     const repo = await deliveryRepo();
@@ -2691,7 +2738,7 @@ describe("deliverCard", () => {
       (await git(["merge-base", "--is-ancestor", "origin/main", "feature"], repo.root))
         .code,
     ).toBe(1);
-  }, 20_000);
+  }, 60_000);
 
   test("(g) a base that conflicts with the head is reported as a conflict too", async () => {
     const repo = await deliveryRepo();
@@ -2722,7 +2769,7 @@ describe("deliverCard", () => {
     expect((await loadBoard(boardPath)).board.items[0]!.delivery!.pr!.number).toBe(
       99,
     );
-  }, 20_000);
+  }, 60_000);
 
   test("(g) a base the head already contains is not warned about", async () => {
     const repo = await deliveryRepo();
@@ -2747,7 +2794,7 @@ describe("deliverCard", () => {
 
     expect(outcome.status).toBe("created");
     expect(outcome.warnings).toEqual([]);
-  }, 20_000);
+  }, 60_000);
 
   test("(g) a base with a history of its own is reported as a merge that could not be attempted", async () => {
     const repo = await deliveryRepo();
@@ -2785,7 +2832,7 @@ describe("deliverCard", () => {
     expect((await loadBoard(boardPath)).board.items[0]!.delivery!.pr!.number).toBe(
       99,
     );
-  }, 20_000);
+  }, 60_000);
 
   test("(g) a merge-tree that exits like a conflict with nothing on stdout is still a failure", async () => {
     const repo = await deliveryRepo();
@@ -2819,7 +2866,7 @@ describe("deliverCard", () => {
         "merge-tree: origin/main - not something we can merge",
     ]);
     expect(outcome.status).toBe("created");
-  }, 20_000);
+  }, 60_000);
 
   test("(g) a conflict in more files than fit names the first few and counts the rest", async () => {
     const repo = await deliveryRepo();
@@ -2843,7 +2890,7 @@ describe("deliverCard", () => {
         `${paths.slice(0, 5).join(", ")}, and 2 more`,
     );
     expect(outcome.status).toBe("created");
-  }, 20_000);
+  }, 60_000);
 
   test("(g) a base ahead of a head it already holds every change of is skipped, and warned about not at all", async () => {
     const repo = await deliveryRepo();
@@ -2874,7 +2921,7 @@ describe("deliverCard", () => {
     expect(outcome.warnings).toEqual([]);
     expect(await ghCalls(stub)).toEqual([]);
     expect(await Bun.file(boardPath).text()).toBe(before);
-  }, 20_000);
+  }, 60_000);
 
   test("writes nothing to stdout or stderr, on either the delivered or the blocked path", async () => {
     const repo = await deliveryRepo();
@@ -2907,7 +2954,7 @@ describe("deliverCard", () => {
     expect(statuses).toEqual(["created", "blocked"]);
     expect(stdout).toBe("");
     expect(stderr).toBe("");
-  }, 20_000);
+  }, 60_000);
 
   test("a pull request that could not be read is a warning, and the card stays blocked", async () => {
     const repo = await deliveryRepo();
@@ -2926,7 +2973,7 @@ describe("deliverCard", () => {
     );
     expect(outcome.unmerged).toEqual(["OV-500-C2  The open change"]);
     expect(await Bun.file(boardPath).text()).toBe(before);
-  }, 20_000);
+  }, 60_000);
 
   test("a detached HEAD fails before anything is pushed or written", async () => {
     const repo = await deliveryRepo();
@@ -2945,7 +2992,7 @@ describe("deliverCard", () => {
     expect(outcome.reason).toContain("detached HEAD");
     expect(await ghCalls(stub)).toEqual([]);
     expect(await Bun.file(boardPath).text()).toBe(before);
-  }, 20_000);
+  }, 60_000);
 
   test("an unknown card id fails without touching the repository", async () => {
     const repo = await deliveryRepo();
@@ -2961,7 +3008,7 @@ describe("deliverCard", () => {
     expect(outcome.reason).toContain("unknown card id: OV-999");
     expect(await ghCalls(stub)).toEqual([]);
     expect(await Bun.file(boardPath).text()).toBe(before);
-  }, 20_000);
+  }, 60_000);
 
   test("the base falls back to the GitHub default branch when origin/HEAD is unset", async () => {
     const repo = await deliveryRepo();
@@ -2986,7 +3033,7 @@ describe("deliverCard", () => {
     const calls = await ghCalls(stub);
     expect(calls[1]).toEqual(["repo", "view", "--json", "defaultBranchRef"]);
     expect((await loadBoard(boardPath)).board.items[0]!.delivery!.base).toBe("main");
-  }, 20_000);
+  }, 60_000);
 });
 
 describe("deliver", () => {
@@ -3009,7 +3056,7 @@ describe("deliver", () => {
     const { code, stderr } = await captureStderr(() => deliver([]));
     expect(code).toBe(2);
     expect(stderr).toContain("usage: change deliver <card-id>");
-  }, 20_000);
+  }, 60_000);
 
   test("a delivered card is reported and exits 0", async () => {
     const repo = await deliveryRepo();
@@ -3030,13 +3077,17 @@ describe("deliver", () => {
     expect(stderr).toBe("");
     expect(code).toBe(0);
     expect(stdout).toContain("card:             OV-500");
+    // Which account opened the delivery pull request, on the run that opens it.
+    expect(stdout).toContain(
+      "agent account:    (none configured, using the active gh account)",
+    );
     expect(stdout).toContain("delivery:         created");
     expect(stdout).toContain("pull request:     #99 (open)");
     expect(stdout).toContain(`board updated:    ${boardPath}`);
     expect(stdout.trimEnd().split("\n").at(-1)).toBe(
       "https://github.com/o/r/pull/99",
     );
-  }, 20_000);
+  }, 60_000);
 
   test("a blocked card names the unmerged changes and exits 1", async () => {
     const repo = await deliveryRepo();
@@ -3058,7 +3109,7 @@ describe("deliver", () => {
     expect(stdout).not.toContain("board updated");
     expect(stderr).toContain("not merged:       OV-500-C2  The open change");
     expect(await Bun.file(boardPath).text()).toBe(before);
-  }, 20_000);
+  }, 60_000);
 
   test("a base the head does not contain is warned about on stderr and still exits 0", async () => {
     const repo = await deliveryRepo();
@@ -3085,7 +3136,7 @@ describe("deliver", () => {
     );
     expect(stdout).toContain("delivery:         created");
     expect(stdout).toContain("pull request:     #99 (open)");
-  }, 20_000);
+  }, 60_000);
 
   test("a skipped run reports why and still exits 0", async () => {
     const repo = await deliveryRepo();
@@ -3104,7 +3155,7 @@ describe("deliver", () => {
     expect(code).toBe(0);
     expect(stdout).toContain("delivery:         skipped");
     expect(stdout).toContain("reason:           no-diff");
-  }, 20_000);
+  }, 60_000);
 });
 
 // ---------------------------------------------------------------------------
@@ -3521,12 +3572,13 @@ describe("mergeChange", () => {
     // The card is the commander's to move; the merge does not move it.
     expect(board.items[0]!.state).toBe("implementing");
 
-    // A merge commit, and nothing else: no --squash, --rebase, --admin or
-    // --delete-branch was passed.
+    // A merge commit, made conditional on the head the gates read, and
+    // nothing else: no --squash, --rebase, --admin or --delete-branch was
+    // passed.
     expect(await mergedPullRequests(stub)).toEqual([
-      ["pr", "merge", "60", "--merge"],
+      ["pr", "merge", "60", "--merge", "--match-head-commit", MERGE_SHA],
     ]);
-  }, 20_000);
+  }, 60_000);
 
   test("a base of main is refused and nothing is merged or written", async () => {
     const repo = await deliveryRepo();
@@ -3545,7 +3597,7 @@ describe("mergeChange", () => {
     expect(outcome.reason).toContain("Nothing was merged");
     expect(await mergedPullRequests(stub)).toEqual([]);
     expect(await Bun.file(boardPath).text()).toBe(before);
-  }, 20_000);
+  }, 60_000);
 
   test("a base of master is refused", async () => {
     const repo = await deliveryRepo();
@@ -3561,7 +3613,7 @@ describe("mergeChange", () => {
     expect(outcome.status).toBe("refused");
     expect(outcome.reason).toContain('merges into "master"');
     expect(await mergedPullRequests(stub)).toEqual([]);
-  }, 20_000);
+  }, 60_000);
 
   test("a base that is the repository default branch is refused under its own name", async () => {
     const repo = await deliveryRepo();
@@ -3582,7 +3634,49 @@ describe("mergeChange", () => {
     expect(outcome.status).toBe("refused");
     expect(outcome.reason).toContain("the repository default branch");
     expect(await mergedPullRequests(stub)).toEqual([]);
-  }, 20_000);
+  }, 60_000);
+
+  test("a local origin/HEAD that disagrees with GitHub does not decide the base", async () => {
+    const repo = await deliveryRepo();
+    // `refs/remotes/origin/HEAD` still names main, as `deliveryRepo` left it,
+    // while GitHub says the default branch is develop. The ref is local,
+    // unverified, and writable by anything with the checkout, so a merge into
+    // the real default branch must not become allowed by pointing it
+    // elsewhere.
+    const boardPath = await writeMergeBoard();
+    const before = await Bun.file(boardPath).text();
+    const stub = await mergeGhStub(
+      mergeAnswers({
+        "check-60.json": mergeView({ baseRefName: "develop" }),
+        "repo-view.json": { defaultBranchRef: { name: "develop" } },
+      }),
+    );
+
+    const outcome = await withGhStub(stub, () =>
+      mergeChange({ boardPath, changeId: "OV-600-C1", cwd: repo.root }),
+    );
+
+    expect(outcome.status).toBe("refused");
+    expect(outcome.reason).toContain("the repository default branch");
+    expect(await mergedPullRequests(stub)).toEqual([]);
+    expect(await Bun.file(boardPath).text()).toBe(before);
+  }, 60_000);
+
+  test("the local origin/HEAD still answers when gh cannot", async () => {
+    const repo = await deliveryRepo();
+    // No repo-view.json, so `gh repo view` fails. `deliveryRepo` left
+    // origin/HEAD naming main, and a base of main is refused either way — the
+    // point here is that a merge into another branch still goes through, so a
+    // machine that cannot reach GitHub is not left unable to merge anything.
+    const boardPath = await writeMergeBoard();
+    const stub = await mergeGhStub(mergeAnswers());
+
+    const outcome = await withGhStub(stub, () =>
+      mergeChange({ boardPath, changeId: "OV-600-C1", cwd: repo.root }),
+    );
+
+    expect(outcome.status).toBe("merged");
+  }, 60_000);
 
   test("a default branch that cannot be determined refuses rather than merges", async () => {
     const repo = await deliveryRepo();
@@ -3598,7 +3692,7 @@ describe("mergeChange", () => {
     expect(outcome.status).toBe("refused");
     expect(outcome.reason).toContain("default branch could not be determined");
     expect(await mergedPullRequests(stub)).toEqual([]);
-  }, 20_000);
+  }, 60_000);
 
   test("the delivery pull request deliverCard opens is refused", async () => {
     const repo = await deliveryRepo();
@@ -3657,7 +3751,7 @@ describe("mergeChange", () => {
     expect(outcome.reason).toContain(`#${deliveryNumber} merges into "main"`);
     expect(await mergedPullRequests(stub)).toEqual([]);
     expect(await Bun.file(boardPath).text()).toBe(before);
-  }, 30_000);
+  }, 60_000);
 
   test("a head that is not the reviewed commit is refused", async () => {
     const repo = await deliveryRepo();
@@ -3681,7 +3775,7 @@ describe("mergeChange", () => {
     expect(outcome.reason).toContain("commits were added after the review");
     expect(await mergedPullRequests(stub)).toEqual([]);
     expect(await Bun.file(boardPath).text()).toBe(before);
-  }, 20_000);
+  }, 60_000);
 
   test("a change that was never reviewed is refused", async () => {
     const repo = await deliveryRepo();
@@ -3703,7 +3797,7 @@ describe("mergeChange", () => {
     expect(outcome.status).toBe("refused");
     expect(outcome.reason).toContain("no reviewed_sha on the board");
     expect(await mergedPullRequests(stub)).toEqual([]);
-  }, 20_000);
+  }, 60_000);
 
   test("a failing CI is refused", async () => {
     const repo = await deliveryRepo();
@@ -3725,7 +3819,7 @@ describe("mergeChange", () => {
     expect(outcome.reason).toContain("did not pass");
     expect(await mergedPullRequests(stub)).toEqual([]);
     expect(await Bun.file(boardPath).text()).toBe(before);
-  }, 20_000);
+  }, 60_000);
 
   test("a pull request with no check at all is refused", async () => {
     const repo = await deliveryRepo();
@@ -3742,7 +3836,7 @@ describe("mergeChange", () => {
     expect(outcome.reason).toContain("no check has run");
     expect(outcome.checked!.checks.total).toBe(0);
     expect(await mergedPullRequests(stub)).toEqual([]);
-  }, 20_000);
+  }, 60_000);
 
   test("a pull request that is still running its checks is refused", async () => {
     const repo = await deliveryRepo();
@@ -3765,7 +3859,7 @@ describe("mergeChange", () => {
     expect(outcome.status).toBe("refused");
     expect(outcome.reason).toContain("have not finished");
     expect(await mergedPullRequests(stub)).toEqual([]);
-  }, 20_000);
+  }, 60_000);
 
   test("a pull request on another branch is refused", async () => {
     const repo = await deliveryRepo();
@@ -3783,7 +3877,7 @@ describe("mergeChange", () => {
     expect(outcome.status).toBe("refused");
     expect(outcome.reason).toContain('is on branch "overlord/OV-600-C2"');
     expect(await mergedPullRequests(stub)).toEqual([]);
-  }, 20_000);
+  }, 60_000);
 
   test("a pull request that is already merged is refused", async () => {
     const repo = await deliveryRepo();
@@ -3799,7 +3893,7 @@ describe("mergeChange", () => {
     expect(outcome.status).toBe("refused");
     expect(outcome.reason).toContain("not open");
     expect(await mergedPullRequests(stub)).toEqual([]);
-  }, 20_000);
+  }, 60_000);
 
   test("no environment variable turns a refusal into a merge", async () => {
     const repo = await deliveryRepo();
@@ -3828,7 +3922,7 @@ describe("mergeChange", () => {
     } finally {
       for (const name of names) delete process.env[name];
     }
-  }, 20_000);
+  }, 60_000);
 
   test("a change with no pull request on the board fails before any gh call", async () => {
     const repo = await deliveryRepo();
@@ -3842,7 +3936,7 @@ describe("mergeChange", () => {
     expect(outcome.status).toBe("failed");
     expect(outcome.reason).toContain("has no pull request on the board");
     expect(await ghCalls(stub)).toEqual([]);
-  }, 20_000);
+  }, 60_000);
 
   test("an unknown change id is reported and nothing is called", async () => {
     const repo = await deliveryRepo();
@@ -3856,7 +3950,7 @@ describe("mergeChange", () => {
     expect(outcome.status).toBe("failed");
     expect(outcome.reason).toContain("unknown change id: OV-999-C9");
     expect(await ghCalls(stub)).toEqual([]);
-  }, 20_000);
+  }, 60_000);
 
   test("a merge that GitHub does not report back is reported rather than assumed", async () => {
     const repo = await deliveryRepo();
@@ -3873,9 +3967,51 @@ describe("mergeChange", () => {
     expect(outcome.reason).toContain("was merged, but GitHub still reports");
     expect(outcome.reason).toContain("change sync OV-600");
     expect(await mergedPullRequests(stub)).toEqual([
-      ["pr", "merge", "60", "--merge"],
+      ["pr", "merge", "60", "--merge", "--match-head-commit", MERGE_SHA],
     ]);
-  }, 20_000);
+  }, 60_000);
+
+  test("the merge is made conditional on the head the gates were decided on", async () => {
+    const repo = await deliveryRepo();
+    const boardPath = await writeMergeBoard();
+    const stub = await mergeGhStub(mergeAnswers());
+
+    const outcome = await withGhStub(stub, () =>
+      mergeChange({ boardPath, changeId: "OV-600-C1", cwd: repo.root }),
+    );
+
+    expect(outcome.status).toBe("merged");
+    // `gh pr view` and `gh pr merge` are two calls, and a commit can be pushed
+    // between them. The commit named in `--match-head-commit` is the one the
+    // review gate compared against `reviewed_sha`, so GitHub refuses the merge
+    // rather than merging commits no review has read.
+    const [call] = await mergedPullRequests(stub);
+    const match = call!.indexOf("--match-head-commit");
+    expect(match).toBeGreaterThan(-1);
+    expect(call![match + 1]).toBe(MERGE_SHA);
+    expect(call![match + 1]).toBe(outcome.checked!.reviewedSha!);
+  }, 60_000);
+
+  test("a head that moved between the checks and the merge is not merged", async () => {
+    const repo = await deliveryRepo();
+    const boardPath = await writeMergeBoard();
+    const before = await Bun.file(boardPath).text();
+    // What `gh pr merge --match-head-commit` does when the head moved: it
+    // refuses, the same way the stub refuses a call it has no answer for.
+    const stub = await mergeGhStub({
+      "check-60.json": mergeView(),
+      "view-60.json": mergedView(),
+    });
+
+    const outcome = await withGhStub(stub, () =>
+      mergeChange({ boardPath, changeId: "OV-600-C1", cwd: repo.root }),
+    );
+
+    expect(outcome.status).toBe("failed");
+    expect(outcome.reason).toContain(MERGE_SHA);
+    expect(outcome.reason).toContain("the checks above were made on");
+    expect(await Bun.file(boardPath).text()).toBe(before);
+  }, 60_000);
 
   test("a merge that gh refuses leaves the board untouched", async () => {
     const repo = await deliveryRepo();
@@ -3895,7 +4031,7 @@ describe("mergeChange", () => {
     expect(outcome.status).toBe("failed");
     expect(outcome.reason).toContain("gh pr merge 60 --merge failed");
     expect(await Bun.file(boardPath).text()).toBe(before);
-  }, 20_000);
+  }, 60_000);
 });
 
 describe("merge CLI", () => {
@@ -3936,6 +4072,42 @@ describe("merge CLI", () => {
       expect(code).toBe(2);
       expect(stderr).toContain("takes no option other than --board");
       expect(stderr).toContain("cannot be turned off");
+    }
+    expect(await Bun.file(boardPath).text()).toBe(before);
+  });
+
+  test("a second change id is a usage error and merges nothing", async () => {
+    const boardPath = await writeMergeBoard();
+    const before = await Bun.file(boardPath).text();
+
+    const { code, stderr } = await captureStderr(() =>
+      merge(["OV-600-C1", "OV-600-C2", "--board", boardPath]),
+    );
+
+    expect(code).toBe(2);
+    expect(stderr).toContain("takes one change id, and was given 2");
+    expect(stderr).toContain("OV-600-C1, OV-600-C2");
+    expect(stderr).toContain("Nothing was merged");
+    // A run that merged the first id and dropped the second would look like a
+    // success, so nothing is read and nothing is written.
+    expect(await Bun.file(boardPath).text()).toBe(before);
+  });
+
+  test("an option left without a value is a usage error, not a refusal", async () => {
+    const boardPath = await writeMergeBoard();
+    const before = await Bun.file(boardPath).text();
+
+    // exit 1 is what a gate saying no uses. An argument the user mistyped has
+    // to be told apart from a merge the command refused to perform.
+    for (const argv of [
+      ["OV-600-C1", "--board"],
+      ["OV-600-C1", "--admin"],
+      ["OV-600-C1", "--force", "--board", boardPath],
+    ]) {
+      const { code, stderr } = await captureStderr(() => merge(argv));
+      expect(code).toBe(2);
+      expect(stderr).toContain("needs a value");
+      expect(stderr).toContain("usage: change merge <change-id>");
     }
     expect(await Bun.file(boardPath).text()).toBe(before);
   });
@@ -3983,7 +4155,7 @@ describe("merge CLI", () => {
         "",
       ].join("\n"),
     );
-  }, 20_000);
+  }, 60_000);
 
   test("a refused merge reports what it checked on stdout and why on stderr, and exits 1", async () => {
     const repo = await deliveryRepo();
@@ -4004,7 +4176,7 @@ describe("merge CLI", () => {
     expect(stdout).not.toContain("board updated:");
     expect(stderr).toContain('merges into "main"');
     expect(stderr).toContain(`Nothing was merged and nothing was written to ${boardPath}`);
-  }, 20_000);
+  }, 60_000);
 });
 
 // ---------------------------------------------------------------------------
@@ -4015,6 +4187,7 @@ describe("merge CLI", () => {
 const ACCOUNT_ENV = [
   "OVERLORD_GH_ACCOUNT",
   "OVERLORD_GH_TOKEN",
+  "GH_HOST",
   "PATH",
   "GH_ACCOUNT_STUB_DIR",
   "GH_ACCOUNT_STUB_LOG",
@@ -4065,13 +4238,19 @@ async function ghAccountStub(
 ): Promise<{
   dir: string;
   log: string;
-  calls: () => Promise<{ argv: string; ghToken: string; githubToken: string }[]>;
+  calls: () => Promise<{
+    argv: string;
+    ghToken: string;
+    githubToken: string;
+    ghEnterpriseToken: string;
+    githubEnterpriseToken: string;
+  }[]>;
 }> {
   const dir = await scratch();
   const log = join(dir, "gh.log");
   const script = [
     "#!/bin/sh",
-    `printf 'argv=%s\\tGH_TOKEN=%s\\tGITHUB_TOKEN=%s\\n' "$*" "$GH_TOKEN" "$GITHUB_TOKEN" >> "$GH_ACCOUNT_STUB_LOG"`,
+    `printf 'argv=%s\\tGH_TOKEN=%s\\tGITHUB_TOKEN=%s\\tGH_ENTERPRISE_TOKEN=%s\\tGITHUB_ENTERPRISE_TOKEN=%s\\n' "$*" "$GH_TOKEN" "$GITHUB_TOKEN" "$GH_ENTERPRISE_TOKEN" "$GITHUB_ENTERPRISE_TOKEN" >> "$GH_ACCOUNT_STUB_LOG"`,
     'if [ "$1 $2" = "auth token" ]; then',
     `  for account in ${known.map((a) => JSON.stringify(a)).join(" ")}; do`,
     '    if [ "$4" = "$account" ]; then echo "$account-token"; exit 0; fi',
@@ -4105,11 +4284,16 @@ async function ghAccountStub(
         .split("\n")
         .filter(Boolean)
         .map((line) => {
-          const [argv, ghToken, githubToken] = line.split("\t");
+          const [argv, ghToken, githubToken, ghEnterprise, githubEnterprise] =
+            line.split("\t");
           return {
             argv: argv!.slice("argv=".length),
             ghToken: ghToken!.slice("GH_TOKEN=".length),
             githubToken: githubToken!.slice("GITHUB_TOKEN=".length),
+            ghEnterpriseToken: ghEnterprise!.slice("GH_ENTERPRISE_TOKEN=".length),
+            githubEnterpriseToken: githubEnterprise!.slice(
+              "GITHUB_ENTERPRISE_TOKEN=".length,
+            ),
           };
         });
     },
@@ -4216,6 +4400,54 @@ describe("gh under the agent account", () => {
     expect(result.stderr).not.toContain("ISSEI-BOT-token");
   });
 
+  test("on a GitHub Enterprise Server host the token reaches gh as GH_ENTERPRISE_TOKEN", async () => {
+    // `gh` does not read GH_TOKEN for an Enterprise Server host, so without
+    // this the call runs on the stored credential — the user's — and
+    // `gh pr create` opens the pull request under their name.
+    const stub = await ghAccountStub(["ISSEI-BOT"]);
+    await withAccount(
+      {
+        OVERLORD_GH_ACCOUNT: "ISSEI-BOT",
+        OVERLORD_GH_TOKEN: undefined,
+        GH_HOST: "ghe.example.com",
+        PATH: `${stub.dir}:${process.env.PATH ?? ""}`,
+        GH_ACCOUNT_STUB_LOG: stub.log,
+      },
+      () => gh(["pr", "create", "--title", "t"]),
+    );
+
+    const created = (await stub.calls()).find((call) =>
+      call.argv.startsWith("pr create"),
+    )!;
+    expect(created.ghEnterpriseToken).toBe("ISSEI-BOT-token");
+    // The secondary variables stay empty, so an inherited one cannot decide
+    // the account if the one ahead of it were ever dropped.
+    expect(created.githubEnterpriseToken).toBe("");
+    expect(created.githubToken).toBe("");
+  });
+
+  test("on github.com the Enterprise variable is emptied, not given the token", async () => {
+    // A token for one host is not offered to another, which is the rule the
+    // git credential helper follows too.
+    const stub = await ghAccountStub(["ISSEI-BOT"]);
+    await withAccount(
+      {
+        OVERLORD_GH_ACCOUNT: "ISSEI-BOT",
+        OVERLORD_GH_TOKEN: undefined,
+        GH_HOST: undefined,
+        PATH: `${stub.dir}:${process.env.PATH ?? ""}`,
+        GH_ACCOUNT_STUB_LOG: stub.log,
+      },
+      () => gh(["pr", "create", "--title", "t"]),
+    );
+
+    const created = (await stub.calls()).find((call) =>
+      call.argv.startsWith("pr create"),
+    )!;
+    expect(created.ghToken).toBe("ISSEI-BOT-token");
+    expect(created.ghEnterpriseToken).toBe("");
+  });
+
   test("an account gh does not know fails the call instead of using the active one", async () => {
     const stub = await ghAccountStub(["ISSEI-BOT"]);
     const result = await withAccount(
@@ -4285,7 +4517,60 @@ describe("git push under the agent account", () => {
     expect(argv.join(" ")).not.toContain("ghp_agent");
     expect(pushes[0]!.username).toBe("x-access-token");
     expect(pushes[0]!.token).toBe("ghp_agent");
-  }, 20_000);
+  }, 60_000);
+
+  test("a GitHub Enterprise host is pushed with the agent account's credential too", async () => {
+    const repo = await deliveryRepo();
+    await gitIn(
+      [
+        "remote",
+        "set-url",
+        "--push",
+        "origin",
+        "https://github.example.com/o/r.git",
+      ],
+      repo.root,
+    );
+    const boardPath = await writeDeliveryBoard([MERGED_CHANGE]);
+    const ghStub = await deliverGhStub({ "view-50.json": VIEW_50_UNCHANGED });
+    const push = await gitPushStub();
+
+    await withAccount(
+      {
+        OVERLORD_GH_ACCOUNT: undefined,
+        OVERLORD_GH_TOKEN: "ghp_agent",
+        GH_HOST: "github.example.com",
+        PATH: `${push.dir}:${ghStub.dir}:${process.env.PATH ?? ""}`,
+        GIT_PUSH_STUB_LOG: push.log,
+      },
+      () =>
+        withGhStub(ghStub, () =>
+          deliverCard({
+            boardPath,
+            cardId: "OV-500",
+            cwd: repo.root,
+            head: "feature",
+          }),
+        ),
+    );
+
+    // `GH_HOST` is where the agent account lives, so its own host is not a
+    // foreign one: the credential is installed exactly as it is for
+    // github.com. Reading the host as github.com regardless would leave the
+    // push to whatever credential the machine has, which is the user's — the
+    // fallback to a human name that the separate account exists to prevent.
+    const pushes = await push.pushes();
+    expect(pushes).toHaveLength(1);
+    expect(pushes[0]!.argv.slice(0, 5)).toEqual([
+      "-c",
+      "credential.helper=",
+      "-c",
+      expect.stringContaining("credential.helper=!f()"),
+      "push",
+    ]);
+    expect(pushes[0]!.username).toBe("x-access-token");
+    expect(pushes[0]!.token).toBe("ghp_agent");
+  }, 60_000);
 
   test("a remote the token does not belong to is warned about, not sent the token", async () => {
     // `deliveryRepo` puts origin on a local path, which is every remote that
@@ -4318,7 +4603,83 @@ describe("git push under the agent account", () => {
     expect(pushes).toHaveLength(1);
     expect(pushes[0]!.argv[0]).toBe("push");
     expect(pushes[0]!.token).toBe("");
-  }, 20_000);
+  }, 60_000);
+
+  test("an https remote on another host is not pushed at all", async () => {
+    const repo = await deliveryRepo();
+    await gitIn(
+      ["remote", "set-url", "--push", "origin", "https://gitlab.com/o/r.git"],
+      repo.root,
+    );
+    const boardPath = await writeDeliveryBoard([MERGED_CHANGE]);
+    const before = await Bun.file(boardPath).text();
+    const ghStub = await deliverGhStub({ "view-50.json": VIEW_50_UNCHANGED });
+    const push = await gitPushStub();
+
+    const outcome = await withAccount(
+      {
+        OVERLORD_GH_ACCOUNT: undefined,
+        OVERLORD_GH_TOKEN: "ghp_agent",
+        GH_HOST: undefined,
+        PATH: `${push.dir}:${ghStub.dir}:${process.env.PATH ?? ""}`,
+        GIT_PUSH_STUB_LOG: push.log,
+      },
+      () =>
+        withGhStub(ghStub, () =>
+          deliverCard({
+            boardPath,
+            cardId: "OV-500",
+            cwd: repo.root,
+            head: "feature",
+          }),
+        ),
+    );
+
+    // The token is not sent to gitlab.com, so the push would have been
+    // authenticated by whatever credential the machine has for it — the
+    // user's — and the branch would be theirs. Nothing is pushed instead.
+    expect(outcome.status).toBe("failed");
+    expect(outcome.reason).toContain("gitlab.com");
+    expect(outcome.reason).toContain("Nothing was pushed");
+    expect(await push.pushes()).toEqual([]);
+    expect(await Bun.file(boardPath).text()).toBe(before);
+  }, 60_000);
+
+  test("with an Enterprise GH_HOST it is a github.com remote that is not pushed", async () => {
+    const repo = await deliveryRepo();
+    await gitIn(
+      ["remote", "set-url", "--push", "origin", "https://github.com/o/r.git"],
+      repo.root,
+    );
+    const boardPath = await writeDeliveryBoard([MERGED_CHANGE]);
+    const ghStub = await deliverGhStub({ "view-50.json": VIEW_50_UNCHANGED });
+    const push = await gitPushStub();
+
+    const outcome = await withAccount(
+      {
+        OVERLORD_GH_ACCOUNT: undefined,
+        OVERLORD_GH_TOKEN: "ghp_agent",
+        GH_HOST: "github.example.com",
+        PATH: `${push.dir}:${ghStub.dir}:${process.env.PATH ?? ""}`,
+        GIT_PUSH_STUB_LOG: push.log,
+      },
+      () =>
+        withGhStub(ghStub, () =>
+          deliverCard({
+            boardPath,
+            cardId: "OV-500",
+            cwd: repo.root,
+            head: "feature",
+          }),
+        ),
+    );
+
+    // The account lives on the Enterprise host, so github.com is the foreign
+    // one here and gets the same answer, in the direction the other way round.
+    expect(outcome.status).toBe("failed");
+    expect(outcome.reason).toContain("github.example.com");
+    expect(await push.pushes()).toEqual([]);
+  }, 60_000);
 
   test("with no account configured the push is unchanged", async () => {
     const repo = await deliveryRepo();
@@ -4347,7 +4708,7 @@ describe("git push under the agent account", () => {
     expect(outcome.warnings).toEqual([]);
     const pushes = await push.pushes();
     expect(pushes[0]!.argv[0]).toBe("push");
-  }, 20_000);
+  }, 60_000);
 });
 
 describe("pr names the account it acts as", () => {
@@ -4414,6 +4775,50 @@ describe("pr names the account it acts as", () => {
     expect(stdout).toContain(
       "agent account:    (none configured, using the active gh account)",
     );
+  });
+});
+
+describe("deliver names the account it acts as", () => {
+  test("a resolvable account is named, and its token is not printed", async () => {
+    const boardPath = await writeDeliveryBoard([MERGED_CHANGE]);
+    const stub = await ghAccountStub(["ISSEI-BOT"]);
+
+    // An unknown card fails before any git or `gh` call, which is enough here:
+    // the account is named on every run, not only on the ones that reach
+    // GitHub, because it is what the delivery pull request would be opened by.
+    const { code, stdout } = await withAccount(
+      {
+        OVERLORD_GH_ACCOUNT: "ISSEI-BOT",
+        OVERLORD_GH_TOKEN: undefined,
+        PATH: `${stub.dir}:${process.env.PATH ?? ""}`,
+        GH_ACCOUNT_STUB_LOG: stub.log,
+      },
+      () => capture(() => deliver(["OV-404", "--board", boardPath])),
+    );
+
+    expect(code).toBe(1);
+    expect(stdout).toContain("agent account:    ISSEI-BOT");
+    expect(stdout).not.toContain("ISSEI-BOT-token");
+  });
+
+  test("an account that cannot be resolved is reported rather than replaced", async () => {
+    const boardPath = await writeDeliveryBoard([MERGED_CHANGE]);
+    const stub = await ghAccountStub(["ISSEI-BOT"]);
+
+    const { stdout } = await withAccount(
+      {
+        OVERLORD_GH_ACCOUNT: "gone",
+        OVERLORD_GH_TOKEN: undefined,
+        PATH: `${stub.dir}:${process.env.PATH ?? ""}`,
+        GH_ACCOUNT_STUB_LOG: stub.log,
+      },
+      () => capture(() => deliver(["OV-404", "--board", boardPath])),
+    );
+
+    expect(stdout).toContain("agent account:    (could not be resolved)");
+    // Never the active account: that is the substitution the separation exists
+    // to prevent, and the output must not suggest it happened.
+    expect(stdout).not.toContain("none configured");
   });
 });
 
